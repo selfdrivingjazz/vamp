@@ -1,0 +1,13 @@
+[package]
+name = "vamp-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VAMP media catalog protocol types, JSON schemas, and interoperability contract"
+readme = "../../README.md"
+include = ["src/**", "protocol/contract.json", "examples/**", "Cargo.toml", "LICENSE"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
