@@ -42,10 +42,9 @@ CLI, processors, and release tooling are not included here. Protocol use and
 independent implementations do not require a Vampire purchase. A Vampire purchase
 does not grant rights to its source code.
 
-This project has a new Git repository with no inherited application history and
-no configured remote. Do not import the former mixed repository's history into a
-public VAMP repository. Configure a protocol-only destination before pushing;
-public hosting and package publication are separate release actions.
+This repository (`github.com/selfdrivingjazz/vamp`, public) has its own history with no
+application code. Never import Vampire's history or source into it. Publishing the
+crate to crates.io is a separate release step. Pre-alpha: expect breaking changes.
 
 ## License
 
