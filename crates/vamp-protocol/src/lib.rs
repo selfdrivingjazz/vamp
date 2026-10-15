@@ -366,6 +366,40 @@ pub struct SheetItem {
     pub id: String,
     pub path: String,
 }
+/// One intake candidate checked by native `find_duplicates`: a file, raw bytes or a
+/// precomputed digest, and the existing assets it duplicates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DuplicateCandidate {
+    /// Expanded file path (path inputs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// File name used for the `name_size` fallback (path inputs, or bytes with `filename`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// BLAKE3 of the candidate bytes; absent when they could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blake3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_size: Option<u64>,
+    /// Why the candidate could not be hashed (it is then reported without matches).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub matches: Vec<DuplicateMatch>,
+}
+/// An existing, non-tombstoned asset whose original matches a [`DuplicateCandidate`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DuplicateMatch {
+    pub asset_id: String,
+    /// `blake3`: identical bytes. `name_size`: the asset's fingerprint is still pending
+    /// (no digest yet) and its byte size and file name equal the candidate's.
+    pub basis: String,
+    /// In the trash (restorable) rather than live.
+    pub trashed: bool,
+    /// The candidate path is this asset's original path (re-adding it returns this asset).
+    pub same_path: bool,
+    /// Folders containing the asset (empty = uncategorized).
+    pub folder_ids: Vec<String>,
+}
 /// One JSON request on stdin, one JSON response on stdout; diagnostics use stderr.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolRequest {
@@ -469,6 +503,7 @@ pub fn schema() -> Value {
         "tool_response": schemars::schema_for!(ToolResponse),
         "store_request": schemars::schema_for!(StoreRequest),
         "store_response": schemars::schema_for!(StoreResponse),
+        "duplicate_candidate": schemars::schema_for!(DuplicateCandidate),
         "error": schemars::schema_for!(ErrorResponse)
     })
 }
