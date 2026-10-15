@@ -12,8 +12,9 @@ It does not contain or license the Vampire application.
 - `crates/vamp-protocol/examples/schema.rs`: standalone schema-bundle output.
 
 The Rust package version is `0.1.0`; the wire protocol version is `0.1`. The
-contract's status remains experimental. The schema bundle has 15 generated schema
-roots plus the semantic contract; it does not cover every operation payload.
+contract's status remains experimental. The schema bundle has 16 generated schema
+roots plus the semantic contract and the protocol version; it does not cover every
+operation payload.
 Existing implementation notes describe current Vampire behavior, not a requirement
 to reproduce its internals. Wire names and serialized types are unchanged by the
 project separation.
