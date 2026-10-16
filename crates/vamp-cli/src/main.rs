@@ -1,3 +1,4 @@
+mod serve;
 mod setup;
 #[cfg(feature = "remote")]
 mod self_update;
@@ -153,12 +154,17 @@ enum Command {
         #[command(subcommand)]
         command: Option<SyncCommand>,
     },
-    /// Attach a replica of a tailnet vamp-server (no token: the server admits this
-    /// machine by its Tailscale identity) and sync its catalog + thumbnails.
+    /// Attach a replica of a vamp-server library (`vamp serve` on another machine) and sync
+    /// its catalog + thumbnails. With --token (the authority's `vamp-server token`) over any
+    /// network; without one the server must admit this machine by its Tailscale identity.
     #[cfg(feature = "remote")]
     Join {
         /// `host`, `host:port` (default port 7777) or a full `http://host:port` URL.
         target: String,
+        /// The authority's bearer token (`vamp-server token` there). Omit on a tailnet whose
+        /// server allowlists this machine (`vamp-server allow`).
+        #[arg(long, env = "VAMP_REMOTE_TOKEN", hide_env_values = true)]
+        token: Option<String>,
         /// Context name (default: the authority's context name).
         #[arg(long)]
         name: Option<String>,
@@ -166,6 +172,25 @@ enum Command {
         /// this local path (e.g. a Drive mount) instead of downloading them. Repeatable.
         #[arg(long = "drive-root", value_name = "AUTHORITY=LOCAL")]
         drive_roots: Vec<String>,
+    },
+    /// Serve this authority library (current or --context) to other machines and the Vampire
+    /// apps: runs the vamp-server installed beside vamp (`vamp-server serve --help` lists every
+    /// option). Binds 127.0.0.1:7777, this machine only, unless --bind says otherwise; prints
+    /// the URL, where the token is and how another machine joins.
+    Serve {
+        /// `host:port` [default: 127.0.0.1:7777]. 0.0.0.0:PORT accepts other machines;
+        /// `tailnet[:PORT]` binds this machine's Tailscale address.
+        #[arg(long)]
+        bind: Option<String>,
+        /// Request auth [default: tailscale on a tailnet address, else token].
+        #[arg(long, value_parser = ["token", "tailscale"])]
+        auth: Option<String>,
+        /// Do not run processor jobs (captions, tags, embeddings) in the server.
+        #[arg(long)]
+        no_jobs: bool,
+        /// Also serve a CLI installer and release files from DIR at /install.sh and /dist/.
+        #[arg(long)]
+        dist: Option<PathBuf>,
     },
     /// Configure the text embedder used by semantic search (ToolRequest embed_text).
     Embedder {
@@ -201,8 +226,8 @@ enum Command {
         #[command(flatten)]
         args: WorkerArgs,
     },
-    /// Update this release install (vamp + vamp-media) to the latest release,
-    /// checksum-verified, replacing the binaries in place.
+    /// Update this release install (vamp, vamp-media, vamp-server, vamp-store) to the latest
+    /// release, checksum-verified, replacing the binaries in place.
     #[cfg(feature = "remote")]
     SelfUpdate {
         /// Only report the current and latest versions.
@@ -1006,6 +1031,7 @@ fn execute(cli: Cli) -> Result<Value> {
         #[cfg(feature = "remote")]
         Command::Join {
             target,
+            token,
             name,
             drive_roots,
         } => {
@@ -1017,12 +1043,29 @@ fn execute(cli: Cli) -> Result<Value> {
                         .with_context(|| format!("--drive-root needs AUTHORITY=LOCAL: {pair}"))
                 })
                 .collect::<Result<_>>()?;
-            let (name, context) = vamp_core::remote::join(&home, &target, name.as_deref(), roots)?;
+            let token = token.unwrap_or_default();
+            let (name, context) =
+                vamp_core::remote::join(&home, &target, &token, name.as_deref(), roots)?;
             let mut library = Library::open(&home, Some(&name))?;
             let sync = vamp_core::remote::sync(&mut library)?;
             Ok(
                 json!({"name":name,"library_id":context.library_id,"state_dir":context.state_dir,"remote_url":context.remote.map(|r| r.url),"sync":sync}),
             )
+        }
+        Command::Serve {
+            bind,
+            auth,
+            no_jobs,
+            dist,
+        } => {
+            let options = serve::Options {
+                bind,
+                auth,
+                no_jobs,
+                dist,
+            };
+            serve::run(&home, cli.context.as_deref(), options)?;
+            unreachable!("vamp serve returns only on failure")
         }
         Command::Setup {
             capability,

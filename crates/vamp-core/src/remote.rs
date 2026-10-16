@@ -646,17 +646,19 @@ pub fn join_url(target: &str) -> String {
     }
 }
 
-/// `vamp join`: attach a replica without a token (the authority admits this machine by
-/// its Tailscale identity). `name` defaults to the authority's context name.
+/// `vamp join`: attach a replica of the authority at `target` (see [`join_url`]). An empty
+/// `token` relies on the authority admitting this machine by its Tailscale identity.
+/// `name` defaults to the authority's context name.
 pub fn join(
     home: &Path,
     target: &str,
+    token: &str,
     name: Option<&str>,
     drive_roots: BTreeMap<String, String>,
 ) -> Result<(String, Context)> {
     let remote = Remote {
         url: join_url(target),
-        token: String::new(),
+        token: token.trim().to_owned(),
         drive_roots,
     };
     let hello = Client::new(&remote)?.hello()?;
