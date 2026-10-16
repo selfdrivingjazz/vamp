@@ -806,7 +806,7 @@ enum ShareCommand {
         #[arg(long, env = "VAMP_SHARE_HOST")]
         host: Option<String>,
     },
-    /// What a share would publish (items, exclusions, bytes); no network.
+    /// What a share would publish (items, exclusions, bytes); never contacts the share host.
     Plan {
         #[command(flatten)]
         scope: ShareScopeArgs,
