@@ -169,7 +169,7 @@ impl Library {
             .into_iter()
             .find(|c| c.source_id.as_deref() == Some(source_id)))
     }
-    fn exploration(&self, slug: &str) -> Result<Collection> {
+    pub(crate) fn exploration(&self, slug: &str) -> Result<Collection> {
         validate_slug(slug)?;
         self.folder_by_source(&source(slug))?.with_context(|| {
             format!("no exploration {slug:?}; create it with vamp explore ensure {slug}")
@@ -213,7 +213,7 @@ impl Library {
         Ok(collection)
     }
     /// The exploration folder and every folder below it (the exploration first).
-    fn subtree(&self, root: &str) -> Result<Vec<Collection>> {
+    pub(crate) fn subtree(&self, root: &str) -> Result<Vec<Collection>> {
         let rows = catalog::collection_rows(&self.conn)?;
         let mut ids: HashSet<String> = HashSet::from([root.to_owned()]);
         // Rows come parents first, so one pass collects every descendant.

@@ -234,6 +234,15 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Publish a frozen snapshot of a folder, exploration or selection to a share host
+    /// (default https://app.vamp.sh; VAMP_SHARE_HOST or --host overrides): previews only,
+    /// an unlisted link with an expiry, optional password, revocable. Items in the Trash or
+    /// tagged `private` are never shared; hidden fields never leave this machine.
+    #[cfg(feature = "remote")]
+    Share {
+        #[command(subcommand)]
+        command: ShareCommand,
+    },
 }
 #[cfg(feature = "remote")]
 #[derive(Args)]
@@ -780,6 +789,131 @@ enum ExploreCommand {
         peek: bool,
     },
 }
+#[cfg(feature = "remote")]
+#[derive(Subcommand)]
+enum ShareCommand {
+    /// Save a publisher token (from your vamp.sh account) for the share host; checked first.
+    Login {
+        #[arg(long, env = "VAMP_SHARE_TOKEN", hide_env_values = true)]
+        token: String,
+        #[arg(long, env = "VAMP_SHARE_HOST")]
+        host: Option<String>,
+    },
+    /// Forget the saved token.
+    Logout,
+    /// The share host and whether a token is saved for it.
+    Account {
+        #[arg(long, env = "VAMP_SHARE_HOST")]
+        host: Option<String>,
+    },
+    /// What a share would publish (items, exclusions, bytes); no network.
+    Plan {
+        #[command(flatten)]
+        scope: ShareScopeArgs,
+    },
+    /// Create a share and print {id, url, status, expires_at, asset_count, bytes}. Re-running
+    /// the same share after an interruption resumes it (only missing files are uploaded).
+    Create {
+        #[command(flatten)]
+        scope: ShareScopeArgs,
+        #[arg(long)]
+        title: Option<String>,
+        /// Shown above the grid (default: an exploration's brief and findings).
+        #[arg(long)]
+        description: Option<String>,
+        /// 1d, 7d, 30d, never, or <n>s|m|h|d (at least 60 s).
+        #[arg(long, default_value = "30d")]
+        ttl: String,
+        /// Read a viewing password from the first line of stdin.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Hide item names.
+        #[arg(long)]
+        no_names: bool,
+        /// Show notes (descriptions).
+        #[arg(long)]
+        notes: bool,
+        #[arg(long)]
+        tags: bool,
+        /// Show http(s) source links.
+        #[arg(long)]
+        source_links: bool,
+        #[arg(long)]
+        rating: bool,
+        /// Hide the palette.
+        #[arg(long)]
+        no_colors: bool,
+        /// Show the date imported.
+        #[arg(long)]
+        dates: bool,
+        #[arg(long, env = "VAMP_SHARE_HOST")]
+        host: Option<String>,
+    },
+    /// The account's shares on the host (status, expiry, items).
+    List {
+        #[arg(long, env = "VAMP_SHARE_HOST")]
+        host: Option<String>,
+    },
+    /// Upload a share's scope again as a new snapshot (or finish an interrupted create).
+    Publish {
+        id: String,
+        #[arg(long, env = "VAMP_SHARE_HOST")]
+        host: Option<String>,
+    },
+    /// Stop serving a share now.
+    Revoke {
+        id: String,
+        #[arg(long, env = "VAMP_SHARE_HOST")]
+        host: Option<String>,
+    },
+}
+#[cfg(feature = "remote")]
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct ShareScopeArgs {
+    /// A folder by id or exact name, with its sub-folders.
+    #[arg(long)]
+    folder: Option<String>,
+    /// An exploration by slug.
+    #[arg(long)]
+    exploration: Option<String>,
+    /// These asset ids, in order.
+    #[arg(long, num_args = 1.., value_delimiter = ',')]
+    select: Option<Vec<String>>,
+}
+#[cfg(feature = "remote")]
+impl ShareScopeArgs {
+    fn resolve(self, library: &Library) -> Result<vamp_protocol::ShareScope> {
+        use vamp_protocol::ShareScope;
+        if let Some(slug) = self.exploration {
+            return Ok(ShareScope::Exploration { slug });
+        }
+        if let Some(asset_ids) = self.select {
+            return Ok(ShareScope::Selection { asset_ids });
+        }
+        let folder = self.folder.context("--folder, --exploration or --select is required")?;
+        let collections = library.collections()?;
+        let id = match collections.iter().find(|c| c.id == folder) {
+            Some(c) => c.id.clone(),
+            None => {
+                let named: Vec<_> = collections.iter().filter(|c| c.name == folder).collect();
+                match named.as_slice() {
+                    [one] => one.id.clone(),
+                    [] => bail!("no folder named {folder:?}"),
+                    many => bail!(
+                        "{} folders are named {folder:?}; pass an id: {}",
+                        many.len(),
+                        many.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                }
+            }
+        };
+        Ok(ShareScope::Folder {
+            collection_id: id,
+            include_subfolders: true,
+        })
+    }
+}
 #[derive(Subcommand)]
 enum SmartCommand {
     List,
@@ -1159,6 +1293,79 @@ fn execute(cli: Cli) -> Result<Value> {
                 )
             }
         },
+        #[cfg(feature = "remote")]
+        Command::Share { command } => {
+            use vamp_core::share;
+            let open = || Library::open(&home, cli.context.as_deref());
+            let progress = |phase: &str, done: u64, total: u64| {
+                if phase == "upload" && total > 0 && (done == total || done % 10 == 0) {
+                    eprintln!("uploading {done}/{total}");
+                }
+            };
+            match command {
+                ShareCommand::Login { token, host } => share::login(&home, &token, host.as_deref()),
+                ShareCommand::Logout => share::logout(&home),
+                ShareCommand::Account { host } => share::account(&home, host.as_deref()),
+                ShareCommand::Plan { scope } => {
+                    let mut library = open()?;
+                    let scope = scope.resolve(&library)?;
+                    share::plan(&mut library, &scope)
+                }
+                ShareCommand::Create {
+                    scope,
+                    title,
+                    description,
+                    ttl,
+                    password_stdin,
+                    no_names,
+                    notes,
+                    tags,
+                    source_links,
+                    rating,
+                    no_colors,
+                    dates,
+                    host,
+                } => {
+                    let mut library = open()?;
+                    let scope = scope.resolve(&library)?;
+                    let password = if password_stdin {
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line)?;
+                        let line = line.trim_end_matches(['\r', '\n']).to_owned();
+                        ensure!(!line.is_empty(), "--password-stdin: stdin has no password");
+                        Some(line)
+                    } else {
+                        None
+                    };
+                    let options = share::ShareOptions {
+                        scope: Some(scope),
+                        title,
+                        description,
+                        ttl: Some(ttl),
+                        password,
+                        fields: Some(vamp_protocol::ShareFields {
+                            name: !no_names,
+                            notes,
+                            tags,
+                            source_url: source_links,
+                            rating,
+                            colors: !no_colors,
+                            dates,
+                        }),
+                        host,
+                        id: None,
+                    };
+                    share::create(&home, &mut library, &options, &progress)
+                }
+                ShareCommand::List { host } => share::list(&home, open().ok().as_ref(), host.as_deref()),
+                ShareCommand::Publish { id, host } => {
+                    share::publish(&home, &mut open()?, &id, host.as_deref(), &progress)
+                }
+                ShareCommand::Revoke { id, host } => {
+                    share::revoke(&home, open().ok().as_ref(), &id, host.as_deref())
+                }
+            }
+        }
         command => {
             let mut library = Library::open(&home, cli.context.as_deref())?;
             ensure!(

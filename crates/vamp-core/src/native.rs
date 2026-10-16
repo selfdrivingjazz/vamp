@@ -121,6 +121,9 @@ pub struct Request {
     /// when absent so forwarded bodies stay readable by authorities that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_by: Option<String>,
+    /// share_*: the share options (`share::ShareOptions`). Local-only (never forwarded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<Value>,
 }
 
 /// Browse selects live assets matching every given filter.
@@ -263,6 +266,10 @@ pub fn request(request: Request) -> Result<Value> {
         return context_value(&request.home, name, &library.context);
     }
     #[cfg(feature = "remote")]
+    if request.operation.starts_with("share_") {
+        return share_request(&request);
+    }
+    #[cfg(feature = "remote")]
     if let Some(value) = super::native_remote::request(&request)? {
         return Ok(value);
     }
@@ -277,6 +284,48 @@ pub fn request(request: Request) -> Result<Value> {
         spawn_thumbnail_copier(&home, context.as_deref())?;
     }
     Ok(result)
+}
+
+/// Share ops run in this process (they hold the account token and read local tiers), on
+/// authorities and replicas alike; nothing is forwarded.
+#[cfg(feature = "remote")]
+fn share_request(request: &Request) -> Result<Value> {
+    use crate::share;
+    let options: share::ShareOptions = request
+        .share
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("invalid share options")?
+        .unwrap_or_default();
+    let home = &request.home;
+    let host = options.host.as_deref();
+    let id = || options.id.as_deref().context("share.id is required");
+    let library = || Library::open(home, request.context.as_deref());
+    let transfer = request.transfer_id.clone();
+    let progress = move |phase: &str, done: u64, total: u64| {
+        if let Some(transfer) = &transfer {
+            share::set_progress(transfer, phase, done, total);
+        }
+    };
+    let finish = |result: Result<Value>| {
+        if let (Err(_), Some(transfer)) = (&result, &request.transfer_id) {
+            share::set_progress(transfer, "failed", 0, 0);
+        }
+        result
+    };
+    match request.operation.as_str() {
+        "share_account" => share::account(home, host),
+        "share_login" => share::login(home, request.token.as_deref().context("token is required")?, host),
+        "share_logout" => share::logout(home),
+        "share_progress" => Ok(share::progress(request.transfer_id.as_deref().context("transfer_id is required")?)),
+        "share_plan" => share::plan(&mut library()?, options.scope.as_ref().context("share.scope is required")?),
+        "share_create" => finish(share::create(home, &mut library()?, &options, &progress)),
+        "share_publish" => finish(share::publish(home, &mut library()?, id()?, host, &progress)),
+        "share_list" => share::list(home, library().ok().as_ref(), host),
+        "share_revoke" => share::revoke(home, library().ok().as_ref(), id()?, host),
+        other => anyhow::bail!("unknown operation {other}"),
+    }
 }
 
 /// Eagle imports running on background threads of this process (the app's bridge is
