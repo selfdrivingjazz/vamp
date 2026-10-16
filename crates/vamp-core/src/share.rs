@@ -77,18 +77,27 @@ fn load_credentials(home: &Path) -> Result<Option<Credentials>> {
     }
 }
 
-/// `https://…`, or plain `http://` to a loopback address (a host under development).
+/// `https://…`; plain `http://` only to a loopback address, or to any host when
+/// `VAMP_SHARE_ALLOW_HTTP=1` (a development host on a private network: the token then
+/// travels unencrypted unless the network encrypts it).
 fn normalize_host(host: &str) -> Result<String> {
     let host = host.trim().trim_end_matches('/');
-    let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
-        .iter()
-        .any(|p| host.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with(':')));
+    let (secure, rest) = match (host.strip_prefix("https://"), host.strip_prefix("http://")) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        _ => anyhow::bail!("share host must be an https:// URL: {host}"),
+    };
+    let name = rest.rsplit_once(':').map_or(rest, |(name, port)| {
+        if port.bytes().all(|b| b.is_ascii_digit()) { name } else { rest }
+    });
+    let loopback = matches!(name, "127.0.0.1" | "localhost" | "[::1]");
+    let allow_http = std::env::var("VAMP_SHARE_ALLOW_HTTP").is_ok_and(|v| v == "1");
     ensure!(
-        (host.starts_with("https://") && host.len() > 8) || loopback,
-        "share host must be an https:// URL (http:// only for localhost): {host}"
+        secure || loopback || allow_http,
+        "share host must be an https:// URL (http:// only for localhost, or with VAMP_SHARE_ALLOW_HTTP=1): {host}"
     );
     ensure!(
-        !host[8..].contains(['/', '?', '#', '@', ' ']),
+        !rest.is_empty() && !rest.contains(['/', '?', '#', '@', ' ']),
         "share host must be an origin without a path: {host}"
     );
     Ok(host.to_owned())
