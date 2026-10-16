@@ -2113,7 +2113,7 @@ mod tests {
                     }
                 })
                 .collect();
-            if !cfg!(feature = "remote") && matches!(args[1].as_str(), "join" | "sync" | "worker" | "self-update") {
+            if !cfg!(feature = "remote") && matches!(args[1].as_str(), "join" | "sync" | "worker" | "self-update" | "share") {
                 continue;
             }
             if let Err(error) = Cli::try_parse_from(&args) {
