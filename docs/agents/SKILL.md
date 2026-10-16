@@ -73,8 +73,8 @@ vamp explore link vamp-sh --asset <asset_id>   # the same, selecting one item
 - VAMP attaches no meaning to these changes: a rating, a tag, a note, a move or the Trash means whatever the owner says it means. Use the interpretation given in your mission prompt; if there is none, report the raw changes and ask him how to read them rather than assuming a convention.
 
 ## Share (publish a snapshot link)
-`vamp share` publishes a frozen snapshot of a folder, an exploration or a selection to a share host (default https://app.vamp.sh, or `VAMP_SHARE_HOST`): previews only, an unlisted link with an expiry, optionally a password. Items in the Trash or tagged `private` are never shared; fields left off (notes, tags, source links…) never leave the machine. It needs a publisher token (`vamp share login --token …`, from the owner).
-- Create a share only when the owner asks. Run `vamp share plan --folder NAME | --exploration SLUG | --select ID,…` first and show him the counts and exclusions.
+The `share` commands publish a frozen snapshot of a folder, an exploration or a selection to a share host (default https://app.vamp.sh, or `VAMP_SHARE_HOST`): previews only, an unlisted link with an expiry, optionally a password. Items in the Trash or tagged `private` are never shared; fields left off (notes, tags, source links…) never leave the machine. It needs a publisher token (`vamp share login --token …`, from the owner).
+- Create a share only when the owner asks. Run `vamp share plan --exploration SLUG` (or `--folder NAME`, `--select ID,ID`) first and show him the counts and exclusions.
 - Default to `--ttl 7d` and no notes/tags (`--notes`, `--tags`, `--source-links` only when he says so); a password comes from stdin (`--password-stdin`).
 - `vamp share create --exploration SLUG --ttl 7d` → `{id, url, status, expires_at, asset_count, bytes}`. Hand the owner the `url`. Re-running an interrupted create resumes it.
 - `vamp share list` shows every share of the account; `vamp share revoke ID` stops one at once.
