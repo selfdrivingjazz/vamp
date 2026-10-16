@@ -1,51 +1,64 @@
-# VAMP protocol
+# VAMP
 
-VAMP is an experimental media-catalog interoperability protocol. This repository
-contains the MIT-licensed contract, Rust data types, and generated JSON schemas.
-It does not contain or license the Vampire application.
+VAMP is an experimental, reference-only media catalog for people and agents: files stay where
+they are, the catalog records them (metadata, tags, folders, thumbnails, model captions and
+embeddings), and every `vamp` command prints JSON. This repository holds the protocol, the
+engine and the `vamp` command-line tool, all MIT-licensed. Pre-alpha: expect breaking changes.
 
-## Public surface
-
-- `crates/vamp-protocol/src/lib.rs`: serialized types and `schema()`.
-- `crates/vamp-protocol/protocol/contract.json`: the canonical semantic and
-  operation contract, bundled into the crate rather than read from another project.
-- `crates/vamp-protocol/examples/schema.rs`: standalone schema-bundle output.
-
-The Rust package version is `0.1.0`; the wire protocol version is `0.1`. The
-contract's status remains experimental. The schema bundle has 16 generated schema
-roots plus the semantic contract and the protocol version; it does not cover every
-operation payload.
-Existing implementation notes describe current Vampire behavior, not a requirement
-to reproduce its internals. Wire names and serialized types are unchanged by the
-project separation.
-
-## Use and verify
+## Install
 
 ```sh
-cargo run -p vamp-protocol --example schema
-cargo package -p vamp-protocol --allow-dirty
+curl -fsSL https://vamp.sh/install | sh
 ```
 
-The example emits the same bundle as Vampire's `vamp schema` command, without
-building the app or engine. Cargo package verification compiles the bundled
-contract from the package itself. Review `cargo package -p vamp-protocol --list`
-before publishing. Only this protocol crate belongs in a public source release.
+Installs `vamp` and its optional `vamp-media` helper (macOS on Apple silicon or Intel, Linux
+x86_64 or aarch64, static) from this repository's
+[GitHub releases](https://github.com/selfdrivingjazz/vamp/releases), checksum-verified.
+`vamp self-update` (`--check` only reports) moves a release install to the latest release.
+Each release archive holds `vamp`, `vamp-media`, `LICENSE` and `THIRD-PARTY-NOTICES.txt`.
 
-Rust consumers can depend on `vamp-protocol` from a checkout. A crates.io dependency
-requires publishing the package first; this local separation does not publish it.
+Then `vamp guide` prints the operating manual (`docs/agents/SKILL.md`, also usable as an agent
+skill), `vamp commands` the full argument tree and `vamp schema` the JSON schemas.
 
-## Vampire is separate
+## Contents
 
-Vampire is the proprietary application implementing VAMP, maintained separately
-in the private sibling `../vampire` project. Its UI, engine, native bridge, server,
-CLI, processors, and release tooling are not included here. Protocol use and
-independent implementations do not require a Vampire purchase. A Vampire purchase
-does not grant rights to its source code.
+| Path | Crate / file | What it is |
+| --- | --- | --- |
+| `crates/vamp-protocol` | `vamp-protocol` | Serialized types, generated JSON schemas and the semantic contract (`protocol/contract.json`) |
+| `crates/vamp-core` | `vamp-core` | The engine: SQLite catalog, Eagle import, thumbnails, processors and jobs, explorations, replica sync (feature `remote`), native operations (feature `native`) |
+| `crates/vamp-cli` | `vamp-cli` (binary `vamp`) | The command-line tool |
+| `crates/vamp-media` | `vamp-media` | Optional helper `vamp` and `vamp-core` call for image decoding (HEIC/AVIF/PSD included), thumbnails and colors |
+| `processors/` | | Optional local model processors (Florence-2 captions/tags, SigLIP embeddings) installed by `vamp setup models --install` |
+| `docs/agents/SKILL.md` | | The manual `vamp guide` prints |
+| `tools/` | | `eagle-fixture.py` (synthetic Eagle libraries for tests), `card-font.py` (note-card glyph atlases) |
+| `examples/` | | `eagle-demo.py` (catalog a bounded Eagle sample) |
 
-This repository (`github.com/selfdrivingjazz/vamp`, public) has its own history with no
-application code. Never import Vampire's history or source into it. Publishing the
-crate to crates.io is a separate release step. Pre-alpha: expect breaking changes.
+The protocol version is `0.1`; the Rust packages are `0.1.0`. Only `vamp-protocol` is meant
+for crates.io; the others are `publish = false`.
+
+## Build and test
+
+```sh
+cargo build --workspace --all-features
+cargo test --workspace --all-features
+cargo run -p vamp-cli --features remote --bin vamp -- guide
+cargo run -p vamp-protocol --example schema   # the bundle `vamp schema` prints
+```
+
+Feature `remote` of `vamp-cli` adds replica contexts of a `vamp-server` authority (`vamp join`,
+`vamp contexts remote`, `vamp sync`) and `vamp self-update`. Tests need `python3` (Eagle
+fixtures). Release archives are built with `VAMP_RELEASE_TARGET=<target triple>` set, which
+is what lets `vamp self-update` pick its asset; source builds refuse to self-update.
+
+## Vampire
+
+Vampire is a separate, proprietary application built on VAMP: the Mac and iOS apps, the
+browser extension, the native bridge, the `vamp-server` authority and the `vamp-store` cloud
+helper. It is not in this repository and is not covered by its license. Protocol use,
+independent implementations and the `vamp` CLI do not require Vampire.
 
 ## License
 
-MIT; see `LICENSE`. Vampire and its dependencies have their own licenses.
+MIT; see `LICENSE`. The note-card glyph atlases in `crates/vamp-core/assets` are rendered from
+the DejaVu fonts (`crates/vamp-core/assets/LICENSE-DejaVu.txt`). Dependencies keep their own
+licenses; release archives list them in `THIRD-PARTY-NOTICES.txt`.
