@@ -1,2 +1,4 @@
 /target/
 .DS_Store
+/vendor/*/target/
+/vendor/*/Cargo.lock
