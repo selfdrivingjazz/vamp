@@ -806,7 +806,7 @@ pub fn parse_ttl(ttl: &str) -> Result<Option<i64>> {
     Ok(Some(seconds))
 }
 
-/// `share_plan`: what a share of `scope` would publish, from local state only.
+/// `share_plan`: what a share of `scope` would publish; never contacts the share host.
 pub fn plan(library: &mut Library, scope: &ShareScope) -> Result<Value> {
     let resolved = resolve(library, scope)?;
     let local = local_tiers(library, &resolved.members)?;
