@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `vamp share login` without an explicit host now defaults to `https://app.vamp.sh` rather than reusing a previously saved host.
 - Share v0, the public half: `vamp share login|logout|account|plan|create|list|publish|revoke`
   publishes a frozen snapshot of a folder (with sub-folders), an exploration or a selection to
   a share host (default `https://app.vamp.sh`, `VAMP_SHARE_HOST`/`--host` override). Items in
