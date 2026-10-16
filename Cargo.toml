@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/vamp-protocol"]
+members = ["crates/vamp-protocol", "crates/vamp-core", "crates/vamp-cli", "crates/vamp-media"]
+default-members = ["crates/vamp-cli"]
 resolver = "2"
 
 [workspace.package]
@@ -8,6 +9,20 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+blake3 = "1"
+rusqlite = { version = "0.39", features = ["bundled", "functions"] }
+clap = { version = "4", features = ["derive", "env"] }
+vamp-protocol = { version = "0.1.0", path = "crates/vamp-protocol" }
+vamp-core = { version = "0.1.0", path = "crates/vamp-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
