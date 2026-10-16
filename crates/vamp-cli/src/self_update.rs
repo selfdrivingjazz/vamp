@@ -1,7 +1,8 @@
-//! `vamp self-update`: replace this release install (`vamp` and the `vamp-media` beside it)
-//! with the latest GitHub release of `selfdrivingjazz/vamp`, verified against that release's
-//! SHA256SUMS. Only release builds (built with `VAMP_RELEASE_TARGET` set to their target
-//! triple) know their asset; source builds refuse.
+//! `vamp self-update`: replace this release install (`vamp` and the `vamp-media`,
+//! `vamp-server` and `vamp-store` beside it) with the latest GitHub release of
+//! `selfdrivingjazz/vamp`, verified against that release's SHA256SUMS. Only release builds
+//! (built with `VAMP_RELEASE_TARGET` set to their target triple) know their asset; source
+//! builds refuse.
 
 use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -16,7 +17,8 @@ use std::{
 /// Release download base; `VAMP_INSTALL_BASE` overrides it like it does for the installer.
 /// Assets are fetched from `<base>/latest/download/<name>`.
 const DEFAULT_BASE: &str = "https://github.com/selfdrivingjazz/vamp/releases";
-const BINARIES: [&str; 2] = ["vamp-media", "vamp"];
+// Helpers first: `vamp` is replaced last, once everything else is in place.
+const BINARIES: [&str; 4] = ["vamp-media", "vamp-server", "vamp-store", "vamp"];
 const MAX_ARCHIVE: u64 = 256 << 20;
 
 /// The release asset's target triple, compiled in by release builds.

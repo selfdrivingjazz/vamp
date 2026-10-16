@@ -1,6 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-15
+
+- Open-source the library server and the cloud storage helper under MIT: `vamp-server` (the
+  `/v1` HTTP API for replicas, the Vampire apps and the browser clipper; token or Tailscale
+  identity auth; background jobs and thumbnail tiers) and `vamp-store` (S3-compatible helper
+  for cloud originals) move here from Vampire as fresh files, with the patched `tiny_http`
+  0.12.0 they build on (`vendor/tiny_http`, upstream MIT OR Apache-2.0 notices kept). The
+  Vampire apps, browser extension and native bridge stay proprietary.
+- `vamp serve [--bind HOST:PORT] [--auth token|tailscale] [--no-jobs] [--dist DIR]` runs the
+  `vamp-server` beside `vamp` (or on `PATH`) for the current or `--context` library. The
+  default bind stays 127.0.0.1:7777 (this machine only); the server now prints its URL, the
+  token file and the `vamp join` command for other machines at startup.
+- `vamp join TARGET --token TOKEN` (or `VAMP_REMOTE_TOKEN`) attaches a replica of any
+  `vamp-server` with its bearer token, not only over a tailnet with identity auth.
+  `vamp_core::remote::join` takes the token.
+- Release archives add `vamp-server` and `vamp-store` (and tiny_http in
+  `THIRD-PARTY-NOTICES.txt`); `vamp self-update` and the installer replace all four binaries.
+- Server tests use example identities (`alice@example.com`, `tag:server`, documentation
+  addresses) instead of real tailnet names.
+
+## 0.1.0 — 2026-10-15
 
 - Open-source the `vamp` CLI under MIT: `vamp-core` (engine), `vamp-cli` (binary `vamp`),
   `vamp-media` (image helper), the model processors, the agent manual (`docs/agents/SKILL.md`,
