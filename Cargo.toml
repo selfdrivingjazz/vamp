@@ -1,10 +1,22 @@
 [workspace]
-members = ["crates/vamp-protocol", "crates/vamp-core", "crates/vamp-cli", "crates/vamp-media"]
+members = [
+    "crates/vamp-protocol",
+    "crates/vamp-core",
+    "crates/vamp-cli",
+    "crates/vamp-media",
+    "crates/vamp-server",
+    "crates/vamp-store",
+]
 default-members = ["crates/vamp-cli"]
 resolver = "2"
+# Patched third-party crates (see vendor/*/VENDORED.md); not workspace members.
+exclude = ["vendor"]
+
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
@@ -18,8 +30,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 blake3 = "1"
 rusqlite = { version = "0.39", features = ["bundled", "functions"] }
 clap = { version = "4", features = ["derive", "env"] }
-vamp-protocol = { version = "0.1.0", path = "crates/vamp-protocol" }
-vamp-core = { version = "0.1.0", path = "crates/vamp-core" }
+vamp-protocol = { version = "0.2.0", path = "crates/vamp-protocol" }
+vamp-core = { version = "0.2.0", path = "crates/vamp-core" }
 
 [profile.release]
 opt-level = 3

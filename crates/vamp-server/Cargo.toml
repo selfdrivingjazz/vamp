@@ -1,0 +1,35 @@
+[package]
+name = "vamp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "vamp-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+blake3.workspace = true
+vamp-protocol.workspace = true
+vamp-core = { workspace = true, features = ["native"] }
+# Small synchronous HTTP/1.1 server: no async runtime for a single-library, LAN-scale API.
+tiny_http = "0.12"
+# Client for /v1/clip image downloads (same client vamp-core's `remote` feature uses).
+ureq = "3"
+form_urlencoded = "1"
+flate2 = "1"
+
+[dev-dependencies]
+rusqlite.workspace = true
+base64 = "0.22"
+anyhow.workspace = true
+tempfile = "3"
+ureq = "3"
+vamp-core = { workspace = true, features = ["native", "remote"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "webp"] }
