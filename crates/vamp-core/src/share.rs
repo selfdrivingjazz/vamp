@@ -103,8 +103,8 @@ fn normalize_host(host: &str) -> Result<String> {
     Ok(host.to_owned())
 }
 
-/// The host to talk to: `explicit`, else `VAMP_SHARE_HOST`, else the signed-in host, else
-/// [`DEFAULT_HOST`].
+/// The host to talk to for non-login operations: `explicit`, else `VAMP_SHARE_HOST`, else
+/// the signed-in host, else [`DEFAULT_HOST`].
 pub fn host_for(home: &Path, explicit: Option<&str>) -> Result<String> {
     let env = std::env::var("VAMP_SHARE_HOST").ok().filter(|h| !h.trim().is_empty());
     match explicit.map(str::to_owned).or(env) {
@@ -114,6 +114,41 @@ pub fn host_for(home: &Path, explicit: Option<&str>) -> Result<String> {
             None => Ok(DEFAULT_HOST.into()),
         },
     }
+}
+
+/// Login must not silently inherit a previously saved host; absent overrides mean production.
+fn login_host(explicit: Option<&str>) -> Result<String> {
+    let env = std::env::var("VAMP_SHARE_HOST").ok().filter(|h| !h.trim().is_empty());
+    normalize_host(explicit.or(env.as_deref()).unwrap_or(DEFAULT_HOST))
+}
+
+/// Checks `token` against the host, then saves it for that host (0600).
+pub fn login(home: &Path, token: &str, host: Option<&str>) -> Result<Value> {
+    let token = token.trim();
+    ensure!(
+        !token.is_empty()
+            && token.len() <= 512
+            && token.bytes().all(|b| b.is_ascii_graphic()),
+        "invalid token"
+    );
+    let host = login_host(host)?;
+    let client = HostClient::new(&host, token);
+    let entitled = match client.json("GET", "/shares", None) {
+        Ok(_) => true,
+        Err(e) if format!("{e:#}").starts_with("share_required") => false,
+        Err(e) => return Err(e),
+    };
+    let _lock = config_lock(home)?;
+    atomic_json(
+        &home.join(CREDENTIALS),
+        &Credentials {
+            host: host.clone(),
+            token: token.into(),
+        },
+    )?;
+    let mut value = account(home, Some(&host))?;
+    value["entitled"] = json!(entitled);
+    Ok(value)
 }
 
 /// `VAMP_SHARE_TOKEN`, else the token saved for exactly this host.
@@ -137,34 +172,6 @@ pub fn account(home: &Path, host: Option<&str>) -> Result<Value> {
     Ok(json!({"host":host,"signed_in":token.is_some(),"token_hint":token.as_deref().map(hint)}))
 }
 
-/// Checks `token` against the host, then saves it for that host (0600).
-pub fn login(home: &Path, token: &str, host: Option<&str>) -> Result<Value> {
-    let token = token.trim();
-    ensure!(
-        !token.is_empty()
-            && token.len() <= 512
-            && token.bytes().all(|b| b.is_ascii_graphic()),
-        "invalid token"
-    );
-    let host = host_for(home, host)?;
-    let client = HostClient::new(&host, token);
-    let entitled = match client.json("GET", "/shares", None) {
-        Ok(_) => true,
-        Err(e) if format!("{e:#}").starts_with("share_required") => false,
-        Err(e) => return Err(e),
-    };
-    let _lock = config_lock(home)?;
-    atomic_json(
-        &home.join(CREDENTIALS),
-        &Credentials {
-            host: host.clone(),
-            token: token.into(),
-        },
-    )?;
-    let mut value = account(home, Some(&host))?;
-    value["entitled"] = json!(entitled);
-    Ok(value)
-}
 
 pub fn logout(home: &Path) -> Result<Value> {
     match fs::remove_file(home.join(CREDENTIALS)) {
@@ -1406,6 +1413,23 @@ mod tests {
     }
 
     #[test]
+    fn login_ignores_saved_host_unless_explicitly_overridden() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        fs::create_dir_all(home).unwrap();
+        atomic_json(
+            &home.join(CREDENTIALS),
+            &Credentials {
+                host: "http://127.0.0.1:9".into(),
+                token: "old-token".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(login_host(None).unwrap(), DEFAULT_HOST);
+        assert_eq!(login_host(Some("http://127.0.0.1:9")).unwrap(), "http://127.0.0.1:9");
+        assert_eq!(host_for(home, None).unwrap(), "http://127.0.0.1:9");
+    }
+
     fn create_resumes_after_an_interrupted_upload_and_revokes() {
         let mut f = fixture();
         let host = mock_host(Some(3));
