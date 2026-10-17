@@ -249,6 +249,11 @@ fn effective_scope(scope: &str, read_write: bool) -> Result<&'static str> {
     Ok(if scope == "write" && read_write { "write" } else { "read" })
 }
 
+fn local_error_code(body: &[u8]) -> Option<i64> {
+    let code = serde_json::from_slice::<Value>(body).ok()?.get("error")?.get("code")?.as_i64()?;
+    matches!(code, -32700 | -32600 | -32601 | -32602 | -32603 | -32020 | -32022).then_some(code)
+}
+
 fn forward(frame: RequestFrame, url: &str, read_write: bool, cancelled: &AtomicBool, tx: &SyncSender<Value>) -> Result<()> {
     ensure!(frame.method == "POST" && frame.body.len() <= MAX_REQUEST, "unsupported or oversized request");
     let scope = effective_scope(&frame.scope, read_write)?;
@@ -258,25 +263,40 @@ fn forward(frame: RequestFrame, url: &str, read_write: bool, cancelled: &AtomicB
         .header("content-type", "application/json")
         .header("X-Vamp-Mcp-Scope", scope);
     for (key, value) in &frame.headers {
-        if matches!(key.to_ascii_lowercase().as_str(), "accept" | "mcp-protocol-version" | "mcp-session-id" | "last-event-id") { request = request.header(key, value); }
+        if matches!(key.to_ascii_lowercase().as_str(), "accept" | "mcp-protocol-version" | "mcp-method" | "mcp-name" | "mcp-session-id" | "last-event-id") { request = request.header(key, value); }
     }
     let mut response = request.send(frame.body.as_bytes())?;
     let headers: HashMap<String, String> = response.headers().iter().filter_map(|(key,value)| {
         matches!(key.as_str(), "content-type" | "mcp-session-id" | "mcp-protocol-version" | "retry-after").then(|| value.to_str().ok().map(|v|(key.to_string(),v.to_owned()))).flatten()
     }).collect();
-    emit(tx, cancelled, json!({"type":"start","id":frame.id,"status":response.status().as_u16(),"headers":headers}))?;
+    let status = response.status().as_u16();
+    emit(tx, cancelled, json!({"type":"start","id":frame.id,"status":status,"headers":headers}))?;
     let mut reader = response.body_mut().as_reader();
     let mut buffer = [0u8; 32_768];
     let mut total = 0;
+    let mut error_prefix = [0u8; 16_384];
+    let mut error_length = 0;
     loop {
         ensure!(!cancelled.load(Ordering::Relaxed), "request cancelled");
         let n = reader.read(&mut buffer)?;
         if n == 0 { break; }
         total += n;
         ensure!(total <= MAX_RESPONSE, "response exceeds relay limit");
+        if status >= 300 {
+            let copied = n.min(error_prefix.len() - error_length);
+            error_prefix[error_length..error_length + copied].copy_from_slice(&buffer[..copied]);
+            error_length += copied;
+        }
         emit(tx, cancelled, json!({"type":"chunk","id":frame.id,"data":STANDARD.encode(&buffer[..n])}))?;
     }
-    emit(tx, cancelled, json!({"type":"end","id":frame.id}))
+    let error_code = if status >= 300 { local_error_code(&error_prefix[..error_length]) } else { None };
+    if status >= 300 {
+        match error_code {
+            Some(code) => eprintln!("Relay local response: status={status} error_code={code}"),
+            None => eprintln!("Relay local response: status={status} error_code=unknown"),
+        }
+    }
+    emit(tx, cancelled, json!({"type":"end","id":frame.id,"error_code":error_code}))
 }
 
 fn session(config: &Config, local_url: &str, read_write: bool, stopped: &AtomicBool) -> Result<()> {
@@ -328,7 +348,10 @@ fn session(config: &Config, local_url: &str, read_write: bool, stopped: &AtomicB
                             let url = local_url.to_owned();
                             let worker_id = id.clone();
                             let handle = thread::spawn(move || {
-                                if forward(frame,&url,read_write,&worker_cancelled,&tx).is_err() { let _ = emit(&tx,&worker_cancelled,json!({"type":"error","id":worker_id})); }
+                                if forward(frame,&url,read_write,&worker_cancelled,&tx).is_err() {
+                                    eprintln!("Relay local request failed: error_code=transport_error");
+                                    let _ = emit(&tx,&worker_cancelled,json!({"type":"error","id":worker_id}));
+                                }
                             });
                             jobs.insert(id,(cancelled,handle));
                         },
@@ -375,6 +398,41 @@ fn connect(home: &Path, context: Option<&str>, read_write: bool) -> Result<Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forwarding_preserves_per_request_method_headers_and_reports_only_error_codes() {
+        let response_body = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32020,"message":"private fixture content"}});
+        let (endpoint, requests, worker) = mock_relay(|_| vec![(400, response_body.clone())]);
+        let headers = HashMap::from([
+            ("Accept".to_owned(), "application/json, text/event-stream".to_owned()),
+            ("MCP-Protocol-Version".to_owned(), "2026-07-28".to_owned()),
+            ("Mcp-Method".to_owned(), "tools/call".to_owned()),
+            ("Mcp-Name".to_owned(), "vamp_query".to_owned()),
+            ("authorization".to_owned(), "Bearer must-not-forward".to_owned()),
+            ("cookie".to_owned(), "must-not-forward".to_owned()),
+        ]);
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"vamp_query","arguments":{}}});
+        let frame = RequestFrame { id:"fixture".to_owned(), method:"POST".to_owned(), headers, body:body.to_string(), scope:"read".to_owned() };
+        let (tx, rx) = mpsc::sync_channel(8);
+        forward(frame, &endpoint, false, &AtomicBool::new(false), &tx).unwrap();
+        drop(tx);
+        worker.join().unwrap();
+        let request = requests.recv().unwrap();
+        assert_eq!(request.headers["mcp-method"], "tools/call");
+        assert_eq!(request.headers["mcp-name"], "vamp_query");
+        assert_eq!(request.headers["mcp-protocol-version"], "2026-07-28");
+        assert_eq!(request.headers["accept"], "application/json, text/event-stream");
+        assert!(!request.headers.contains_key("authorization"));
+        assert!(!request.headers.contains_key("cookie"));
+        assert_eq!(request.body, body);
+        let frames: Vec<_> = rx.into_iter().collect();
+        assert_eq!(frames[0]["status"], 400);
+        assert_eq!(frames.last().unwrap()["error_code"], -32020);
+        let bytes: Vec<_> = frames.iter().filter_map(|frame| frame["data"].as_str()).flat_map(|data| STANDARD.decode(data).unwrap()).collect();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), response_body);
+        assert_eq!(local_error_code(br#"{"error":{"code":123456,"message":"private"}}"#), None);
+        assert_eq!(local_error_code(br#"{"error":{"code":"private"}}"#), None);
+        assert_eq!(local_error_code(b"not json"), None);
+    }
     #[test]
     fn endpoint_requires_secure_origin() {
         assert!(endpoint_url("https://mcp.vamp.sh").is_ok());

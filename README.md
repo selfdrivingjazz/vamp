@@ -203,6 +203,12 @@ computer and a write-capable OAuth grant; either side remaining read-only preven
 AI-client grants on the account page when needed. Vampire for Mac exposes the read-only
 tunnel in **Settings → Agents → Use from ChatGPT and Claude anywhere**.
 
+The tunnel preserves MCP's per-request `Mcp-Method` and `Mcp-Name` metadata alongside
+the protocol version, including the current stateless protocol and legacy initialization.
+If the local MCP handler rejects a request, stderr reports only its HTTP status and a
+recognized numeric JSON-RPC error code (or `unknown`), never response messages, library
+content or credentials. Transport failures use the fixed `transport_error` category.
+
 
 ## Contents
 
