@@ -39,7 +39,7 @@ const MAX_JSON: u64 = 1024 * 1024;
 /// Upper bound for a client-rendered provisional thumbnail (`POST /v1/assets/{id}/preview`).
 const MAX_PREVIEW: u64 = 4 * 1024 * 1024;
 /// Library-scoped native operations served by `POST /v1/native` (replicas forward these).
-/// Excluded: operations taking authority filesystem paths or raw bytes.
+/// Excluded: operations taking authority filesystem paths. Exploration media is bounded.
 const NATIVE_OPERATIONS: &[&str] = &[
     "browse",
     "galaxy",
@@ -64,6 +64,13 @@ const NATIVE_OPERATIONS: &[&str] = &[
     "tag_delete",
     "palette",
     "hash",
+    "explore_ensure",
+    "explore_add",
+    "explore_summary",
+    "explore_show",
+    "explore_list",
+    "explore_link",
+    "explore_changes",
 ];
 
 /// Read the server token, creating a random one (0600) on first use.
@@ -491,14 +498,18 @@ pub(crate) fn handle(app: &Arc<App>, mut request: Request) {
     } else {
         match authorized(app, &request) {
             Err(message) => error_reply(401, &message),
-            // Catalog events from this request name the tailnet peer (the user's device) as
-            // actor; token requests keep the server's VAMP_ACTOR.
-            Ok(peer) => match vamp_core::with_actor(peer.as_ref().map(peer_actor), || {
-                route(app, &mut request, peer.as_ref())
-            }) {
-                Ok(reply) => reply,
-                Err(HttpError(status, message)) => error_reply(status, &message),
-            },
+            // Authenticated clients may identify an agent, but cannot claim to be an
+            // owner/device. This attribution does not grant any additional access.
+            Ok(peer) => {
+                let actor = request_header(&request, "X-Vamp-Actor")
+                    .filter(|actor| vamp_core::is_agent(actor) && actor.len() <= 128 && actor.is_ascii() && !actor.chars().any(char::is_control))
+                    .map(str::to_owned)
+                    .or_else(|| peer.as_ref().map(peer_actor));
+                match vamp_core::with_actor(actor, || route(app, &mut request, peer.as_ref())) {
+                    Ok(reply) => reply,
+                    Err(HttpError(status, message)) => error_reply(status, &message),
+                }
+            }
         }
     };
     if let Some(origin) = origin {
@@ -936,7 +947,10 @@ fn route(
             ))
         }
         (Method::Post, ["v1", "native"]) => {
-            let mut body: Value = read_json(request)?;
+            // Base64 exploration findings may contain up to 64 MiB of media.
+            let bytes = read_body(request, (vamp_core::native::MAX_MEDIA + 2) / 3 * 4 + MAX_JSON)?;
+            let mut body: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| HttpError(400, format!("invalid JSON body: {e}")))?;
             let operation = body["operation"].as_str().unwrap_or_default().to_owned();
             if !NATIVE_OPERATIONS.contains(&operation.as_str()) {
                 return Err(HttpError(
