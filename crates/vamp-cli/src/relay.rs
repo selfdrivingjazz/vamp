@@ -19,11 +19,14 @@ pub struct Args {
 
 #[derive(Subcommand)]
 enum RelayCommand {
-    /// Open account sign-in, or install a tunnel token downloaded from the account page.
+    /// Open account sign-in, exchange a pairing code, or import a downloaded tunnel token.
     Login {
-        /// Owner-only file containing the scoped tunnel token (never pass a token as an argument).
-        #[arg(long)]
+        /// Downloaded file containing the scoped tunnel token (never pass a token as an argument).
+        #[arg(long, conflicts_with = "pair_code")]
         token_file: Option<PathBuf>,
+        /// Single-use pairing code from the account page (expires after ten minutes).
+        #[arg(long, conflicts_with = "token_file")]
+        pair_code: Option<String>,
         #[arg(long, default_value = DEFAULT_ENDPOINT)]
         endpoint: String,
     },
@@ -55,6 +58,12 @@ struct RemoteConfig {
     websocket_url: String,
 }
 
+#[derive(Deserialize)]
+struct PairedCredential {
+    token: String,
+    account_id: String,
+}
+
 fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(10)))
@@ -72,15 +81,52 @@ fn endpoint_url(endpoint: &str) -> Result<tungstenite::http::Uri> {
     Ok(uri)
 }
 
-fn private_read(path: &Path) -> Result<String> {
+fn read_credential(path: &Path, require_private: bool) -> Result<String> {
     let metadata = fs::symlink_metadata(path).context("reading relay credential metadata")?;
     ensure!(metadata.file_type().is_file(), "relay credential must be a regular file, not a symlink");
     #[cfg(unix)] {
         use std::os::unix::fs::PermissionsExt;
-        ensure!(metadata.permissions().mode() & 0o077 == 0, "relay credential must be owner-only (chmod 600)");
+        if metadata.permissions().mode() & 0o077 != 0 {
+            ensure!(!require_private, "relay credential must be owner-only (chmod 600)");
+            eprintln!("Warning: the downloaded tunnel token is readable by other users. It will be saved privately; delete the downloaded file after login.");
+        }
     }
     ensure!(metadata.len() <= 16_384, "relay credential file is too large");
     fs::read_to_string(path).context("reading relay credential")
+}
+
+fn private_read(path: &Path) -> Result<String> {
+    read_credential(path, true)
+}
+
+fn valid_secret(value: &str, prefix: &str) -> bool {
+    value.starts_with(prefix) && value.len() == prefix.len() + 43
+        && value.bytes().skip(prefix.len()).all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn exchange_pair_code(endpoint: &str, code: &str) -> Result<PairedCredential> {
+    ensure!(valid_secret(code, ""), "invalid pairing code; copy a new code from the account page");
+    let mut response = http_agent().post(format!("{endpoint}/api/relay/pair"))
+        .header("content-type", "application/json")
+        .send(serde_json::to_vec(&json!({"code":code}))?.as_slice())
+        .map_err(|_| anyhow::anyhow!("connecting to relay pairing service"))?;
+    let status = response.status();
+    let body = response.body_mut().with_config().limit(16_384).read_to_vec()
+        .map_err(|_| anyhow::anyhow!("reading relay pairing response"))?;
+    if !status.is_success() {
+        // Only display known errors, never arbitrary service text that might echo a secret.
+        let error: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        match (status.as_u16(), error.get("error").and_then(Value::as_str)) {
+            (400, Some("invalid_pair_code")) => bail!("invalid or expired pairing code; codes are single-use and expire after ten minutes; get a new code from the account page"),
+            (429, Some("rate_limited")) => bail!("relay pairing is rate limited; try again later"),
+            (403, Some("entitlement")) => bail!("relay pairing requires an active relay entitlement"),
+            _ => bail!("relay rejected pairing (HTTP {})", status.as_u16()),
+        }
+    }
+    let credential: PairedCredential = serde_json::from_slice(&body)
+        .map_err(|_| anyhow::anyhow!("invalid relay pairing response"))?;
+    ensure!(valid_secret(&credential.token, "vat_") && !credential.account_id.is_empty(), "invalid relay pairing response");
+    Ok(credential)
 }
 
 fn load(home: &Path) -> Result<Config> {
@@ -89,26 +135,35 @@ fn load(home: &Path) -> Result<Config> {
 
 pub fn run(args: Args, home: &Path, context: Option<&str>) -> Result<Value> {
     match args.command {
-        RelayCommand::Login { token_file, endpoint } => {
+        RelayCommand::Login { token_file, pair_code, endpoint } => {
             let endpoint = endpoint.trim_end_matches('/').to_owned();
             endpoint_url(&endpoint)?;
-            let Some(file) = token_file else {
+            let (token, paired_account) = if let Some(code) = pair_code {
+                let credential = exchange_pair_code(&endpoint, &code)?;
+                (credential.token, Some(credential.account_id))
+            } else if let Some(file) = token_file.as_deref() {
+                let raw = read_credential(file, false)?;
+                let token = if raw.trim_start().starts_with('{') {
+                    serde_json::from_str::<Value>(&raw)
+                        .map_err(|_| anyhow::anyhow!("invalid tunnel token file"))?
+                        .get("token").and_then(Value::as_str).context("token file needs a token field")?.to_owned()
+                } else { raw.trim().to_owned() };
+                (token, None)
+            } else {
                 let url = format!("{endpoint}/account");
                 // Opening a browser is best-effort; the returned URL also works on headless machines.
                 #[cfg(target_os = "macos")]
                 let _ = Command::new("open").arg(&url).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
                 #[cfg(target_os = "linux")]
                 let _ = Command::new("xdg-open").arg(&url).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
-                return Ok(json!({"login_url":url,"next":"Sign in, download a tunnel token, then run vamp relay login --token-file FILE."}));
+                return Ok(json!({"login_url":url,"next":"Sign in, then run vamp relay login --pair-code CODE with a single-use code. Or download a tunnel token and run vamp relay login --token-file FILE."}));
             };
-            let raw = private_read(&file)?;
-            let token = if raw.trim_start().starts_with('{') {
-                serde_json::from_str::<Value>(&raw)?.get("token").and_then(Value::as_str).context("token file needs a token field")?.to_owned()
-            } else { raw.trim().to_owned() };
-            ensure!(token.starts_with("vat_") && token.len() == 47 && token.bytes().skip(4).all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'), "invalid tunnel token file");
+            ensure!(valid_secret(&token, "vat_"), "invalid tunnel token file");
             let mut response = http_agent().get(format!("{endpoint}/api/relay/config")).header("authorization", format!("Bearer {token}")).call().context("connecting to relay")?;
             ensure!(response.status().is_success(), "relay rejected tunnel credential or relay subscription is inactive (HTTP {})", response.status().as_u16());
-            let remote: RemoteConfig = serde_json::from_slice(&response.body_mut().with_config().limit(16_384).read_to_vec()?)?;
+            let remote: RemoteConfig = serde_json::from_slice(&response.body_mut().with_config().limit(16_384).read_to_vec()?)
+                .map_err(|_| anyhow::anyhow!("invalid relay configuration response"))?;
+            ensure!(paired_account.as_deref().is_none_or(|account| account == remote.account_id), "relay pairing account does not match configuration");
             ensure!(remote.mcp_url == format!("{endpoint}/mcp/{}",remote.account_id), "relay returned an unexpected resource URL");
             let expected_ws = format!("{}/api/relay/tunnel", endpoint.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1));
             ensure!(remote.websocket_url == expected_ws, "relay returned an unexpected tunnel URL");
@@ -122,7 +177,11 @@ pub fn run(args: Args, home: &Path, context: Option<&str>) -> Result<Value> {
             let result = (|| -> Result<()> { let mut f = options.open(&temp)?; f.write_all(&serde_json::to_vec(&config)?)?; f.sync_all()?; fs::rename(&temp, home.join("relay.json"))?; Ok(()) })();
             if result.is_err() { let _ = fs::remove_file(&temp); }
             result?;
-            Ok(json!({"configured":true,"account_id":config.account_id,"mcp_url":config.mcp_url,"read_only_default":true}))
+            let mut result = json!({"configured":true,"account_id":config.account_id,"mcp_url":config.mcp_url,"read_only_default":true});
+            if token_file.is_some() {
+                result["next"] = json!("Delete the downloaded tunnel token file now; the saved relay credential is private.");
+            }
+            Ok(result)
         }
         RelayCommand::Status => {
             if !home.join("relay.json").exists() { return Ok(json!({"configured":false})); }
@@ -329,5 +388,206 @@ mod tests {
         assert_eq!(effective_scope("read", true).unwrap(), "read");
         assert_eq!(effective_scope("write", true).unwrap(), "write");
         assert!(effective_scope("admin", true).is_err());
+    }
+
+    struct CapturedRequest {
+        method: String,
+        url: String,
+        headers: HashMap<String, String>,
+        body: Value,
+    }
+
+    fn mock_relay(responses: impl FnOnce(&str) -> Vec<(u16, Value)>) -> (String, mpsc::Receiver<CapturedRequest>, thread::JoinHandle<()>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.server_addr());
+        let responses = responses(&endpoint);
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            for (status, body) in responses {
+                let mut request = server.recv_timeout(Duration::from_secs(5)).unwrap().expect("expected relay request");
+                let mut raw = String::new();
+                request.as_reader().read_to_string(&mut raw).unwrap();
+                let captured = CapturedRequest {
+                    method: request.method().to_string(),
+                    url: request.url().to_owned(),
+                    headers: request.headers().iter().map(|header| (header.field.as_str().to_string().to_ascii_lowercase(), header.value.to_string())).collect(),
+                    body: if raw.is_empty() { Value::Null } else { serde_json::from_str(&raw).unwrap() },
+                };
+                let response = tiny_http::Response::from_string(body.to_string())
+                    .with_status_code(status)
+                    .with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap());
+                request.respond(response).unwrap();
+                tx.send(captured).unwrap();
+            }
+        });
+        (endpoint, rx, worker)
+    }
+
+    fn remote_config(endpoint: &str, account: &str) -> Value {
+        json!({
+            "account_id":account,
+            "mcp_url":format!("{endpoint}/mcp/{account}"),
+            "websocket_url":format!("{}/api/relay/tunnel", endpoint.replacen("http://", "ws://", 1)),
+        })
+    }
+
+    fn login(home: &Path, endpoint: String, token_file: Option<PathBuf>, pair_code: Option<String>) -> Result<Value> {
+        run(Args { command: RelayCommand::Login { token_file, pair_code, endpoint } }, home, None)
+    }
+
+    #[test]
+    fn pairing_installs_without_a_download_or_secret_output() {
+        let home = tempfile::tempdir().unwrap();
+        let code = "p".repeat(43);
+        let token = format!("vat_{}", "t".repeat(43));
+        let (endpoint, requests, worker) = mock_relay(|endpoint| vec![
+            (200, json!({"token":token,"account_id":"account_test"})),
+            (200, remote_config(endpoint, "account_test")),
+        ]);
+        let result = login(home.path(), endpoint, None, Some(code.clone())).unwrap();
+        worker.join().unwrap();
+        let pair = requests.recv().unwrap();
+        assert_eq!(pair.method, "POST");
+        assert_eq!(pair.url, "/api/relay/pair");
+        assert_eq!(pair.headers["content-type"], "application/json");
+        assert!(!pair.headers.contains_key("authorization"));
+        assert!(pair.body == json!({"code":code}));
+        let config = requests.recv().unwrap();
+        assert_eq!(config.method, "GET");
+        assert_eq!(config.url, "/api/relay/config");
+        assert!(config.headers["authorization"] == format!("Bearer {token}"));
+        assert_eq!(result["configured"], true);
+        assert_eq!(result["account_id"], "account_test");
+        assert!(!result.to_string().contains(&code));
+        assert!(!result.to_string().contains(&token));
+        assert!(!result.to_string().contains("Delete"));
+        let saved = load(home.path()).unwrap();
+        assert!(saved.token == token);
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(home.path().join("relay.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let status = run(Args { command: RelayCommand::Status }, home.path(), None).unwrap();
+        assert!(!status.to_string().contains(&token));
+    }
+
+    #[test]
+    fn pair_code_and_token_file_conflict_without_echoing_code() {
+        use clap::Parser;
+        let code = "p".repeat(43);
+        let error = crate::Cli::try_parse_from(["vamp", "relay", "login", "--pair-code", &code, "--token-file", "token.json"]).err().unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(!error.to_string().contains(&code));
+        assert!(crate::Cli::try_parse_from(["vamp", "relay", "login", "--pair-code", &code]).is_ok());
+    }
+
+    #[test]
+    fn pairing_rejects_bad_codes_before_connecting() {
+        for code in ["".to_owned(), "p".repeat(42), "p".repeat(44), format!("{}=", "p".repeat(42)), format!("vat_{}", "t".repeat(43))] {
+            let error = exchange_pair_code("http://127.0.0.1:0", &code).err().unwrap().to_string();
+            assert!(error.contains("invalid pairing code"));
+            if !code.is_empty() { assert!(!error.contains(&code)); }
+        }
+    }
+
+    #[test]
+    fn pairing_errors_are_friendly_and_do_not_echo_service_text() {
+        let code = "p".repeat(43);
+        let token = format!("vat_{}", "t".repeat(43));
+        for (status, error, expected) in [
+            (400, "invalid_pair_code", "single-use"),
+            (429, "rate_limited", "rate limited"),
+            (403, "entitlement", "active relay entitlement"),
+            (500, token.as_str(), "HTTP 500"),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let (endpoint, _requests, worker) = mock_relay(|_| vec![(status, json!({"error":error,"detail":code,"token":token}))]);
+            let error = login(home.path(), endpoint, None, Some(code.clone())).err().unwrap().to_string();
+            worker.join().unwrap();
+            assert!(error.contains(expected));
+            assert!(!error.contains(&code));
+            assert!(!error.contains(&token));
+            assert!(!home.path().join("relay.json").exists());
+        }
+    }
+
+    #[test]
+    fn pairing_validates_response_before_installing() {
+        let token = format!("vat_{}", "t".repeat(43));
+        for response in [
+            json!({"account_id":"account_test"}),
+            json!({"token":"invalid","account_id":"account_test"}),
+            json!({"token":token,"account_id":""}),
+            json!({"token":token,"account_id":42}),
+            json!(token),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let (endpoint, _requests, worker) = mock_relay(|_| vec![(200, response)]);
+            let error = login(home.path(), endpoint, None, Some("p".repeat(43))).err().unwrap().to_string();
+            worker.join().unwrap();
+            assert!(error.contains("invalid relay pairing response"));
+            assert!(!error.contains(&token));
+            assert!(!home.path().join("relay.json").exists());
+        }
+    }
+
+    #[test]
+    fn pairing_requires_matching_configuration_account_and_urls() {
+        for bad in ["account", "mcp_url", "websocket_url"] {
+            let home = tempfile::tempdir().unwrap();
+            let token = format!("vat_{}", "t".repeat(43));
+            let (endpoint, _requests, worker) = mock_relay(|endpoint| {
+                let mut remote = remote_config(endpoint, if bad == "account" { "other_account" } else { "account_test" });
+                if bad != "account" { remote[bad] = json!("https://example.com/unexpected"); }
+                vec![(200, json!({"token":token,"account_id":"account_test"})), (200, remote)]
+            });
+            assert!(login(home.path(), endpoint, None, Some("p".repeat(43))).is_err());
+            worker.join().unwrap();
+            assert!(!home.path().join("relay.json").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_download_installs_private_credential_and_delete_hint() {
+        use std::os::unix::fs::PermissionsExt;
+        for json_file in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("home");
+            fs::create_dir(&home).unwrap();
+            let file = directory.path().join("download.json");
+            let token = format!("vat_{}", "t".repeat(43));
+            let contents = if json_file { json!({"token":token}).to_string() } else { format!("{token}\n") };
+            fs::write(&file, contents).unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(private_read(&file).is_err());
+            // Installing also replaces any previously readable saved file with a private one.
+            fs::write(home.join("relay.json"), "{}").unwrap();
+            fs::set_permissions(home.join("relay.json"), fs::Permissions::from_mode(0o644)).unwrap();
+            let (endpoint, _requests, worker) = mock_relay(|endpoint| vec![(200, remote_config(endpoint, "account_test"))]);
+            let result = login(&home, endpoint, Some(file.clone()), None).unwrap();
+            worker.join().unwrap();
+            assert!(result["next"].as_str().unwrap().contains("Delete the downloaded"));
+            assert!(!result.to_string().contains(&token));
+            assert!(file.exists());
+            assert_eq!(fs::metadata(home.join("relay.json")).unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(load(&home).unwrap().token == token);
+            fs::set_permissions(home.join("relay.json"), fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(load(&home).is_err());
+            assert!(run(Args { command: RelayCommand::Status }, &home, None).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn downloaded_credentials_still_require_bounded_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("download.json");
+        let link = directory.path().join("link.json");
+        fs::write(&file, "t".repeat(16_385)).unwrap();
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(read_credential(&file, false).is_err());
+        assert!(read_credential(&link, false).is_err());
+        assert!(read_credential(directory.path(), false).is_err());
     }
 }

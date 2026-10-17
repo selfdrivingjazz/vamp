@@ -178,12 +178,23 @@ is streamed through the relay, not stored there, and no public library links are
 
 ```sh
 vamp relay login                  # opens the account page, also prints its URL
-# Sign in, download a tunnel token, then protect and import that file:
-chmod 600 /path/to/tunnel-token.json
-vamp relay login --token-file /path/to/tunnel-token.json
+# Sign in and copy the single-use pairing code from the account page:
+vamp relay login --pair-code CODE # no token download needed
 vamp relay status                 # prints the remote MCP URL, never the credential
 vamp --context refs relay connect # keep running; read-only by default
 ```
+
+Pairing codes expire after ten minutes and can be exchanged only once. They are not
+long-lived tunnel credentials; do not share them. `--pair-code` cannot be combined with
+`--token-file`. Vampire for Mac can pair directly from the account page's
+`vampire://relay/pair?code=...` link.
+
+If direct pairing is unavailable, download a tunnel token from the account page and run
+`vamp relay login --token-file /path/to/tunnel-token.json`. Browser downloads with mode
+0644 are accepted with a warning; `chmod 600` before import is optional extra protection.
+After a successful import, delete the downloaded file as prompted. The saved credential
+in `VAMP_HOME/relay.json` is always created with mode 0600 on Unix, and later reads reject
+group/world permissions. Neither login method prints the code or tunnel token.
 
 Add the URL from `relay status` as a custom MCP connector in your AI client and approve
 OAuth consent. Remote write access requires both `relay connect --read-write` on the
