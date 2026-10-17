@@ -189,7 +189,9 @@ fn forward(frame: RequestFrame, url: &str, read_write: bool, cancelled: &AtomicB
     ensure!(matches!(frame.scope.as_str(), "read" | "write"), "invalid request scope");
     ensure!(frame.scope != "write" || read_write, "writes are disabled locally");
     let agent = http_agent();
-    let mut request = agent.post(url).header("content-type", "application/json")
+    // Library traffic must stay on loopback even when the process inherits an HTTP proxy.
+    let mut request = agent.post(url).config().proxy(None).build()
+        .header("content-type", "application/json")
         .header("X-Vamp-Mcp-Scope", if frame.scope == "write" && read_write { "write" } else { "read" });
     for (key, value) in &frame.headers {
         if matches!(key.to_ascii_lowercase().as_str(), "accept" | "mcp-protocol-version" | "mcp-session-id" | "last-event-id") { request = request.header(key, value); }
