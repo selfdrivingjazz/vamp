@@ -216,7 +216,12 @@ fn forward(frame: RequestFrame, url: &str, read_write: bool, cancelled: &AtomicB
 fn session(config: &Config, local_url: &str, read_write: bool, stopped: &AtomicBool) -> Result<()> {
     let mut request = config.websocket_url.as_str().into_client_request()?;
     request.headers_mut().insert("authorization", format!("Bearer {}",config.token).parse()?);
-    let (mut socket, _) = tungstenite::connect(request).context("opening relay tunnel")?;
+    // JSON framing can escape each source byte to six bytes. Bound before tungstenite allocates.
+    let websocket_config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_REQUEST * 6 + 65_536))
+        .max_frame_size(Some(MAX_REQUEST * 6 + 65_536));
+    // Never forward the tunnel credential across a redirect.
+    let (mut socket, _) = tungstenite::client::connect_with_config(request, Some(websocket_config), 0).context("opening relay tunnel")?;
     match socket.get_mut() {
         MaybeTlsStream::Plain(tcp) => { tcp.set_read_timeout(Some(Duration::from_millis(200)))?; tcp.set_write_timeout(Some(Duration::from_secs(10)))?; },
         MaybeTlsStream::Rustls(tls) => { tls.sock.set_read_timeout(Some(Duration::from_millis(200)))?; tls.sock.set_write_timeout(Some(Duration::from_secs(10)))?; },
@@ -242,7 +247,7 @@ fn session(config: &Config, local_url: &str, read_write: bool, stopped: &AtomicB
             match message {
                 Message::Text(text) if text == "pong" => (),
                 Message::Text(text) => {
-                    ensure!(text.len() <= MAX_REQUEST + 16_384, "relay frame is too large");
+                    ensure!(text.len() <= MAX_REQUEST * 6 + 65_536, "relay frame is too large");
                     let value: Value = serde_json::from_str(&text)?;
                     match value.get("type").and_then(Value::as_str) {
                         Some("cancel") => { if let Some((cancelled,_)) = value.get("id").and_then(Value::as_str).and_then(|id|jobs.get(id)) { cancelled.store(true,Ordering::Relaxed); } },
