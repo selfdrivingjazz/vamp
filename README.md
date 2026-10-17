@@ -169,6 +169,30 @@ HTTP uses POST `/mcp`, JSON responses, no sessions and no GET event stream.
 For inspection: `npx @modelcontextprotocol/inspector vamp mcp --read-only`, or start the
 HTTP server above and choose Streamable HTTP with its `/mcp` URL in Inspector.
 
+### Hosted remote access (optional subscription)
+
+The open-source tunnel client also runs on Linux servers. VAMP Connect provides an
+OAuth-protected remote MCP URL for ChatGPT and Claude; it requires an active relay
+entitlement. The computer serving the library must remain awake and connected. Content
+is streamed through the relay, not stored there, and no public library links are created.
+
+```sh
+vamp relay login                  # opens the account page, also prints its URL
+# Sign in, download a tunnel token, then protect and import that file:
+chmod 600 /path/to/tunnel-token.json
+vamp relay login --token-file /path/to/tunnel-token.json
+vamp relay status                 # prints the remote MCP URL, never the credential
+vamp --context refs relay connect # keep running; read-only by default
+```
+
+Add the URL from `relay status` as a custom MCP connector in your AI client and approve
+OAuth consent. Remote write access requires both `relay connect --read-write` on the
+computer and a write-capable OAuth grant; either side remaining read-only prevents writes.
+`vamp relay logout` removes this computer's saved credential; revoke tunnel tokens and
+AI-client grants on the account page when needed. Vampire for Mac exposes the read-only
+tunnel in **Settings → Agents → Use from ChatGPT and Claude anywhere**.
+
+
 ## Contents
 
 | Path | Crate / file | What it is |
