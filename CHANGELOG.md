@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Optional crash and error reports, off by default: `vamp diagnostics status|enable|disable|test`
+  (`vamp setup` also shows the choice). `enable --endpoint URL [--headers-file PATH]` sends
+  OTLP/HTTP JSON log records to that user-chosen OpenTelemetry endpoint only (none is compiled
+  in; a missing or unusable endpoint refuses to enable) for commands failing with
+  `operation_failed` and for panics: an error category, the command path without arguments,
+  component (panic source file and line in VAMP crates), version, OS and architecture; never
+  messages, arguments, paths, library content or identifiers. Bounded (3 per process, 10 per
+  hour per home under a file lock, 4 KiB, 3 s, no queue, no redirects); output and exit status
+  are unchanged. Credentials come from an owner-only headers file (never argv) and live in
+  `<home>/diagnostics.json` (mode 600, never printed), separate from the catalog config;
+  every send re-reads it, so `disable` (which deletes it) also stops running processes;
+  `DO_NOT_TRACK=1` overrides it for a run. `vamp-cli` now always links its HTTP client
+  (`ureq`); `vamp-protocol` and `vamp-core` are unchanged.
 - Removed `vamp share` (hosted sharing parked).
 
 ## 0.2.0 — 2026-10-15
@@ -25,7 +38,6 @@
   addresses) instead of real tailnet names.
 
 ## 0.1.0 — 2026-10-15
-
 - Open-source the `vamp` CLI under MIT: `vamp-core` (engine), `vamp-cli` (binary `vamp`),
   `vamp-media` (image helper), the model processors, the agent manual (`docs/agents/SKILL.md`,
   printed by `vamp guide`) and the Eagle test fixture tool now live here, added as fresh files

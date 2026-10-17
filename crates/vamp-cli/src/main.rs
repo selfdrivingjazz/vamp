@@ -1,3 +1,4 @@
+mod diagnostics;
 mod serve;
 mod setup;
 #[cfg(feature = "remote")]
@@ -8,7 +9,7 @@ mod sync_service;
 mod worker;
 
 use anyhow::{Context as _, Result, bail, ensure};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches as _, Parser, Subcommand, ValueEnum};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
@@ -26,7 +27,7 @@ use vamp_protocol::{Metadata, MetadataPatch, ProcessorSpec, SheetItem, ToolReque
     name = "vamp",
     version,
     about = "Reference-only media catalog for agents",
-    long_about = "Reference-only media catalog for agents. JSON output is the default. Originals are referenced in place and never modified or deleted (ingested bytes such as clips and exploration findings are copied into the library inbox). Search covers metadata and observations; --semantic ranks by embeddings. Set VAMP_ACTOR to identify event authors. Optional media/ML helpers are installed only by explicit setup --install. `vamp guide` prints the agent manual."
+    long_about = "Reference-only media catalog for agents. JSON output is the default. Originals are referenced in place and never modified or deleted (ingested bytes such as clips and exploration findings are copied into the library inbox). Search covers metadata and observations; --semantic ranks by embeddings. Set VAMP_ACTOR to identify event authors. Optional media/ML helpers are installed only by explicit setup --install. Crash and error reports are off unless enabled with `vamp diagnostics enable`. `vamp guide` prints the agent manual."
 )]
 struct Cli {
     #[arg(
@@ -145,6 +146,12 @@ enum Command {
         )]
         device: Option<String>,
     },
+    /// Optional crash and error reports to an OpenTelemetry endpoint you choose (off by
+    /// default; `status` lists exactly what a report holds).
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommand,
+    },
     /// Pull the authority's changes into the current replica context's mirror.
     #[cfg(feature = "remote")]
     Sync {
@@ -234,6 +241,28 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+}
+#[derive(Subcommand)]
+enum DiagnosticsCommand {
+    /// Whether reports are on, where they go (credentials redacted) and what they hold.
+    Status,
+    /// Opt in: send bounded crash/error reports (no messages, arguments, paths or library
+    /// content) to this OTLP/HTTP endpoint.
+    Enable {
+        /// OTLP/HTTP base URL; reports are POSTed to <endpoint>/v1/logs (e.g.
+        /// http://localhost:4318 or https://otlp-gateway-<region>.grafana.net/otlp).
+        #[arg(long)]
+        endpoint: String,
+        /// File of request headers, one NAME=VALUE per line (e.g.
+        /// Authorization=Basic <base64 instance:token>), readable only by you (chmod 600). Kept
+        /// out of argv and shell history; copied mode 600 into <home>/diagnostics.json, never printed.
+        #[arg(long, value_name = "PATH")]
+        headers_file: Option<PathBuf>,
+    },
+    /// Opt out: stop reporting and forget the endpoint and its credentials.
+    Disable,
+    /// Send one test report now and print whether the endpoint accepted it.
+    Test,
 }
 #[cfg(feature = "remote")]
 #[derive(Args)]
@@ -926,7 +955,7 @@ fn command_tree(command: &clap::Command) -> Value {
         let kind = if matches!(arg.get_action(), clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Help | clap::ArgAction::HelpShort | clap::ArgAction::HelpLong | clap::ArgAction::Version) { "boolean" }
             else { match arg.get_id().as_str() {
                 "limit" | "offset" | "after" | "expected_revision" | "columns" | "cell_size" | "interval_seconds" => "integer",
-                "home" | "original_root" | "state_dir" | "source" | "path" | "metadata" | "patch" | "output" | "spec" => "path",
+                "home" | "original_root" | "state_dir" | "source" | "path" | "metadata" | "patch" | "output" | "spec" | "headers_file" => "path",
                 _ => "string",
             }};
         let choices = parser.possible_values().map(|values| values.filter(|v| !v.is_hide_set()).map(|v| v.get_name().to_owned()).collect::<Vec<_>>());
@@ -1080,6 +1109,15 @@ fn execute(cli: Cli) -> Result<Value> {
             source.as_deref(),
             device.as_deref(),
         ),
+        Command::Diagnostics { command } => match command {
+            DiagnosticsCommand::Status => diagnostics::status(&home),
+            DiagnosticsCommand::Enable {
+                endpoint,
+                headers_file,
+            } => diagnostics::enable(&home, &endpoint, headers_file.as_deref()),
+            DiagnosticsCommand::Disable => diagnostics::disable(&home),
+            DiagnosticsCommand::Test => diagnostics::test(&home),
+        },
         #[cfg(feature = "remote")]
         Command::Sync {
             command: Some(SyncCommand::InstallService),
@@ -1807,8 +1845,16 @@ fn guide() -> &'static str {
 }
 fn main() -> ExitCode {
     vamp_core::allow_cloud_placeholder_reads();
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
+    let mut command = Cli::command();
+    let parsed = command
+        .try_get_matches_from_mut(std::env::args_os())
+        .and_then(|mut matches| {
+            let operation = diagnostics::operation(&matches);
+            Cli::from_arg_matches_mut(&mut matches).map(|cli| (cli, operation))
+        })
+        .map_err(|error| error.format(&mut command));
+    let (cli, operation) = match parsed {
+        Ok(parsed) => parsed,
         Err(error) => {
             if matches!(
                 error.kind(),
@@ -1827,6 +1873,16 @@ fn main() -> ExitCode {
         print!("{}", guide());
         return ExitCode::SUCCESS;
     }
+    // Only with the user's opt-in (`vamp diagnostics enable`); the diagnostics commands
+    // themselves never report.
+    let reporter = if matches!(cli.command, Command::Diagnostics { .. }) {
+        None
+    } else {
+        diagnostics::reporter(&cli.home.clone().unwrap_or_else(default_home))
+    };
+    if let Some(reporter) = &reporter {
+        reporter.clone().install_panic_hook(operation.clone());
+    }
     match execute(cli) {
         Ok(value) => {
             use std::io::Write;
@@ -1843,6 +1899,9 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             print_error("operation_failed", format!("{error:#}"));
+            if let Some(reporter) = &reporter {
+                reporter.error(&operation, &error);
+            }
             ExitCode::FAILURE
         }
     }
