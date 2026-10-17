@@ -72,13 +72,6 @@ vamp explore link vamp-sh --asset <asset_id>   # the same, selecting one item
 - `vamp explore changes vamp-sh` — what actors other than you changed in the exploration since your last read, then advances your cursor (`--peek` leaves it, `--since N` replays from event N). JSON: `reader`, `since`, `cursor`, `items` (each touched item's current `name`, `rating`, `tags`, `description`, `note` (what you added it with), `trashed`, `deleted`, `folders`, plus its raw `events`: `sequence`, `kind`, `actor`, `at`, `payload`), `folder_events` (renames, new or deleted sub-folders).
 - VAMP attaches no meaning to these changes: a rating, a tag, a note, a move or the Trash means whatever the owner says it means. Use the interpretation given in your mission prompt; if there is none, report the raw changes and ask him how to read them rather than assuming a convention.
 
-## Share (publish a snapshot link)
-The `share` commands publish a frozen snapshot of a folder, an exploration or a selection to a share host (default https://app.vamp.sh, or `VAMP_SHARE_HOST`): previews only, an unlisted link with an expiry, optionally a password. Items in the Trash or tagged `private` are never shared; fields left off (notes, tags, source links…) never leave the machine. It needs a publisher token (`vamp share login --token …`, from the owner).
-- Create a share only when the owner asks. Run `vamp share plan --exploration SLUG` (or `--folder NAME`, `--select ID,ID`) first and show him the counts and exclusions.
-- Default to `--ttl 7d` and no notes/tags (`--notes`, `--tags`, `--source-links` only when he says so); a password comes from stdin (`--password-stdin`).
-- `vamp share create --exploration SLUG --ttl 7d` → `{id, url, status, expires_at, asset_count, bytes}`. Hand the owner the `url`. Re-running an interrupted create resumes it.
-- `vamp share list` shows every share of the account; `vamp share revoke ID` stops one at once.
-
 ## Safety rules
 - Never delete files. `vamp media remove <id>` moves to the trash (restorable with `vamp media restore <id>`). Do not run `vamp media empty-trash` unless the user explicitly asks.
 - Always use `--expected-revision` for updates/removals; never retry a 409/conflict blindly.

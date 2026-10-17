@@ -2,15 +2,7 @@
 
 ## Unreleased
 
-- `vamp share login` without an explicit host now defaults to `https://app.vamp.sh` rather than reusing a previously saved host.
-- Share v0, the public half: `vamp share login|logout|account|plan|create|list|publish|revoke`
-  publishes a frozen snapshot of a folder (with sub-folders), an exploration or a selection to
-  a share host (default `https://app.vamp.sh`, `VAMP_SHARE_HOST`/`--host` override). Items in
-  the Trash or tagged `private` are left out; metadata is scrubbed to the chosen fields before
-  anything is sent; only the existing grid/hires/micro derivatives are uploaded,
-  content-addressed by SHA-256, so interrupted creates resume and re-publishes upload only
-  what changed. The `vamp-share` manifest v1 (`vamp schema` `share_manifest`), the host API and
-  the native ops `share_*` are in the contract section `share`.
+- Removed `vamp share` (hosted sharing parked).
 
 ## 0.2.0 — 2026-10-15
 

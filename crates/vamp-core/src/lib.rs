@@ -49,8 +49,6 @@ mod native_remote;
 pub mod remote;
 #[cfg(feature = "remote")]
 pub mod cache;
-#[cfg(feature = "remote")]
-pub mod share;
 pub mod thumbs;
 pub mod card;
 pub mod explore;
