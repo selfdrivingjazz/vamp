@@ -121,6 +121,27 @@ pub struct Request {
     /// when absent so forwarded bodies stay readable by authorities that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_by: Option<String>,
+    /// Exploration operations use the same core implementation as `vamp explore`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peek: Option<bool>,
 }
 
 /// Browse selects live assets matching every given filter.
@@ -470,6 +491,34 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
             .context("invalid rules; expected {match, rules:[{field, op, value}]}")
     };
     match request.operation.as_str() {
+        "explore_ensure" => {
+            explore::agent_actor()?;
+            library.explore_ensure(request.slug.as_deref().context("slug is required")?, request.title.as_deref(), request.brief.as_deref())
+        }
+        "explore_add" => {
+            explore::agent_actor()?;
+            let content = if let Some(encoded) = &request.bytes_base64 {
+                ensure!(encoded.len() as u64 <= (MAX_MEDIA + 2) / 3 * 4, "exploration media exceeds 64 MiB");
+                let bytes = decode_base64(encoded)?;
+                ensure!(bytes.len() as u64 <= MAX_MEDIA, "exploration media exceeds 64 MiB");
+                explore::Content::Bytes { bytes, filename: request.filename.clone().context("filename is required")?, image_url: request.image_url.clone() }
+            } else {
+                explore::Content::Card { kind: request.kind.clone().unwrap_or_else(|| if request.url.is_some() { "link" } else { "note" }.into()) }
+            };
+            library.explore_add(
+                request.slug.as_deref().context("slug is required")?,
+                explore::Finding { name: name()?.to_owned(), note: request.note.clone(), tags: request.tags.clone(), url: request.url.clone(), folder: request.folder.clone(), content },
+                media_helper().as_deref(),
+            )
+        }
+        "explore_summary" => {
+            explore::agent_actor()?;
+            library.explore_summary(request.slug.as_deref().context("slug is required")?, request.text.as_deref().context("text is required")?)
+        }
+        "explore_show" => library.explore_show(request.slug.as_deref().context("slug is required")?),
+        "explore_list" => library.explore_list(),
+        "explore_link" => library.explore_link(request.slug.as_deref().context("slug is required")?, request.asset_id.as_deref(), request.server_url.as_deref().or(library.server_url()?.as_deref())),
+        "explore_changes" => library.explore_changes(request.slug.as_deref().context("slug is required")?, request.since, !request.peek.unwrap_or(false)),
         "browse" if request.semantic => embeddings::native::semantic_browse(library, &request),
         "similar" => embeddings::native::similar(library, &request),
         // Authority pack for in-memory similarity browsing (replicas: native_remote).

@@ -218,6 +218,12 @@ impl Client {
         })
     }
     fn authorize<B>(&self, request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        // Agent provenance is supplied only to already-authenticated authorities. It is
+        // attribution, never a credential or an authorization decision.
+        let actor = crate::current_actor();
+        let request = if crate::is_agent(&actor) && actor.len() <= 128 && actor.is_ascii() && !actor.chars().any(char::is_control) {
+            request.header("X-Vamp-Actor", actor)
+        } else { request };
         if self.token.is_empty() {
             request
         } else {

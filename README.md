@@ -109,6 +109,66 @@ the collector is on loopback (`localhost`, `127.0.0.1` or `::1`).
   (`status` shows `"do_not_track":true`, `"enabled":false`; `test` refuses). Without it, reports
   are on only while `diagnostics.json` holds consent for the current report version.
 
+## Connect an AI assistant
+
+`vamp mcp` connects an MCP client to the selected authority or replica context. It uses
+stdio by default (only protocol messages go to stdout):
+
+```sh
+claude mcp add vamp -- vamp mcp --read-only
+# To select a particular library:
+claude mcp add vamp -- vamp --context refs mcp --read-only
+```
+
+For Claude Desktop, merge this entry into `mcpServers` in
+`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS (on Windows,
+`%APPDATA%\Claude\claude_desktop_config.json`), preserving other entries. Replace the
+executable with the absolute path printed by `command -v vamp`, then restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "vamp": {
+      "command": "/absolute/path/to/vamp",
+      "args": ["--context", "refs", "mcp", "--read-only"],
+      "env": { "VAMP_ACTOR": "agent:claude-desktop" }
+    }
+  }
+}
+```
+
+Vampire for Mac has **Settings → Agents → Connect to Claude Desktop**: it detects Claude,
+asks before changing its configuration, preserves other servers and backs up the old file.
+It uses the app's bundled CLI and the current library.
+
+For clients that accept Streamable HTTP:
+
+```sh
+vamp mcp --http 127.0.0.1:7790
+# MCP endpoint: http://127.0.0.1:7790/mcp (read-only by default)
+```
+
+HTTP binds only to loopback and validates Host/Origin to prevent DNS rebinding. It is a
+local endpoint, not a publicly authenticated service: do not reverse-proxy it to the
+Internet. `--read-write` explicitly enables HTTP mutations; stdio is writable unless
+`--read-only` is passed. Read-only mode hides and rejects mutation tools, and exploration
+changes never advances a read-only reader's cursor. `VAMP_HOME`/`--home` and
+`VAMP_CONTEXT`/`--context` work as for other commands. The actor is `VAMP_ACTOR`, or
+`agent:<client-name>` (agent identities also travel with authenticated replica writes).
+
+Tools cover metadata/semantic search, folders, smart folders, tags, item details, bounded
+image thumbnails/previews, explicit capped originals, URL/file ingestion with provenance,
+tagging, ratings, annotations, folder creation and explorations (including change review).
+No deletion or shell-execution tool is exposed. Treat media and catalog text as untrusted
+data. Semantic search needs the library's existing embeddings/query embedder; no models
+are installed automatically. A replica reads its local mirror; run `vamp sync` when stale.
+
+The server supports MCP revision **2026-07-28** (`server/discover`, per-request metadata)
+and legacy initialize-based **2025-11-25**, **2025-06-18**, **2025-03-26** clients.
+HTTP uses POST `/mcp`, JSON responses, no sessions and no GET event stream.
+For inspection: `npx @modelcontextprotocol/inspector vamp mcp --read-only`, or start the
+HTTP server above and choose Streamable HTTP with its `/mcp` URL in Inspector.
+
 ## Contents
 
 | Path | Crate / file | What it is |
@@ -125,7 +185,7 @@ the collector is on loopback (`localhost`, `127.0.0.1` or `::1`).
 | `tools/` | | `eagle-fixture.py` (synthetic Eagle libraries for tests), `card-font.py` (note-card glyph atlases) |
 | `examples/` | | `eagle-demo.py` (catalog a bounded Eagle sample) |
 
-The protocol version is `0.1`; the Rust packages are `0.2.0`. Only `vamp-protocol` is meant
+The protocol version is `0.1`; the Rust packages are `0.3.0`. Only `vamp-protocol` is meant
 for crates.io; the others are `publish = false`.
 
 ## Build and test

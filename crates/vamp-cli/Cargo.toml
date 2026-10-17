@@ -14,8 +14,10 @@ anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-vamp-core.workspace = true
+vamp-core = { workspace = true, features = ["native"] }
 vamp-protocol.workspace = true
+tiny_http = "0.12"
+base64 = "0.22"
 # HTTP client: opt-in diagnostics reports (`vamp diagnostics`) and `vamp self-update`.
 ureq = "3"
 # `vamp self-update` (with `remote`): release checksum, .tar.gz reader.

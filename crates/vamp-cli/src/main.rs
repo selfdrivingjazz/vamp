@@ -1,4 +1,8 @@
 mod diagnostics;
+mod mcp;
+mod mcp_tools;
+#[cfg(feature = "remote")]
+mod relay;
 mod serve;
 mod setup;
 #[cfg(feature = "remote")]
@@ -62,6 +66,11 @@ enum Command {
     Schema,
     /// Print the machine-readable command and argument tree.
     Commands,
+    /// Connect AI clients to the current visual library over MCP.
+    Mcp(mcp::Options),
+    /// Connect this machine to your hosted MCP relay.
+    #[cfg(feature = "remote")]
+    Relay(relay::Args),
     /// Create an empty reference-only catalog.
     Init {
         #[arg(long)]
@@ -1015,6 +1024,9 @@ fn mutates(command: &Command) -> bool {
 fn execute(cli: Cli) -> Result<Value> {
     let home = cli.home.unwrap_or_else(default_home);
     match cli.command {
+        Command::Mcp(_) => unreachable!("MCP owns stdout and is handled in main"),
+        #[cfg(feature = "remote")]
+        Command::Relay(args) => relay::run(args, &home, cli.context.as_deref()),
         Command::Guide => unreachable!("guide prints text in main"),
         Command::Schema => Ok(vamp_protocol::schema()),
         Command::Commands => {
@@ -1872,6 +1884,15 @@ fn main() -> ExitCode {
     if matches!(cli.command, Command::Guide) {
         print!("{}", guide());
         return ExitCode::SUCCESS;
+    }
+    if let Command::Mcp(options) = cli.command {
+        return match mcp::run(options, &cli.home.unwrap_or_else(default_home), cli.context.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                print_error("mcp_failed", format!("{error:#}"));
+                ExitCode::FAILURE
+            }
+        };
     }
     // Only with the user's opt-in (`vamp diagnostics enable`); the diagnostics commands
     // themselves never report.
