@@ -101,3 +101,41 @@ fn replicas_mirror_added_by_and_backfill_older_mirrors_in_place() {
     }
     serving.join().unwrap();
 }
+
+#[test]
+fn authenticated_replica_agent_provenance_and_explorations() -> anyhow::Result<()> {
+    let authority = tempfile::tempdir()?;
+    let replica = tempfile::tempdir()?;
+    let library = Library::init(authority.path(), "authority", None, None)?;
+    let token = vamp_server::token(&library.state_dir)?;
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+    let url = format!("http://{}", server.server_addr());
+    let app = vamp_server::App::new(library, "authority")?;
+    let serving = {
+        let server = server.clone();
+        std::thread::spawn(move || vamp_server::serve(server, app, 2))
+    };
+    let result = (|| -> anyhow::Result<()> {
+        op(replica.path(), json!({"operation":"remote_attach","name":"replica","remote_url":url,"token":token}))?;
+        with_actor(Some("agent:mcp-test".into()), || -> anyhow::Result<()> {
+            let added = op(replica.path(), json!({"operation":"ingest","filename":"mcp.txt","bytes_base64":"aGVsbG8gbWNw"}))?;
+            let id = added["id"].as_str().unwrap();
+            let asset = op(replica.path(), json!({"operation":"inspect","asset_id":id}))?;
+            assert_eq!(asset["asset"]["added_by"], "agent:mcp-test");
+            let library = Library::open(replica.path(), None)?;
+            let client = library.remote_client()?;
+            let mission = client.native(&json!({"operation":"explore_ensure","slug":"mcp-test","title":"MCP mission","brief":"Review references"}))?;
+            assert!(mission.is_object());
+            client.native(&json!({"operation":"explore_add","slug":"mcp-test","name":"A note","note":"Why it matters","kind":"note","tags":["mcp"]}))?;
+            client.native(&json!({"operation":"explore_summary","slug":"mcp-test","text":"One finding"}))?;
+            let shown = client.native(&json!({"operation":"explore_show","slug":"mcp-test"}))?;
+            assert!(shown.to_string().contains("A note"), "{shown}");
+            let changes = client.native(&json!({"operation":"explore_changes","slug":"mcp-test","peek":true}))?;
+            assert_eq!(changes["reader"], "agent:mcp-test");
+            Ok(())
+        })
+    })();
+    for _ in 0..2 { server.unblock(); }
+    serving.join().unwrap();
+    result
+}

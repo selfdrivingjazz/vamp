@@ -65,13 +65,14 @@ impl Handler {
             if version == CURRENT && !meta[CAPABILITIES_KEY].is_object() {
                 return Some(error(id, -32602, "Missing _meta clientCapabilities object"));
             }
-        } else if method == "server/discover" {
+        } else if method == "server/discover" || (method != "initialize" && self.legacy_client.is_none()) {
             return Some(error(id, -32602, "Missing _meta protocolVersion"));
         }
         let read_only = self.read_only || scope_read_only;
         let result = match method {
+            "initialize" if version == Some(CURRENT) => return Some(error(id, -32601, "Use server/discover with the per-request protocol")),
             "initialize" => {
-                self.legacy_client = params["clientInfo"]["name"].as_str().map(str::to_owned);
+                self.legacy_client = Some(params["clientInfo"]["name"].as_str().unwrap_or("mcp").to_owned());
                 let requested = params["protocolVersion"].as_str().unwrap_or("2025-11-25");
                 let negotiated = if VERSIONS[1..].contains(&requested) { requested } else { "2025-11-25" };
                 json!({"protocolVersion":negotiated,"capabilities":{"tools":{}},"serverInfo":info(),"instructions":instructions(read_only)})
@@ -83,7 +84,7 @@ impl Handler {
                 let Some(name) = params["name"].as_str() else { return Some(error(id, -32602, "Missing tool name")); };
                 let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
                 if !args.is_object() { return Some(error(id, -32602, "arguments must be an object")); }
-                if !super::mcp_tools::schemas(read_only).iter().any(|tool| tool["name"] == name) {
+                if !super::mcp_tools::available(name, read_only) {
                     return Some(error(id, -32602, format!("Unknown or unavailable tool: {name}")));
                 }
                 let client = meta[CLIENT_KEY]["name"].as_str().or(self.legacy_client.as_deref()).unwrap_or("mcp");
@@ -186,7 +187,7 @@ fn http(mut handler: Handler, address: SocketAddr) -> Result<()> {
                             status = 403; Some(error(id, -32602, "Invalid relay scope"))
                         } else {
                             // HTTP is stateless: legacy client identity is never reused across callers.
-                            handler.legacy_client = None;
+                            handler.legacy_client = (!modern).then(|| "mcp".to_owned());
                             let result = handler.handle(value, scope.as_deref() == Some("read"));
                             if let Some(result) = &result {
                                 match result["error"]["code"].as_i64() {

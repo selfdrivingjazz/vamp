@@ -36,6 +36,13 @@ const FORWARDED: &[&str] = &[
     "tag_delete",
     "palette",
     "hash",
+    "explore_ensure",
+    "explore_add",
+    "explore_summary",
+    "explore_show",
+    "explore_list",
+    "explore_link",
+    "explore_changes",
 ];
 fn forward_body(request: &Request) -> Result<Value> {
     let mut body = serde_json::to_value(request)?;
