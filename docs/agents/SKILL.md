@@ -18,6 +18,7 @@ nonzero exit (`{"error":{"code","message"}}`). Never parse `--help` text when JS
 - No library yet on this machine? `vamp join HOST[:PORT] [--token TOKEN]` (default port 7777) attaches a replica of the authority at HOST (the token is the authority's `vamp-server token`; on a tailnet the server may admit this machine without one; ask the owner if it is refused).
 - `vamp serve [--bind 0.0.0.0:PORT]` — serve the current library to other machines and the Vampire apps (default bind 127.0.0.1:7777, this machine only); it prints the URL, the token file and the join command. Long-running: start it only when asked.
 - `vamp self-update [--check]` — replace a release install (`vamp`, `vamp-media`, `vamp-server`, `vamp-store`, from `curl -fsSL https://vamp.sh/install | sh`) with the latest release.
+- `vamp diagnostics status` — whether optional crash/error reports are on (off by default), where they go and exactly what they hold. Enabling (`vamp diagnostics enable --endpoint URL`) or disabling is the owner's choice: never change it unless they ask.
 - Set `VAMP_ACTOR=agent:<agent-name>` so catalog events record who made a change; what you add is recorded as added by you (`metadata.extra.added_by`), and the owner's app shows the owner's own items by default (agents' under Agents).
 
 ## Find

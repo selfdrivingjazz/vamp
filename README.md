@@ -50,6 +50,65 @@ Tailscale user). `vamp-server install-agent` writes a macOS launch agent; on Lin
 `vamp-server serve` under systemd. `vamp storage set s3 …` keeps originals in an
 S3-compatible bucket through `vamp-store` (installed beside `vamp`).
 
+## Crash and error reports (optional, off by default)
+
+`vamp` works fully offline with no account, and sends nothing anywhere unless you opt in.
+`vamp setup` and `vamp diagnostics status` show the choice: whether reports are on, where they
+go (credentials redacted) and exactly what a report holds. There is no VAMP-run collector;
+reports go only to an OpenTelemetry endpoint you choose, as OTLP/HTTP JSON log records
+POSTed to `<endpoint>/v1/logs` (an OpenTelemetry Collector or Grafana Alloy, e.g.
+`http://localhost:4318`, or Grafana Cloud's OTLP endpoint with its `Authorization` header).
+Credentials go in a headers file, never on the command line, so they stay out of shell history
+and the process list: one `NAME=VALUE` per line (blank lines and `#` comments skipped),
+readable only by you.
+
+```sh
+umask 077
+touch ~/.vamp-otlp-headers
+chmod 600 ~/.vamp-otlp-headers
+# In your editor, put one NAME=VALUE header per line in this file.
+# Example format: Authorization=Basic <base64 of instance-id:token>
+vamp diagnostics enable --endpoint https://otlp-gateway-<region>.grafana.net/otlp \
+  --headers-file ~/.vamp-otlp-headers
+vamp diagnostics test      # send one test report; fails unless the endpoint accepts it
+vamp diagnostics disable   # stop, and forget the endpoint and its credentials
+```
+
+Edit header values in the protected file, not in command arguments or shell
+history. `enable` refuses a headers file other users can read and never prints
+its contents; you may delete it after enabling. Credentials require HTTPS unless
+the collector is on loopback (`localhost`, `127.0.0.1` or `::1`).
+
+- **When:** a command that fails with `operation_failed`, and a Rust panic on any `vamp`
+  thread (after the panic message is printed). Nothing is sent for commands that succeed.
+  Not covered: invalid arguments, output errors, crashes without a panic (signals such as
+  SIGKILL or SIGSEGV, aborts, out-of-memory, stack overflow) and failures inside helper
+  processes (`vamp-media`, model processors). Exit status, unwinding and output never change.
+- **What:** kind (error, panic, test), an error category from a fixed list (`io.not_found`,
+  `json`, `network`, `other`, …), the command path without arguments (`media inspect`), the
+  component and, for a panic in VAMP's own source, its crate-relative file and line, the
+  `vamp` version, OS and CPU architecture, and the time. Never messages, stack traces,
+  arguments, local paths, asset ids, tags, URLs, environment, library content or any machine,
+  user or install identifier.
+- **Receiver:** the chosen collector sees transport metadata such as your source IP and
+  any authentication headers you configure. Its operator controls retention and deletion.
+- **Limits:** at most 3 reports per process and 10 per hour per home (counted under a short
+  file lock, `<home>/diagnostics.lock`, so parallel `vamp` runs share the budget), 4 KiB
+  each, sent synchronously (2 s connect, 3 s total; a failing command can take that much
+  longer to exit), never queued or retried, no redirects followed.
+- **Storage:** `<home>/diagnostics.json` (mode 600, separate from the catalog config; holds the
+  endpoint, the headers copied from the headers file and the consent time) and
+  `<home>/diagnostics-state.json` (send budget and the last delivery result shown by
+  `status`). Consent is to one version of the report contents: a release that changes them
+  stops reporting until you enable it again. Every send re-reads `diagnostics.json`, so
+  `disable`, or a changed endpoint or headers, also stops reports from already running
+  `vamp jobs watch`, `vamp sync --watch` and `vamp worker` processes. A request
+  already in flight can finish; disabling does not erase reports already received.
+- **Precedence:** `DO_NOT_TRACK` set to anything but empty, `0` or `false` (e.g.
+  `DO_NOT_TRACK=1`) turns reports off for that run whatever `diagnostics.json` says
+  (`status` shows `"do_not_track":true`, `"enabled":false`; `test` refuses). Without it, reports
+  are on only while `diagnostics.json` holds consent for the current report version.
+
 ## Contents
 
 | Path | Crate / file | What it is |

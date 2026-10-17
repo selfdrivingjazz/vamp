@@ -403,8 +403,11 @@ pub fn run(
         None if install => {
             bail!("choose an explicit capability: vamp setup media|florence|models --install")
         }
-        None => Ok(
-            json!({"capabilities":[media(&home, false, source)?,florence(&home, false)?,models(&home, context, false, device)?]}),
-        ),
+        // Diagnostics are a choice, not an install: shown here, changed with
+        // `vamp diagnostics enable|disable`.
+        None => Ok(json!({
+            "capabilities":[media(&home, false, source)?,florence(&home, false)?,models(&home, context, false, device)?],
+            "diagnostics":crate::diagnostics::status(&home)?,
+        })),
     }
 }

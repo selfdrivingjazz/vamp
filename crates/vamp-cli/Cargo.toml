@@ -16,12 +16,16 @@ serde.workspace = true
 serde_json.workspace = true
 vamp-core.workspace = true
 vamp-protocol.workspace = true
-# `vamp self-update` (with `remote`): HTTP client, release checksum, .tar.gz reader.
-ureq = { version = "3", optional = true }
+# HTTP client: opt-in diagnostics reports (`vamp diagnostics`) and `vamp self-update`.
+ureq = "3"
+# `vamp self-update` (with `remote`): release checksum, .tar.gz reader.
 sha2 = { version = "0.11", optional = true }
 flate2 = { version = "1", optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = []
-# `vamp contexts remote`, `vamp sync` and `vamp self-update` (adds an HTTP client).
-remote = ["vamp-core/remote", "dep:ureq", "dep:sha2", "dep:flate2"]
+# `vamp contexts remote`, `vamp sync` and `vamp self-update`.
+remote = ["vamp-core/remote", "dep:sha2", "dep:flate2"]
