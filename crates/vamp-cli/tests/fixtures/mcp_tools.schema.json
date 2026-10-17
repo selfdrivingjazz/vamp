@@ -1,0 +1,785 @@
+[
+  {
+    "name": "vamp_search",
+    "description": "Search library metadata, or use semantic/hybrid ranking when a text embedder and image embeddings are available. Semantic errors are returned, not hidden by a metadata fallback.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "metadata",
+            "semantic",
+            "hybrid"
+          ],
+          "default": "metadata"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "added_by": {
+          "type": "string",
+          "description": "Filter to owner, agents, or actor:<exact actor>.",
+          "maxLength": 65536
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_browse",
+    "description": "Browse items with an optional query restricted to folders, a smart folder, tags, and other core browse filters. Semantic ranking uses the same scope when configured; metadata search is the default.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "collection_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "folder_ids": {
+          "type": "array",
+          "description": "Folder IDs to include.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "include_subfolders": {
+          "type": "boolean",
+          "description": "Include descendants of selected folders."
+        },
+        "smart_folder_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "tags": {
+          "type": "array",
+          "description": "Require every tag.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "tags_any": {
+          "type": "array",
+          "description": "Require at least one tag.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "untagged": {
+          "type": "boolean",
+          "description": "Only untagged items."
+        },
+        "uncategorized": {
+          "type": "boolean",
+          "description": "Only items without a folder."
+        },
+        "kind": {
+          "type": "string",
+          "description": "MIME top-level type, such as image or video.",
+          "maxLength": 65536
+        },
+        "exts": {
+          "type": "array",
+          "description": "File extensions.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "shape": {
+          "type": "string",
+          "enum": [
+            "landscape",
+            "portrait",
+            "square",
+            "panorama"
+          ]
+        },
+        "rating_min": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "colors": {
+          "type": "array",
+          "description": "Hex colors, such as #ff8800.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "color_tolerance": {
+          "type": "number",
+          "minimum": 0
+        },
+        "sort": {
+          "type": "string",
+          "enum": [
+            "added_desc",
+            "added_asc",
+            "name_asc",
+            "name_desc",
+            "rating_desc",
+            "size_desc",
+            "dimensions_desc",
+            "modified_desc",
+            "created_desc",
+            "last_viewed_desc",
+            "random",
+            "color"
+          ]
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "date_from": {
+          "type": "string",
+          "description": "Inclusive date or RFC 3339 timestamp.",
+          "maxLength": 65536
+        },
+        "date_to": {
+          "type": "string",
+          "description": "Inclusive date or RFC 3339 timestamp.",
+          "maxLength": 65536
+        },
+        "date_field": {
+          "type": "string",
+          "enum": [
+            "imported",
+            "created",
+            "modified"
+          ]
+        },
+        "size_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "size_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "recently_used": {
+          "type": "boolean",
+          "description": "Only previously viewed items."
+        },
+        "trash": {
+          "type": "boolean",
+          "description": "Browse trash instead of live items."
+        },
+        "semantic": {
+          "type": "boolean",
+          "description": "Rank the scoped query semantically when an embedder is configured."
+        },
+        "added_by": {
+          "type": "string",
+          "description": "Filter to owner, agents, or actor:<exact actor>.",
+          "maxLength": 65536
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_folders",
+    "description": "List library folders with IDs, hierarchy, descriptions and item counts.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_smart_folders",
+    "description": "List saved smart-folder rules and current item counts; pass an ID to vamp_browse.smart_folder_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_tags",
+    "description": "List tags and counts, tag groups, and starred tags.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_inspect",
+    "description": "Inspect an item, including metadata, provenance, observations, suggested tags, folders and available representations.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "asset_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "asset_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_fetch_image",
+    "description": "Return MCP image content, defaulting to the thumbnail; preview is opt-in and original requires explicit tier=original. Never falls back to the original. Only PNG, JPEG, GIF and WebP are accepted. Encoded image bytes are capped before reading/encoding; originals are rejected before fetching when catalog size exceeds the cap.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "asset_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "tier": {
+          "type": "string",
+          "enum": [
+            "thumbnail",
+            "preview",
+            "original"
+          ],
+          "default": "thumbnail"
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8388608,
+          "default": 4194304
+        }
+      },
+      "required": [
+        "asset_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_explore_show",
+    "description": "Show an exploration's brief, findings summary, folders, items and app link.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      },
+      "required": [
+        "slug"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_explore_list",
+    "description": "List explorations with briefs, folder IDs and item counts.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_explore_link",
+    "description": "Get the existing Vampire app/deeplink and optional server link for an exploration or one of its items.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "asset_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "server_url": {
+          "type": "string",
+          "description": "Optional http(s) authority URL; otherwise use the context's configured URL.",
+          "maxLength": 65536
+        }
+      },
+      "required": [
+        "slug"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_explore_changes",
+    "description": "Read other actors' changes since a cursor or this actor's last read. peek=true leaves the cursor unchanged. Read-only servers always peek and reject peek=false.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "since": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "peek": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "slug"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_add",
+    "description": "Import one local file or downloaded http(s) media URL (exactly one), at most 64 MiB. The engine attributes added_by to this MCP actor. Bytes are imported into the library; a URL is media, not a web page.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "Path to a local regular file, resolved on the MCP host.",
+          "maxLength": 65536
+        },
+        "url": {
+          "type": "string",
+          "description": "Direct http(s) media URL.",
+          "maxLength": 65536
+        },
+        "description": {
+          "type": "string",
+          "description": "Human description.",
+          "maxLength": 65536
+        },
+        "tags": {
+          "type": "array",
+          "description": "Initial user tags.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "source_url": {
+          "type": "string",
+          "description": "Source page URL; defaults to the downloaded media URL.",
+          "maxLength": 65536
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_tag",
+    "description": "Add/remove user tags, or explicitly replace all tags. Uses the core MetadataPatch rules (replace, then add, then remove).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "asset_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "tags": {
+          "type": "array",
+          "description": "Replace all user tags, including [] to clear.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "add_tags": {
+          "type": "array",
+          "description": "Tags to add.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "remove_tags": {
+          "type": "array",
+          "description": "Tags to remove.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional optimistic concurrency guard from inspect."
+        }
+      },
+      "required": [
+        "asset_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_rate",
+    "description": "Set an item's rating from 0 (unrated) to 5 using MetadataPatch.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "asset_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "rating": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional optimistic concurrency guard from inspect."
+        }
+      },
+      "required": [
+        "asset_id",
+        "rating"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_annotate",
+    "description": "Set the human description using MetadataPatch; an empty string clears it. Model observations are left unchanged.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "asset_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "description": {
+          "type": "string",
+          "description": "Replacement human annotation.",
+          "maxLength": 65536
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional optimistic concurrency guard from inspect."
+        }
+      },
+      "required": [
+        "asset_id",
+        "description"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_create_folder",
+    "description": "Create a folder at the root or beneath an existing parent folder.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "parent_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_explore_ensure",
+    "description": "Idempotently create/find an exploration under Explorations/. A supplied brief replaces its brief while preserving its findings summary.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "description": "Display title used when creating the exploration.",
+          "maxLength": 65536
+        },
+        "brief": {
+          "type": "string",
+          "description": "Exploration brief.",
+          "maxLength": 65536
+        }
+      },
+      "required": [
+        "slug"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_explore_add",
+    "description": "Add a finding with provenance, idempotently using existing core exploration logic. Supply a direct image_url, a local file, or neither for a rendered note/link card. At most 64 MiB of imported media. URL is the source page, not the downloaded image.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "note": {
+          "type": "string",
+          "description": "Why the finding matters.",
+          "maxLength": 65536
+        },
+        "tags": {
+          "type": "array",
+          "description": "User tags.",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "url": {
+          "type": "string",
+          "description": "Source page http(s) URL.",
+          "maxLength": 65536
+        },
+        "folder": {
+          "type": "string",
+          "description": "Subfolder path within the exploration, e.g. studios/posters.",
+          "maxLength": 65536
+        },
+        "image_url": {
+          "type": "string",
+          "description": "Direct http(s) media URL; mutually exclusive with file.",
+          "maxLength": 65536
+        },
+        "file": {
+          "type": "string",
+          "description": "Local regular file on the MCP host; mutually exclusive with image_url.",
+          "maxLength": 65536
+        },
+        "kind": {
+          "type": "string",
+          "description": "Card label when no file/image_url is supplied; defaults to link or note.",
+          "maxLength": 65536
+        }
+      },
+      "required": [
+        "slug",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "vamp_explore_summary",
+    "description": "Replace an exploration's running findings summary while keeping its brief.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "text": {
+          "type": "string",
+          "description": "Findings summary.",
+          "maxLength": 65536
+        }
+      },
+      "required": [
+        "slug",
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": true
+    }
+  }
+]

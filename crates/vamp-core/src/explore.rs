@@ -549,17 +549,16 @@ impl Library {
     pub fn explore_changes(&mut self, slug: &str, since: Option<u64>, advance: bool) -> Result<Value> {
         let actor = agent_actor()?;
         let folder = self.exploration(slug)?;
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS exploration_reads(slug TEXT NOT NULL, actor TEXT NOT NULL, cursor INTEGER NOT NULL, PRIMARY KEY(slug, actor))",
+        let has_reads: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='exploration_reads')",
+            [], |r| r.get(0),
         )?;
-        let stored: Option<i64> = self
-            .conn
-            .query_row(
+        let stored: Option<i64> = if has_reads {
+            self.conn.query_row(
                 "SELECT cursor FROM exploration_reads WHERE slug=?1 AND actor=?2",
-                params![slug, actor],
-                |r| r.get(0),
-            )
-            .optional()?;
+                params![slug, actor], |r| r.get(0),
+            ).optional()?
+        } else { None };
         let after = since.unwrap_or(stored.unwrap_or(0) as u64);
         let head = self.last_event()?;
         let tree = self.subtree(&folder.id)?;
@@ -643,6 +642,9 @@ impl Library {
             items.push(item);
         }
         if advance {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS exploration_reads(slug TEXT NOT NULL, actor TEXT NOT NULL, cursor INTEGER NOT NULL, PRIMARY KEY(slug, actor))",
+            )?;
             self.conn.execute(
                 "INSERT INTO exploration_reads(slug,actor,cursor) VALUES(?1,?2,?3) ON CONFLICT(slug,actor) DO UPDATE SET cursor=excluded.cursor",
                 params![slug, actor, head as i64],
@@ -791,6 +793,11 @@ mod tests {
             assert_eq!(linked["open"], format!("open 'vampire://open?{query}'"));
             assert!(library.explore_link("vamp-sh", None, Some("vampire://x")).is_err());
             assert_eq!(library.explore_link("vamp-sh", None, None).unwrap()["url"], Value::Null);
+            assert_eq!(library.explore_changes("vamp-sh", None, false).unwrap()["advanced"], false);
+            let read_tables: i64 = library.conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='exploration_reads'", [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(read_tables, 0, "peeking must not create persistent cursor state");
             // Only this agent has written so far; the read advances the cursor.
             assert_eq!(library.explore_changes("vamp-sh", None, true).unwrap()["items"], json!([]));
         });
