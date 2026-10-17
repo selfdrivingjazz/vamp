@@ -184,15 +184,20 @@ fn emit(tx: &SyncSender<Value>, cancelled: &AtomicBool, value: Value) -> Result<
     tx.send(value).context("relay disconnected")
 }
 
+fn effective_scope(scope: &str, read_write: bool) -> Result<&'static str> {
+    ensure!(matches!(scope, "read" | "write"), "invalid request scope");
+    // A broad OAuth grant never elevates this computer's local permission.
+    Ok(if scope == "write" && read_write { "write" } else { "read" })
+}
+
 fn forward(frame: RequestFrame, url: &str, read_write: bool, cancelled: &AtomicBool, tx: &SyncSender<Value>) -> Result<()> {
     ensure!(frame.method == "POST" && frame.body.len() <= MAX_REQUEST, "unsupported or oversized request");
-    ensure!(matches!(frame.scope.as_str(), "read" | "write"), "invalid request scope");
-    ensure!(frame.scope != "write" || read_write, "writes are disabled locally");
+    let scope = effective_scope(&frame.scope, read_write)?;
     let agent = http_agent();
     // Library traffic must stay on loopback even when the process inherits an HTTP proxy.
     let mut request = agent.post(url).config().proxy(None).build()
         .header("content-type", "application/json")
-        .header("X-Vamp-Mcp-Scope", if frame.scope == "write" && read_write { "write" } else { "read" });
+        .header("X-Vamp-Mcp-Scope", scope);
     for (key, value) in &frame.headers {
         if matches!(key.to_ascii_lowercase().as_str(), "accept" | "mcp-protocol-version" | "mcp-session-id" | "last-event-id") { request = request.header(key, value); }
     }
@@ -318,9 +323,11 @@ mod tests {
         for bad in ["http://example.com", "https://example.com/path", "https://user@example.com", "https://example.com/?token=secret"] { assert!(endpoint_url(bad).is_err()); }
     }
     #[test]
-    fn local_write_gate_precedes_network() {
-        let (tx,_rx) = mpsc::sync_channel(1);
-        let frame = RequestFrame { id:"x".into(),method:"POST".into(),headers:HashMap::new(),body:"{}".into(),scope:"write".into() };
-        assert!(forward(frame,"http://127.0.0.1:1/mcp",false,&AtomicBool::new(false),&tx).unwrap_err().to_string().contains("disabled"));
+    fn local_and_oauth_permissions_intersect() {
+        assert_eq!(effective_scope("read", false).unwrap(), "read");
+        assert_eq!(effective_scope("write", false).unwrap(), "read");
+        assert_eq!(effective_scope("read", true).unwrap(), "read");
+        assert_eq!(effective_scope("write", true).unwrap(), "write");
+        assert!(effective_scope("admin", true).is_err());
     }
 }
