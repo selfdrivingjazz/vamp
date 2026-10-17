@@ -23,6 +23,8 @@ ureq = "3"
 # `vamp self-update` (with `remote`): release checksum, .tar.gz reader.
 sha2 = { version = "0.11", optional = true }
 flate2 = { version = "1", optional = true }
+tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"], optional = true }
+ctrlc = { version = "3.5", features = ["termination"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -30,4 +32,4 @@ tempfile = "3"
 [features]
 default = []
 # `vamp contexts remote`, `vamp sync` and `vamp self-update`.
-remote = ["vamp-core/remote", "dep:sha2", "dep:flate2"]
+remote = ["vamp-core/remote", "dep:sha2", "dep:flate2", "dep:tungstenite", "dep:ctrlc"]
