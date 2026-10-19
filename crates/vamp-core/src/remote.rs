@@ -45,6 +45,8 @@ pub struct RemoteStatus {
     pub status: u16,
     pub code: String,
     pub message: String,
+    /// Typed state retained from the authority, also exposed through `Error::source`.
+    pub embedding_unavailable: Option<EmbeddingUnavailable>,
 }
 
 impl std::fmt::Display for RemoteStatus {
@@ -60,7 +62,11 @@ impl std::fmt::Display for RemoteStatus {
     }
 }
 
-impl std::error::Error for RemoteStatus {}
+impl std::error::Error for RemoteStatus {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.embedding_unavailable.as_ref().map(|error| error as _)
+    }
+}
 
 /// A download that received no bytes for the stall timeout.
 #[derive(Debug)]
@@ -263,6 +269,9 @@ impl Client {
                 .as_str()
                 .unwrap_or("request failed")
                 .to_owned(),
+            embedding_unavailable: (body["error"]["code"] == EmbeddingUnavailable::CODE)
+                .then(|| EmbeddingUnavailable::deserialize(&body["error"]).ok())
+                .flatten(),
         }
         .into())
     }

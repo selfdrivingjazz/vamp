@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Per-asset embedding requests now return typed `embedding_unavailable` conflicts (HTTP 409),
+  distinguishing queued/running, failed, stale-refresh and unqueued analysis. Errors include
+  the known processor, distinct queued image count and a short failure category without
+  leaking processor logs. Current-source lookup never substitutes stale vectors or fake
+  neighbours; remote, native and CLI error envelopes retain the typed fields.
+  `embedding_status` provides a read-only Same Energy/Galaxy anchor preflight, and explicit
+  `embedding_retry` retries only that asset's current failed job without starting a worker.
 - Optional crash and error reports, off by default: `vamp diagnostics status|enable|disable|test`
   (`vamp setup` also shows the choice). `enable --endpoint URL [--headers-file PATH]` sends
   OTLP/HTTP JSON log records to that user-chosen OpenTelemetry endpoint only (none is compiled
