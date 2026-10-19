@@ -24,6 +24,9 @@ pub struct Request {
     pub offset: usize,
     pub limit: Option<usize>,
     pub asset_id: Option<String>,
+    /// Per-asset embedding preflight/retry: the pack or layout's model when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub path: Option<PathBuf>,
     pub name: Option<String>,
     #[serde(default)]
@@ -521,6 +524,11 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
         "explore_changes" => library.explore_changes(request.slug.as_deref().context("slug is required")?, request.since, !request.peek.unwrap_or(false)),
         "browse" if request.semantic => embeddings::native::semantic_browse(library, &request),
         "similar" => embeddings::native::similar(library, &request),
+        "embedding_status" => {
+            library.require_embedding(asset_id()?, request.model.as_deref())?;
+            Ok(json!({"available":true}))
+        }
+        "embedding_retry" => library.embedding_retry(asset_id()?, request.model.as_deref()),
         // Authority pack for in-memory similarity browsing (replicas: native_remote).
         "energy_pack" => Ok(match library.energy_pack()? {
             Some((path, header)) => crate::energy::describe(&path, &header),

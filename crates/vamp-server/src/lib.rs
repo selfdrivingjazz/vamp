@@ -42,6 +42,9 @@ const MAX_PREVIEW: u64 = 4 * 1024 * 1024;
 /// Excluded: operations taking authority filesystem paths. Exploration media is bounded.
 const NATIVE_OPERATIONS: &[&str] = &[
     "browse",
+    "similar",
+    "embedding_status",
+    "embedding_retry",
     "galaxy",
     "galaxy_search",
     "sidebar",
@@ -318,9 +321,30 @@ fn spawn_watchdog(app: std::sync::Weak<App>) {
 
 type Reply = Response<Box<dyn Read + Send>>;
 
-struct HttpError(u16, String);
+struct HttpError {
+    status: u16,
+    message: String,
+    embedding_unavailable: Option<vamp_core::EmbeddingUnavailable>,
+}
+
+impl HttpError {
+    fn new(status: u16, message: String) -> Self {
+        Self { status, message, embedding_unavailable: None }
+    }
+
+    fn reply(self) -> Reply {
+        if let Some(unavailable) = self.embedding_unavailable {
+            return json_reply(409, &json!({"error":unavailable.to_json()}));
+        }
+        error_reply(self.status, &self.message)
+    }
+}
 
 fn status_for(error: &anyhow::Error) -> u16 {
+    if vamp_core::EmbeddingUnavailable::from_error(error).is_some() {
+        // Valid request, but this asset's current derived state cannot answer it yet.
+        return 409;
+    }
     let message = format!("{error:#}");
     if vamp_core::io::is_stalled(error) {
         503
@@ -335,13 +359,17 @@ fn status_for(error: &anyhow::Error) -> u16 {
 
 impl From<anyhow::Error> for HttpError {
     fn from(error: anyhow::Error) -> Self {
-        Self(status_for(&error), format!("{error:#}"))
+        Self {
+            status: status_for(&error),
+            message: format!("{error:#}"),
+            embedding_unavailable: vamp_core::EmbeddingUnavailable::from_error(&error).cloned(),
+        }
     }
 }
 
 impl From<Stalled> for HttpError {
     fn from(stalled: Stalled) -> Self {
-        Self(503, stalled.to_string())
+        Self::new(503, stalled.to_string())
     }
 }
 
@@ -398,7 +426,7 @@ fn json_reply(status: u16, value: &Value) -> Reply {
 fn landed_conflict(error: anyhow::Error) -> HttpError {
     let message = format!("{error:#}");
     if message.contains("has landed") || message.contains("already stored") {
-        HttpError(409, message)
+        HttpError::new(409, message)
     } else {
         error.into()
     }
@@ -507,7 +535,7 @@ pub(crate) fn handle(app: &Arc<App>, mut request: Request) {
                     .or_else(|| peer.as_ref().map(peer_actor));
                 match vamp_core::with_actor(actor, || route(app, &mut request, peer.as_ref())) {
                     Ok(reply) => reply,
-                    Err(HttpError(status, message)) => error_reply(status, &message),
+                    Err(error) => error.reply(),
                 }
             }
         }
@@ -541,7 +569,7 @@ impl Query {
         self.get(key)
             .map(|v| {
                 v.parse()
-                    .map_err(|_| HttpError(400, format!("invalid {key}")))
+                    .map_err(|_| HttpError::new(400, format!("invalid {key}")))
             })
             .transpose()
             .map(|v| v.unwrap_or(default))
@@ -561,29 +589,29 @@ impl Query {
 
 fn read_body(request: &mut Request, limit: u64) -> Result<Vec<u8>, HttpError> {
     if request.body_length().is_some_and(|n| n as u64 > limit) {
-        return Err(HttpError(413, format!("body exceeds {limit} bytes")));
+        return Err(HttpError::new(413, format!("body exceeds {limit} bytes")));
     }
     let mut body = Vec::new();
     request
         .as_reader()
         .take(limit + 1)
         .read_to_end(&mut body)
-        .map_err(|e| HttpError(400, e.to_string()))?;
+        .map_err(|e| HttpError::new(400, e.to_string()))?;
     if body.len() as u64 > limit {
-        return Err(HttpError(413, format!("body exceeds {limit} bytes")));
+        return Err(HttpError::new(413, format!("body exceeds {limit} bytes")));
     }
     Ok(body)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(request: &mut Request) -> Result<T, HttpError> {
     let body = read_body(request, MAX_JSON)?;
-    serde_json::from_slice(&body).map_err(|e| HttpError(400, format!("invalid JSON body: {e}")))
+    serde_json::from_slice(&body).map_err(|e| HttpError::new(400, format!("invalid JSON body: {e}")))
 }
 
 fn ok(value: impl serde::Serialize) -> Result<Reply, HttpError> {
     Ok(json_reply(
         200,
-        &serde_json::to_value(value).map_err(|e| HttpError(500, e.to_string()))?,
+        &serde_json::to_value(value).map_err(|e| HttpError::new(500, e.to_string()))?,
     ))
 }
 
@@ -709,7 +737,7 @@ fn route(
         (Method::Post, ["v1", "assets", "batch"]) => {
             let body: BatchBody = read_json(request)?;
             if body.ids.len() > MAX_BATCH {
-                return Err(HttpError(400, format!("at most {MAX_BATCH} ids per batch")));
+                return Err(HttpError::new(400, format!("at most {MAX_BATCH} ids per batch")));
             }
             let library = app.lock();
             // Missing (tombstoned/unknown) ids are omitted; the caller treats them as deleted.
@@ -719,7 +747,7 @@ fn route(
                 .filter_map(|id| library.inspect(id).ok())
                 .collect::<Vec<_>>();
             drop(library);
-            let value = serde_json::to_value(views).map_err(|e| HttpError(500, e.to_string()))?;
+            let value = serde_json::to_value(views).map_err(|e| HttpError::new(500, e.to_string()))?;
             Ok(compressed_json(request, &value))
         }
         (Method::Get, ["v1", "events", "stream"]) => {
@@ -813,7 +841,7 @@ fn route(
         (Method::Get, ["v1", "assets", id, "tier", tier]) => {
             // Generated tier files only: never an original, so never Drive.
             let path = vamp_core::thumbs::tier_path(&app.lock(), id, tier)
-                .map_err(|e| HttpError(400, format!("{e:#}")))?;
+                .map_err(|e| HttpError::new(400, format!("{e:#}")))?;
             match path.and_then(|p| std::fs::read(p).ok()) {
                 Some(data) => {
                     let len = data.len();
@@ -855,7 +883,7 @@ fn route(
                     &json!({"error":{"code":"no_embeddings","message":"the library has no embeddings"}}),
                 ));
             };
-            let data = std::fs::read(path).map_err(|e| HttpError(500, e.to_string()))?;
+            let data = std::fs::read(path).map_err(|e| HttpError::new(500, e.to_string()))?;
             let len = data.len();
             Ok(Response::new(
                 StatusCode(200),
@@ -876,7 +904,7 @@ fn route(
                 patch.name = body.name;
             }
             if patch.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
-                return Err(HttpError(400, "name cannot be empty".into()));
+                return Err(HttpError::new(400, "name cannot be empty".into()));
             }
             ok(app.lock().update(id, patch, body.expected_revision)?)
         }
@@ -885,7 +913,7 @@ fn route(
                 .get("expected_revision")
                 .map(|v| v.parse::<u64>())
                 .transpose()
-                .map_err(|_| HttpError(400, "invalid expected_revision".into()))?;
+                .map_err(|_| HttpError::new(400, "invalid expected_revision".into()))?;
             app.lock().remove(id, expected)?;
             ok(json!({"trashed":1}))
         }
@@ -893,7 +921,7 @@ fn route(
             let body = read_body(request, MAX_INGEST)?;
             let filename = query
                 .get("filename")
-                .ok_or_else(|| HttpError(400, "filename is required".into()))?;
+                .ok_or_else(|| HttpError::new(400, "filename is required".into()))?;
             let metadata = Metadata {
                 description: query
                     .get("note")
@@ -928,14 +956,11 @@ fn route(
         (Method::Post, ["v1", "thumbnails", "pack"]) => {
             let body: PackBody = read_json(request)?;
             if body.ids.len() > vamp_core::thumbs::MAX_PACK {
-                return Err(HttpError(
-                    400,
-                    format!("at most {} ids per pack", vamp_core::thumbs::MAX_PACK),
-                ));
+                return Err(HttpError::new(400, format!("at most {} ids per pack", vamp_core::thumbs::MAX_PACK)));
             }
             // Paths resolve under the lock; files are read after it is released.
             let items = vamp_core::thumbs::pack_items(&app.lock(), &body.ids, &body.kind)
-                .map_err(|e| HttpError(400, format!("{e:#}")))?;
+                .map_err(|e| HttpError::new(400, format!("{e:#}")))?;
             let data = vamp_core::thumbs::pack_body(items);
             let len = data.len();
             Ok(Response::new(
@@ -950,13 +975,10 @@ fn route(
             // Base64 exploration findings may contain up to 64 MiB of media.
             let bytes = read_body(request, (vamp_core::native::MAX_MEDIA + 2) / 3 * 4 + MAX_JSON)?;
             let mut body: Value = serde_json::from_slice(&bytes)
-                .map_err(|e| HttpError(400, format!("invalid JSON body: {e}")))?;
+                .map_err(|e| HttpError::new(400, format!("invalid JSON body: {e}")))?;
             let operation = body["operation"].as_str().unwrap_or_default().to_owned();
             if !NATIVE_OPERATIONS.contains(&operation.as_str()) {
-                return Err(HttpError(
-                    400,
-                    format!("operation not available over HTTP: {operation}"),
-                ));
+                return Err(HttpError::new(400, format!("operation not available over HTTP: {operation}")));
             }
             if let Some(object) = body.as_object_mut() {
                 // Library-scoped: the served library, never a client-chosen home/context.
@@ -964,7 +986,7 @@ fn route(
                 object.remove("context");
             }
             let native: vamp_core::native::Request = serde_json::from_value(body)
-                .map_err(|e| HttpError(400, format!("invalid request: {e}")))?;
+                .map_err(|e| HttpError::new(400, format!("invalid request: {e}")))?;
             if operation == "hash" {
                 // Reads originals: on the I/O pool, never under the library lock.
                 return ok(hash_pending(app, native.limit.unwrap_or(100))?);
@@ -984,10 +1006,10 @@ fn route(
             let add = match body.operation.as_str() {
                 "add" => true,
                 "remove" => false,
-                _ => return Err(HttpError(400, "operation must be add or remove".into())),
+                _ => return Err(HttpError::new(400, "operation must be add or remove".into())),
             };
             if body.asset_ids.is_empty() {
-                return Err(HttpError(400, "asset_ids is required".into()));
+                return Err(HttpError::new(400, "asset_ids is required".into()));
             }
             let mut library = app.lock();
             let mut collection = None;
@@ -997,8 +1019,8 @@ fn route(
             ok(collection)
         }
         (_, ["v1", "jobs", ..]) => jobs_api::route(app, &method, &segments, request)
-            .unwrap_or_else(|| Err(HttpError(404, format!("no route for {method} {path}")))),
-        _ => Err(HttpError(404, format!("no route for {method} {path}"))),
+            .unwrap_or_else(|| Err(HttpError::new(404, format!("no route for {method} {path}")))),
+        _ => Err(HttpError::new(404, format!("no route for {method} {path}"))),
     }
 }
 
@@ -1053,7 +1075,7 @@ fn generate_in_background(app: &Arc<App>, id: &str) {
     let (app, id) = (app.clone(), id.to_owned());
     std::thread::spawn(move || {
         for kind in ["thumbnail", "preview"] {
-            if let Err(HttpError(_, message)) = representation_path(&app, &id, kind) {
+            if let Err(HttpError { message, .. }) = representation_path(&app, &id, kind) {
                 eprintln!("vamp-server: {kind} for {id} failed: {message}");
                 break;
             }
@@ -1271,10 +1293,7 @@ fn clip_batch(app: &Arc<App>, body: ClipBatchBody) -> Result<Value, HttpError> {
         collection_id,
     } = body;
     if items.len() > MAX_CLIP_BATCH {
-        return Err(HttpError(
-            400,
-            format!("at most {MAX_CLIP_BATCH} items per batch"),
-        ));
+        return Err(HttpError::new(400, format!("at most {MAX_CLIP_BATCH} items per batch")));
     }
     {
         let library = app.lock();
@@ -1348,7 +1367,7 @@ fn health_report(app: &App) -> Value {
 /// on the request I/O pool; a stalled one ends the batch (the rest stay pending).
 fn hash_pending(app: &App, limit: usize) -> Result<Value, HttpError> {
     if !(1..=10_000).contains(&limit) {
-        return Err(HttpError(400, "limit must be 1–10000".into()));
+        return Err(HttpError::new(400, "limit must be 1–10000".into()));
     }
     let ids = app.lock().pending_hash_ids(limit)?;
     let (mut hashed, mut changed, mut failed) = (0, 0, Vec::new());
@@ -1521,7 +1540,7 @@ fn open_original(
     })?;
     opened.map_err(|e| {
         if e.downcast_ref::<std::io::Error>().is_some() {
-            HttpError(404, format!("{e:#}"))
+            HttpError::new(404, format!("{e:#}"))
         } else {
             e.into()
         }
@@ -1537,14 +1556,11 @@ fn stream(app: &Arc<App>, request: &Request, id: &str, kind: &str) -> Result<Rep
         // A clipped original still downloading: retry later; one that failed: say why.
         if vamp_core::fetching::awaiting_original(&original) {
             if original.storage == vamp_core::fetching::FETCHING {
-                return Err(HttpError(503, format!("original of {id} is still being fetched")));
+                return Err(HttpError::new(503, format!("original of {id} is still being fetched")));
             }
             let asset = library.inspect(id)?.asset;
             let reason = asset.metadata.extra.get(vamp_core::fetching::ORIGINAL_ERROR);
-            return Err(HttpError(
-                404,
-                format!("original of {id} could not be fetched: {}", reason.and_then(Value::as_str).unwrap_or("unknown error")),
-            ));
+            return Err(HttpError::new(404, format!("original of {id} could not be fetched: {}", reason.and_then(Value::as_str).unwrap_or("unknown error"))));
         }
         // Pending (lazy) fingerprints use their surrogate key as the entity tag.
         let etag = original.source_key();
@@ -1554,8 +1570,8 @@ fn stream(app: &Arc<App>, request: &Request, id: &str, kind: &str) -> Result<Rep
         let path = representation_path(app, id, kind)?;
         let mut hasher = blake3::Hasher::new();
         hasher
-            .update_reader(File::open(&path).map_err(|e| HttpError(404, e.to_string()))?)
-            .map_err(|e| HttpError(500, e.to_string()))?;
+            .update_reader(File::open(&path).map_err(|e| HttpError::new(404, e.to_string()))?)
+            .map_err(|e| HttpError::new(500, e.to_string()))?;
         let mime = match path.extension().and_then(|e| e.to_str()) {
             Some("png") => "image/png",
             Some("webp") => "image/webp",
@@ -1580,10 +1596,10 @@ fn stream(app: &Arc<App>, request: &Request, id: &str, kind: &str) -> Result<Rep
             (file, size, Some(by))
         }
         Err(path) => {
-            let file = File::open(&path).map_err(|e| HttpError(404, e.to_string()))?;
+            let file = File::open(&path).map_err(|e| HttpError::new(404, e.to_string()))?;
             let size = file
                 .metadata()
-                .map_err(|e| HttpError(500, e.to_string()))?
+                .map_err(|e| HttpError::new(500, e.to_string()))?
                 .len();
             (file, size, None)
         }
@@ -1627,7 +1643,7 @@ fn stream(app: &Arc<App>, request: &Request, id: &str, kind: &str) -> Result<Rep
         }),
         None => {
             file.seek(SeekFrom::Start(start))
-                .map_err(|e| HttpError(500, e.to_string()))?;
+                .map_err(|e| HttpError::new(500, e.to_string()))?;
             Box::new(file.take(len))
         }
     };

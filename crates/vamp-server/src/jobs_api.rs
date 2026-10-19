@@ -55,9 +55,9 @@ fn conflict(error: anyhow::Error) -> HttpError {
     let status = if message.contains("lease conflict") {
         409
     } else {
-        HttpError::from(error).0
+        HttpError::from(error).status
     };
-    HttpError(status, message)
+    HttpError::new(status, message)
 }
 
 /// `/v1/jobs/...` routes; `None` when the path is not a jobs route.

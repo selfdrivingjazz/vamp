@@ -1919,7 +1919,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            print_error("operation_failed", format!("{error:#}"));
+            if let Some(unavailable) = vamp_core::EmbeddingUnavailable::from_error(&error) {
+                eprintln!("{}", json!({"protocol_version":vamp_protocol::PROTOCOL_VERSION,"error":unavailable.to_json()}));
+            } else {
+                print_error("operation_failed", format!("{error:#}"));
+            }
             if let Some(reporter) = &reporter {
                 reporter.error(&operation, &error);
             }

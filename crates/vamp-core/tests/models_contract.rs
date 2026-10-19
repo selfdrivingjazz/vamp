@@ -312,3 +312,175 @@ fn native_semantic_browse_ranks_only_filtered_candidates() {
     assert_eq!(untagged["total"], 1);
     assert!(untagged["items"].as_array().unwrap().is_empty());
 }
+
+fn unavailable(error: &anyhow::Error) -> vamp_core::EmbeddingUnavailable {
+    vamp_core::EmbeddingUnavailable::from_error(error).unwrap().clone()
+}
+
+fn queued_image(lib: &mut Library, dir: &TempDir, name: &str) -> vamp_protocol::Asset {
+    let path = dir.path().join(name);
+    fs::write(&path, name.as_bytes()).unwrap();
+    lib.add(&path, None, Metadata::default()).unwrap()
+}
+
+fn complete_embedding(lib: &mut Library, claim: &vamp_core::ClaimedJob) {
+    let response = serde_json::from_value(serde_json::json!({
+        "observation":{"kind":"embedding","model":"fake-clip",
+            "value":{"embedding":{"model":"fake-clip","dim":3,"vector_b64":vector([1.0,0.0,0.0])}}}
+    })).unwrap();
+    lib.complete_job(&claim.job.id, &claim.lease.id, response).unwrap();
+}
+
+#[test]
+fn embedding_unavailable_none_ignores_caption_jobs_and_preserves_argument_errors() {
+    let dir = TempDir::new().unwrap();
+    let mut lib = library(&dir);
+    lib.processor_add(processor("caption", "/must-not-run-caption".into())).unwrap();
+    let asset = queued_image(&mut lib, &dir, "none.png");
+    let before = lib.jobs(None, 100).unwrap().len();
+    let error = lib.similar(&asset.id, 10).unwrap_err().context("similar request");
+    let missing = unavailable(&error);
+    assert_eq!(missing.state, vamp_core::EmbeddingState::None);
+    assert_eq!(missing.processor, None);
+    assert_eq!(missing.pending_total, None);
+    assert_eq!(missing.reason.as_deref(), Some("no_processor"));
+    let json = missing.to_json();
+    assert_eq!(json["code"], "embedding_unavailable");
+    assert_eq!(json["state"], "none");
+    assert!(json.get("processor").is_none());
+    assert!(json.get("pending_total").is_none());
+    assert_eq!(lib.jobs(None, 100).unwrap().len(), before, "read errors cannot enqueue");
+    assert!(vamp_core::EmbeddingUnavailable::from_error(&lib.similar(&asset.id, 0).unwrap_err()).is_none());
+    assert!(vamp_core::EmbeddingUnavailable::from_error(&lib.similar("missing", 10).unwrap_err()).is_none());
+    assert!(lib.embedding_retry(&asset.id, None).is_err());
+}
+
+#[test]
+fn embedding_pending_counts_distinct_source_current_live_images_not_jobs() {
+    let dir = TempDir::new().unwrap();
+    let mut lib = library(&dir);
+    lib.embedder_set(EmbedderSpec {
+        command: vec!["/must-not-run-embedding".into()],
+        model: "fake-clip".into(), timeout_seconds: 10, serve: false,
+    }).unwrap();
+    for name in ["siglip-embedding", "other-image-analysis"] {
+        lib.processor_add(processor(name, "/must-not-run-embedding".into())).unwrap();
+    }
+    lib.processor_add(processor("caption", "/must-not-run-caption".into())).unwrap();
+    let first = queued_image(&mut lib, &dir, "first.png");
+    queued_image(&mut lib, &dir, "second.jpg");
+    queued_image(&mut lib, &dir, "not-an-image.txt");
+    let trashed = queued_image(&mut lib, &dir, "trashed.png");
+    lib.remove(&trashed.id, None).unwrap();
+    let old = queued_image(&mut lib, &dir, "old.png");
+    fs::write(&old.original.path, b"changed original source").unwrap();
+    lib.refresh(&old.id, None).unwrap();
+
+    let pending = unavailable(&lib.similar(&first.id, 10).unwrap_err());
+    assert_eq!(pending.state, vamp_core::EmbeddingState::Pending);
+    assert_eq!(pending.pending_total, Some(2));
+    assert!(pending.processor.is_some());
+    let old_missing = unavailable(&lib.similar(&old.id, 10).unwrap_err());
+    assert_eq!(old_missing.state, vamp_core::EmbeddingState::None);
+    assert_eq!(old_missing.reason.as_deref(), Some("not_queued"));
+    assert_eq!(old_missing.pending_total, Some(2));
+}
+
+#[test]
+fn embedding_running_job_remains_pending_without_executing_a_processor() {
+    let dir = TempDir::new().unwrap();
+    let mut lib = library(&dir);
+    lib.processor_add(processor("siglip-embedding", "/must-not-run".into())).unwrap();
+    let asset = queued_image(&mut lib, &dir, "pending.png");
+    let pending = unavailable(&lib.similar(&asset.id, 10).unwrap_err());
+    assert_eq!(pending.state, vamp_core::EmbeddingState::Pending);
+    assert_eq!(pending.processor.as_deref(), Some("siglip-embedding"));
+    assert_eq!(pending.pending_total, Some(1));
+    assert_eq!(pending.reason, None);
+    let claims = lib.claim_jobs("fixture", &["siglip-embedding".into()], 1, 60).unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].job.status, "running");
+    assert_eq!(unavailable(&lib.similar(&asset.id, 10).unwrap_err()), pending);
+}
+
+#[test]
+fn embedding_failed_retry_requeues_only_the_exact_current_job() {
+    let dir = TempDir::new().unwrap();
+    let mut lib = library(&dir);
+    lib.processor_add(processor("siglip-embedding", "/must-not-run".into())).unwrap();
+    let first = queued_image(&mut lib, &dir, "first.png");
+    let second = queued_image(&mut lib, &dir, "second.png");
+    let claims = lib.claim_jobs("fixture", &["siglip-embedding".into()], 2, 60).unwrap();
+    for claim in &claims {
+        lib.fail_job(&claim.job.id, &claim.lease.id, "timeout reading /private/raw/path").unwrap();
+    }
+    let missing = unavailable(&lib.similar(&first.id, 10).unwrap_err());
+    assert_eq!(missing.state, vamp_core::EmbeddingState::Failed);
+    assert_eq!(missing.pending_total, Some(0));
+    assert_eq!(missing.reason.as_deref(), Some("timeout"));
+    assert!(!missing.to_json().to_string().contains("/private/raw/path"));
+    let retried = lib.embedding_retry(&first.id, None).unwrap();
+    assert_eq!(retried["job"]["asset_id"], first.id);
+    assert_eq!(retried["job"]["status"], "pending");
+    assert_eq!(lib.embedding_retry(&first.id, None).unwrap()["job"]["id"], retried["job"]["id"]);
+    let pending = lib.jobs(Some("pending"), 100).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].asset_id, first.id);
+    assert_eq!(lib.jobs(Some("failed"), 100).unwrap()[0].asset_id, second.id);
+}
+
+#[test]
+fn embedding_stale_requires_refresh_work_and_current_failure_overrides_old_vector() {
+    let dir = TempDir::new().unwrap();
+    let mut lib = library(&dir);
+    lib.processor_add(processor("custom-image-analysis", "/must-not-run".into())).unwrap();
+    let asset = queued_image(&mut lib, &dir, "stale.png");
+    let claim = lib.claim_jobs("fixture", &["custom-image-analysis".into()], 1, 60).unwrap().remove(0);
+    complete_embedding(&mut lib, &claim);
+    lib.require_embedding(&asset.id, Some("fake-clip")).unwrap();
+    assert!(lib.similar(&asset.id, 10).unwrap().is_empty(), "never synthesize neighbours");
+    assert_eq!(lib.embedding_retry(&asset.id, None).unwrap()["available"], true);
+    fs::write(&asset.original.path, b"new original source").unwrap();
+    lib.refresh(&asset.id, None).unwrap();
+    let not_queued = unavailable(&lib.similar(&asset.id, 10).unwrap_err());
+    assert_eq!(not_queued.state, vamp_core::EmbeddingState::None);
+    assert_eq!(not_queued.reason.as_deref(), Some("not_queued"));
+    lib.enqueue("custom-image-analysis", &asset.id).unwrap();
+    let stale = unavailable(&lib.similar(&asset.id, 10).unwrap_err());
+    assert_eq!(stale.state, vamp_core::EmbeddingState::Stale);
+    assert_eq!(stale.pending_total, Some(1));
+    assert_eq!(stale.processor.as_deref(), Some("custom-image-analysis"));
+    let claim = lib.claim_jobs("fixture", &["custom-image-analysis".into()], 1, 60).unwrap().remove(0);
+    lib.fail_job(&claim.job.id, &claim.lease.id, "processor exited unsuccessfully").unwrap();
+    let failed = unavailable(&lib.similar(&asset.id, 10).unwrap_err());
+    assert_eq!(failed.state, vamp_core::EmbeddingState::Failed);
+    assert_eq!(failed.reason.as_deref(), Some("processor_failed"));
+    lib.embedding_retry(&asset.id, Some("fake-clip")).unwrap();
+    assert_eq!(unavailable(&lib.similar(&asset.id, 10).unwrap_err()).state, vamp_core::EmbeddingState::Stale);
+    let claim = lib.claim_jobs("fixture", &["custom-image-analysis".into()], 1, 60).unwrap().remove(0);
+    complete_embedding(&mut lib, &claim);
+    lib.require_embedding(&asset.id, Some("fake-clip")).unwrap();
+    assert_eq!(unavailable(&lib.require_embedding(&asset.id, Some("other-model")).unwrap_err()).state, vamp_core::EmbeddingState::None);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn native_embedding_preflight_and_retry_preserve_the_typed_error() {
+    let dir = TempDir::new().unwrap();
+    let mut lib = library(&dir);
+    lib.processor_add(processor("siglip-embedding", "/must-not-run".into())).unwrap();
+    let asset = queued_image(&mut lib, &dir, "native.png");
+    for operation in ["similar", "embedding_status"] {
+        let request = serde_json::from_value(serde_json::json!({"operation":operation,"asset_id":asset.id})).unwrap();
+        let error = vamp_core::native::dispatch(&mut lib, request).unwrap_err();
+        let json = unavailable(&error).to_json();
+        assert_eq!(json["code"], "embedding_unavailable");
+        assert_eq!(json["state"], "pending");
+        assert_eq!(json["processor"], "siglip-embedding");
+        assert_eq!(json["pending_total"], 1);
+    }
+    let claim = lib.claim_jobs("fixture", &["siglip-embedding".into()], 1, 60).unwrap().remove(0);
+    lib.fail_job(&claim.job.id, &claim.lease.id, "timeout").unwrap();
+    let request = serde_json::from_value(serde_json::json!({"operation":"embedding_retry","asset_id":asset.id})).unwrap();
+    assert_eq!(vamp_core::native::dispatch(&mut lib, request).unwrap()["job"]["status"], "pending");
+}

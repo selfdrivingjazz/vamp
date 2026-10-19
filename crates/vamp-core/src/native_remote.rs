@@ -234,6 +234,8 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
             | "collection_rename"
             | "collection_delete"
             | "similar"
+            | "embedding_status"
+            | "embedding_retry"
             | "galaxy"
             | "galaxy_search"
             | "accept_tags"
@@ -354,6 +356,9 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
         "similar" => {
             let ranked = client.similar(asset_id()?, request.limit.unwrap_or(40))?;
             return Ok(Some(json!({"items":mirror_items(&library, &ranked)?})));
+        }
+        "embedding_status" | "embedding_retry" => {
+            return client.native(&forward_body(request)?).map(Some);
         }
         "accept_tags" => {
             json!(client.accept_tags(asset_id()?, &request.tags, request.expected_revision)?)

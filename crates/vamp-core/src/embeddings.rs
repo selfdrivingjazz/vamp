@@ -9,11 +9,87 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS embeddings(asset_id TEXT NOT NULL REFERENCES assets(id), source_hash TEXT NOT NULL, model TEXT NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL, PRIMARY KEY(asset_id,source_hash,model));
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, document TEXT NOT NULL);";
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, document TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS embedding_processors ON observations(json_extract(document,'$.processor'),coalesce(json_extract(document,'$.value.embedding.model'),json_extract(document,'$.model'))) WHERE json_extract(document,'$.kind')='embedding';";
 const EMBEDDER_KEY: &str = "embedder";
 const MAX_DIM: u64 = 8192;
 /// Reciprocal-rank-fusion constant for hybrid search.
 const RRF_K: f32 = 60.0;
+
+/// Why an asset has no usable embedding for its current source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingState {
+    Pending,
+    Failed,
+    Stale,
+    None,
+}
+
+/// A catalog-state conflict, not an invalid similarity request. No processor is run or
+/// queued when this error is produced; all fields come from the authority's catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingUnavailable {
+    pub state: EmbeddingState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processor: Option<String>,
+    /// Distinct live image assets with source-current pending/running embedding jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_total: Option<u64>,
+    /// A short category only: never a raw processor log, path or command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl EmbeddingUnavailable {
+    pub const CODE: &'static str = "embedding_unavailable";
+
+    /// Works through local context wrappers and a remote HTTP status's source chain.
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+
+    /// The inner error object, shared by HTTP and native JSON envelopes.
+    pub fn to_json(&self) -> Value {
+        let mut value = json!(self);
+        value["code"] = json!(Self::CODE);
+        value["message"] = json!(self.to_string());
+        value
+    }
+}
+
+impl std::fmt::Display for EmbeddingUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.state {
+            EmbeddingState::Pending => "embedding analysis is queued or running",
+            EmbeddingState::Failed => "embedding analysis failed",
+            EmbeddingState::Stale => "the current original is awaiting refreshed embedding analysis",
+            EmbeddingState::None => "no embedding analysis is available for the current original",
+        })
+    }
+}
+
+impl std::error::Error for EmbeddingUnavailable {}
+
+fn failure_reason(error: Option<&str>) -> &'static str {
+    let error = error.unwrap_or("").as_bytes();
+    let contains = |needle: &str| error.windows(needle.len()).any(|part| part.eq_ignore_ascii_case(needle.as_bytes()));
+    if contains("timed out") || contains("timeout") {
+        "timeout"
+    } else if contains("lease") && contains("expired") {
+        "lease_expired"
+    } else if contains("interrupted") {
+        "interrupted"
+    } else if contains("original changed") || contains("stale result") {
+        "source_changed"
+    } else if contains("representation unavailable") || contains("input unavailable") {
+        "input_unavailable"
+    } else if contains("embedding") || contains("observation") || contains("json") {
+        "invalid_output"
+    } else {
+        "processor_failed"
+    }
+}
 
 /// Trusted local executable answering ToolRequest operation `embed_text` with an
 /// `embedding` observation from the same model as the stored image embeddings.
@@ -178,6 +254,134 @@ impl Library {
             .execute("DELETE FROM settings WHERE key=?1", [EMBEDDER_KEY])?
             > 0)
     }
+    /// Recognize the built-in image embedder, a processor using the configured embedder
+    /// command, or one with actual embedding-observation provenance. Other observation
+    /// processors (captions/tags) are never counted as embedding work.
+    fn embedding_processors(&self, model: Option<&str>) -> Result<HashSet<String>> {
+        let embedder = self.embedder()?;
+        let mut names = HashSet::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT json_extract(document,'$.processor') FROM observations WHERE json_extract(document,'$.kind')='embedding' AND (?1 IS NULL OR coalesce(json_extract(document,'$.value.embedding.model'),json_extract(document,'$.model'))=?1)",
+        )?;
+        for name in stmt.query_map([model], |r| r.get::<_, String>(0))? {
+            names.insert(name?);
+        }
+        let configured_model = embedder.as_ref().is_none_or(|spec| model.is_none_or(|m| m == spec.model));
+        if configured_model {
+            // This is the registered built-in capability name, not a name substring guess.
+            // Jobs retain their processor snapshot even after the registration is removed.
+            names.insert("siglip-embedding".into());
+            if let Some(embedder) = embedder {
+                for processor in self.processors()? {
+                    if processor.output == "observation" && processor.command == embedder.command {
+                        names.insert(processor.name);
+                    }
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    fn missing_embedding(&self, asset: &Asset, model: Option<&str>) -> Result<EmbeddingUnavailable> {
+        let processors = json_text(&self.embedding_processors(model)?)?;
+        let source = asset.original.source_key();
+        let current = self.conn.prepare_cached(
+            "SELECT processor,status,json_extract(document,'$.error') FROM jobs WHERE asset_id=?1 AND json_extract(document,'$.source_hash')=?2 AND status IN ('pending','running','failed') AND processor IN (SELECT value FROM json_each(?3)) AND json_extract(document,'$.processor.output')='observation' ORDER BY status IN ('pending','running') DESC,rowid DESC LIMIT 1",
+        )?.query_row(params![asset.id, source, processors], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+        }).optional()?;
+        let processor = if let Some((name, _, _)) = &current {
+            Some(name.clone())
+        } else {
+            self.conn.query_row(
+                "SELECT name FROM processors WHERE name IN (SELECT value FROM json_each(?1)) AND json_extract(document,'$.output')='observation' ORDER BY name LIMIT 1",
+                [&processors],
+                |r| r.get::<_, String>(0),
+            ).optional()?
+        };
+        let pending_total = if processor.is_some() {
+            // jobs_status bounds this to active work; no original bytes, vectors, or model
+            // helpers are loaded. Count an image once even with several embedding jobs.
+            Some(self.conn.query_row(
+                "SELECT count(DISTINCT j.asset_id) FROM jobs j JOIN assets a ON a.id=j.asset_id WHERE j.status IN ('pending','running') AND a.deleted=0 AND a.trashed=0 AND a.hash=json_extract(j.document,'$.source_hash') AND json_extract(a.document,'$.original.mime') LIKE 'image/%' AND j.processor IN (SELECT value FROM json_each(?1)) AND json_extract(j.document,'$.processor.output')='observation'",
+                [&processors],
+                |r| r.get::<_, i64>(0),
+            )? as u64)
+        } else {
+            None
+        };
+        let (state, reason) = match current {
+            Some((_, status, error)) if status == "failed" => (
+                EmbeddingState::Failed,
+                Some(failure_reason(error.as_deref()).into()),
+            ),
+            Some(_) => {
+                let older = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM embeddings WHERE asset_id=?1 AND source_hash<>?2 AND (?3 IS NULL OR model=?3))",
+                    params![asset.id, source, model],
+                    |r| r.get::<_, bool>(0),
+                )?;
+                (if older { EmbeddingState::Stale } else { EmbeddingState::Pending }, None)
+            }
+            None => (
+                EmbeddingState::None,
+                Some(if processor.is_some() { "not_queued" } else { "no_processor" }.into()),
+            ),
+        };
+        Ok(EmbeddingUnavailable { state, processor, pending_total, reason })
+    }
+
+    /// Read-only preflight for per-asset pack anchors and Galaxy membership. A missing
+    /// pack/layout row alone is not evidence that analysis is queued.
+    pub fn require_embedding(&self, asset_id: &str, model: Option<&str>) -> Result<()> {
+        #[cfg(feature = "remote")]
+        if self.remote().is_some() {
+            self.remote_client()?.native(&json!({"operation":"embedding_status","asset_id":asset_id,"model":model}))?;
+            return Ok(());
+        }
+        let asset = get_asset(&self.conn, asset_id)?;
+        let available = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM embeddings WHERE asset_id=?1 AND source_hash=?2 AND (?3 IS NULL OR model=?3))",
+            params![asset.id, asset.original.source_key(), model],
+            |r| r.get::<_, bool>(0),
+        )?;
+        if !available {
+            return Err(self.missing_embedding(&asset, model)?.into());
+        }
+        Ok(())
+    }
+
+    /// Explicitly retry only this asset's source-current failed embedding job. This does
+    /// not start a worker, run a model, or enqueue unrelated assets.
+    pub fn embedding_retry(&mut self, asset_id: &str, model: Option<&str>) -> Result<Value> {
+        #[cfg(feature = "remote")]
+        if self.remote().is_some() {
+            return self.remote_client()?.native(&json!({"operation":"embedding_retry","asset_id":asset_id,"model":model}));
+        }
+        let error = match self.require_embedding(asset_id, model) {
+            Ok(()) => return Ok(json!({"available":true})),
+            Err(error) => error,
+        };
+        let Some(unavailable) = EmbeddingUnavailable::from_error(&error) else {
+            return Err(error);
+        };
+        let Some(processor) = unavailable.processor.as_deref() else {
+            return Err(error);
+        };
+        if unavailable.state == EmbeddingState::None {
+            return Err(error);
+        }
+        let asset = get_asset(&self.conn, asset_id)?;
+        let document = self.conn.query_row(
+            "SELECT document FROM jobs WHERE asset_id=?1 AND processor=?2 AND json_extract(document,'$.source_hash')=?3 AND status IN ('pending','running','failed') ORDER BY status IN ('pending','running') DESC,rowid DESC LIMIT 1",
+            params![asset_id, processor, asset.original.source_key()],
+            |r| r.get::<_, String>(0),
+        )?;
+        let job: Job = parse(document)?;
+        let job = if job.status == "failed" { self.retry_job(&job.id)? } else { job };
+        Ok(json!({"job":job}))
+    }
+
     /// Persistent embedders are queried over their socket; when none is listening, one is
     /// started in the background and this query runs as a one-shot subprocess.
     pub fn embed_text(&self, text: &str) -> Result<(String, Vec<f32>)> {
@@ -313,17 +517,26 @@ impl Library {
             (1..=1000).contains(&limit),
             "limit must be between 1 and 1000"
         );
+        #[cfg(feature = "remote")]
+        if self.remote().is_some() {
+            let ranked = self.remote_client()?.similar(asset_id, limit)?.into_iter()
+                .map(|(id, score)| Ok((id, score.context("authority omitted similarity score")? as f32)))
+                .collect::<Result<Vec<_>>>()?;
+            return self.scored(ranked, limit);
+        }
         let asset = get_asset(&self.conn, asset_id)?;
         let preferred = self.embedder()?.map(|spec| spec.model);
-        let (model, blob): (String, Vec<u8>) = self
+        let Some((model, blob)) = self
             .conn
             .query_row(
                 "SELECT model,vector FROM embeddings WHERE asset_id=?1 AND source_hash=?2 ORDER BY model=?3 DESC,model LIMIT 1",
                 params![asset_id, asset.original.source_key(), preferred],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
             )
             .optional()?
-            .context("no embedding for the current original; run an embeddings processor")?;
+        else {
+            return Err(self.missing_embedding(&asset, None)?.into());
+        };
         let ranked = self.rank(&model, &from_blob(&blob), Some(asset_id), None)?;
         self.scored(ranked, limit)
     }

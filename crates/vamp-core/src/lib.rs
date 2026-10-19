@@ -31,7 +31,7 @@ mod embeddings;
 mod galaxy;
 pub mod energy;
 mod processing;
-pub use embeddings::{EmbedderSpec, Scored};
+pub use embeddings::{EmbedderSpec, EmbeddingState, EmbeddingUnavailable, Scored};
 pub use processing::{ClaimedJob, LEASE_SECONDS, MAX_LEASE_ATTEMPTS};
 mod tools;
 #[cfg(unix)]
