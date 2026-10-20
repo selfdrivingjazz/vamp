@@ -494,7 +494,7 @@ impl Library {
                     )?;
                 }
                 match helper {
-                    Some(helper) if asset.original.mime.starts_with("image/") => {
+                    Some(helper) if asset.original.mime.starts_with("image/") || asset.original.mime.starts_with("video/") => {
                         for kind in ["thumbnail", "preview"] {
                             if let Err(e) = self.generate(&asset.id, kind, helper) {
                                 warnings.push(format!("{kind}: {e:#}"));
@@ -502,7 +502,7 @@ impl Library {
                             }
                         }
                     }
-                    Some(_) => warnings.push(format!("{} is not an image; the grid shows a placeholder", asset.original.mime)),
+                    Some(_) => warnings.push(format!("{} has no visual representation; the grid shows a placeholder", asset.original.mime)),
                     None => warnings.push("vamp-media helper unavailable: no thumbnail, replicas show a placeholder (run with the vamp beside vamp-media or set VAMP_MEDIA_HELPER)".into()),
                 }
                 ("created", asset)
@@ -736,6 +736,30 @@ mod tests {
         assert_eq!(split_description(Some("only brief")), ("only brief".into(), "".into()));
         assert!(validate_slug("vamp-sh").is_ok());
         assert!(validate_slug("Vamp").is_err() && validate_slug("-x").is_err() && validate_slug("").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn videos_attempt_poster_generation_and_report_helper_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, mut library) = library();
+        let helper = dir.path().join("media");
+        std::fs::write(&helper, "#!/bin/sh\necho 'video poster generation requires ffmpeg' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        with_actor(Some("agent:test-video".into()), || {
+            library.explore_ensure("video", None, None).unwrap();
+            let added = library.explore_add("video", finding("moving painting", Content::Bytes {
+                bytes: b"video fixture".to_vec(),
+                filename: "painting.mp4".into(),
+                image_url: None,
+            }), Some(&helper)).unwrap();
+            let warnings = added["warnings"].as_array().unwrap();
+            assert_eq!(warnings.len(), 1);
+            let warning = warnings[0].as_str().unwrap();
+            assert!(warning.starts_with("thumbnail:"), "{warning}");
+            assert!(warning.contains("video poster generation requires ffmpeg"), "{warning}");
+            assert!(!warning.contains("is not an image"));
+        });
     }
 
     // One test owns VAMP_ACTOR (process-wide) by switching per-thread actors instead.
