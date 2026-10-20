@@ -10,11 +10,10 @@ anyhow.workspace = true
 serde_json.workspace = true
 vamp-protocol.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp"] }
+tempfile = "3"
 
 # Pure-Rust HEIC/HEIF and AVIF decoders (no C, no cmake/nasm) where there is no sips.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 heif-oxide = "0.1.0"
 avif-rust = "0.0.8"
 
-[dev-dependencies]
-tempfile = "3"

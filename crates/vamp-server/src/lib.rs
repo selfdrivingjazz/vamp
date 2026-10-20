@@ -814,7 +814,7 @@ fn route(
                 .lock()
                 .land_original(id, &body, filename)
                 .map_err(landed_conflict)?;
-            if app.helper.is_some() && asset.original.mime.starts_with("image/") {
+            if app.helper.is_some() && visual_media(&asset.original.mime) {
                 generate_in_background(app, &asset.id);
             }
             ok(asset)
@@ -1060,11 +1060,15 @@ fn ingest(
         }
         asset
     };
-    // Derivatives are optional: without a helper (or for non-images) the asset has none.
-    if app.helper.is_some() && asset.original.mime.starts_with("image/") {
+    // Derivatives are optional: images and video posters use the same representation tiers.
+    if app.helper.is_some() && visual_media(&asset.original.mime) {
         generate_in_background(app, &asset.id);
     }
     Ok(asset)
+}
+
+fn visual_media(mime: &str) -> bool {
+    mime.starts_with("image/") || mime.starts_with("video/")
 }
 
 /// Renders a new asset's thumbnail, then preview, off the request. Each lands as a
@@ -1261,7 +1265,7 @@ fn resolve_original(app: &Arc<App>, item: &PendingOriginal) {
     });
     match landed {
         Ok(asset) => {
-            if app.helper.is_some() && asset.original.mime.starts_with("image/") {
+            if app.helper.is_some() && visual_media(&asset.original.mime) {
                 generate_in_background(app, &asset.id);
             }
         }
@@ -1653,7 +1657,10 @@ fn stream(app: &Arc<App>, request: &Request, id: &str, kind: &str) -> Result<Rep
         body,
         Some(len as usize),
         None,
-    ))
+    )
+    // These bodies have an exact length. Preserve Content-Length for progressive
+    // players, including ranges larger than tiny_http's default 32 KiB threshold.
+    .with_chunked_threshold(usize::MAX))
 }
 
 /// Single `bytes=a-b`, `bytes=a-` or `bytes=-n` range; `None` ignores the header.

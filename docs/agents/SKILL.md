@@ -73,6 +73,7 @@ pass a long-lived tunnel token as a command argument.
 ## Inspect and view
 - `vamp media inspect <id>` — full asset: `revision`, metadata (tags, rating, description), captions/model tags (observations), representations.
 - `vamp media fetch <id> --kind thumbnail|preview|original` — prints a local path you can open/read. Look at `thumbnail`/`preview` first; fetch `original` only when full resolution is needed (it may download from cloud storage).
+- `vamp media thumbnail <id>` / `vamp media preview <id>` — explicitly generate image derivatives, including a video's first-frame poster. Video requires optional `ffmpeg` on the authority's `PATH` (or `VAMP_FFMPEG`); missing tools and decoding failures are reported. Uses the normal thumbnail/preview and grid tiers; never changes the original.
 - `vamp media sheet --query "..." --limit 16 --output out.png` — numbered contact sheet to review many results in one image (or `--ids ID,ID,...`).
 - `vamp media export <ids...> --to <dir>` — copy originals into an existing directory for the user.
 

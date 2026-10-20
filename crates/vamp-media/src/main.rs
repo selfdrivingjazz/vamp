@@ -11,6 +11,7 @@ use vamp_protocol::{
 
 #[cfg(not(target_os = "macos"))]
 mod native;
+mod video;
 
 const MAX_REQUEST: u64 = 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
@@ -45,6 +46,7 @@ fn run() -> Result<()> {
             env!("CARGO_PKG_VERSION"),
             PROTOCOL_VERSION
         );
+        println!("Video posters: first displayed frame via optional ffmpeg on PATH (or VAMP_FFMPEG).\nVideo sources are streamed, not subject to the image source-byte limit; extracted frames\nare bounded to 4096px before normal image limits. Missing ffmpeg is a generation error.");
         return Ok(());
     }
     if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
@@ -103,7 +105,12 @@ fn run() -> Result<()> {
                 .input_path
                 .as_deref()
                 .context("input_path is required")?;
-            let (decoded, source) = decode_sized(Path::new(input))?;
+            let input = Path::new(input);
+            let (decoded, source) = if video::is_video(input, request.asset.as_ref()) {
+                video::poster(input)?
+            } else {
+                decode_sized(input)?
+            };
             let source = Some(source);
             (fit_white(decoded, edge, edge), None, source)
         }

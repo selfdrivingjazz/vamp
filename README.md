@@ -22,6 +22,15 @@ four binaries) to the latest release. Each release archive holds `vamp`, `vamp-m
 Then `vamp guide` prints the operating manual (`docs/agents/SKILL.md`, also usable as an agent
 skill), `vamp commands` the full argument tree and `vamp schema` the JSON schemas.
 
+Video thumbnails and previews use the first displayed frame as a poster, then the same
+JPEG representations and WebP grid tiers as images. This requires the optional `ffmpeg`
+executable on the authority's `PATH` (or `VAMP_FFMPEG` set to its path); a missing tool
+or unreadable video produces a generation error, never a fabricated thumbnail.
+`vamp media thumbnail ID` and `vamp media preview ID` explicitly generate these
+derivatives for an existing video. Originals and provenance are never rewritten.
+The authority serves originals with byte ranges and a known `Content-Length`, including
+large MP4 range responses, for progressive video players.
+
 ## Share a library
 
 One machine owns a library (the authority); other machines and the Vampire apps attach
@@ -217,7 +226,7 @@ content or credentials. Transport failures use the fixed `transport_error` categ
 | `crates/vamp-protocol` | `vamp-protocol` | Serialized types, generated JSON schemas and the semantic contract (`protocol/contract.json`) |
 | `crates/vamp-core` | `vamp-core` | The engine: SQLite catalog, Eagle import, thumbnails, processors and jobs, explorations, replica sync (feature `remote`), native operations (feature `native`) |
 | `crates/vamp-cli` | `vamp-cli` (binary `vamp`) | The command-line tool |
-| `crates/vamp-media` | `vamp-media` | Optional helper `vamp` and `vamp-core` call for image decoding (HEIC/AVIF/PSD included), thumbnails and colors |
+| `crates/vamp-media` | `vamp-media` | Optional helper `vamp` and `vamp-core` call for image decoding (HEIC/AVIF/PSD included), video posters (optional ffmpeg), thumbnails and colors |
 | `crates/vamp-server` | `vamp-server` | HTTP server for one authority library: the `/v1` API replicas, the Vampire apps and the browser clipper use; token or Tailscale identity auth; background processor jobs and thumbnail tiers (`vamp serve` runs it) |
 | `crates/vamp-store` | `vamp-store` | S3-compatible object storage helper for cloud originals (one JSON request on stdin, one response on stdout) |
 | `vendor/tiny_http` | `tiny_http` 0.12.0 (patched) | The HTTP/1.1 server `vamp-server` uses, with a connection-pool fix (`vendor/tiny_http/VENDORED.md`); MIT OR Apache-2.0 |
