@@ -186,8 +186,14 @@ impl Transfer {
     }
 }
 
+enum DownloadMode<'a> {
+    Representation(Option<&'a str>),
+    Conditional(Option<&'a str>),
+}
+
 enum Chunk {
     Head(Option<u64>),
+    Unchanged,
     Data(Vec<u8>),
     Done,
     Failed(anyhow::Error),
@@ -481,6 +487,30 @@ impl Client {
         transfer: &Transfer,
         stall: Duration,
     ) -> Result<()> {
+        self.download_to(path, dest, DownloadMode::Representation(expected_blake3), transfer, stall)?;
+        Ok(())
+    }
+
+    /// Conditional, atomic download. A 304 leaves `dest` untouched; a 200 publishes
+    /// its body only after the ordinary cancellable, priority-aware transfer completes.
+    pub fn download_if_changed(
+        &self,
+        path: &str,
+        dest: &Path,
+        etag: Option<&str>,
+        transfer: &Transfer,
+    ) -> Result<bool> {
+        self.download_to(path, dest, DownloadMode::Conditional(etag), transfer, STALL_TIMEOUT)
+    }
+
+    fn download_to(
+        &self,
+        path: &str,
+        dest: &Path,
+        mode: DownloadMode<'_>,
+        transfer: &Transfer,
+        stall: Duration,
+    ) -> Result<bool> {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::sync::atomic::Ordering::{Relaxed, SeqCst};
@@ -499,9 +529,16 @@ impl Client {
         let (hold, gone) = (Arc::new(AtomicBool::new(transfer.held())), Arc::new(AtomicBool::new(false)));
         let _running = Running(transfer, gone.clone());
         let (tx, rx) = sync_channel::<Chunk>(8);
-        let request = self
-            .authorize(self.agent.get(format!("{}{path}", self.base)))
-            .config()
+        let conditional = matches!(mode, DownloadMode::Conditional(_));
+        let mut request = self.authorize(self.agent.get(format!("{}{path}", self.base)));
+        if let DownloadMode::Conditional(Some(etag)) = mode {
+            request = if etag.starts_with('"') || etag.starts_with("W/\"") {
+                request.header("If-None-Match", etag)
+            } else {
+                request.header("If-None-Match", format!("\"{etag}\""))
+            };
+        }
+        let request = request.config()
             // Bounds the helper thread if the authority stalls forever after we give up.
             .timeout_recv_body(Some(Duration::from_secs(6 * 3600)))
             .build();
@@ -526,7 +563,14 @@ impl Client {
                 let response = request
                     .call()
                     .with_context(|| format!("remote unavailable: {base}"))
-                    .and_then(Self::checked);
+                    .and_then(|response| {
+                        if conditional && response.status().as_u16() == 304 {
+                            return Ok(response);
+                        }
+                        let response = Self::checked(response)?;
+                        ensure!(!conditional || response.status().as_u16() == 200, "unexpected conditional download status: {}", response.status());
+                        Ok(response)
+                    });
                 let response = match response {
                     Ok(response) => response,
                     Err(e) => {
@@ -534,6 +578,10 @@ impl Client {
                         return;
                     }
                 };
+                if response.status().as_u16() == 304 {
+                    let _ = tx.send(Chunk::Unchanged);
+                    return;
+                }
                 let total = response
                     .headers()
                     .get("content-length")
@@ -562,12 +610,12 @@ impl Client {
                 }
             })?;
         let temp = parent.join(format!(".{}.part", id()));
-        let result = (|| -> Result<()> {
-            let mut out = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            let mut hasher = blake3::Hasher::new();
+        let result = (|| -> Result<bool> {
+            let mut out = None;
+            let mut hasher = match mode {
+                DownloadMode::Representation(Some(_)) => Some(blake3::Hasher::new()),
+                _ => None,
+            };
             let mut last = std::time::Instant::now();
             loop {
                 ensure!(!transfer.cancelled(), "download cancelled");
@@ -578,16 +626,18 @@ impl Client {
                 }
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(Chunk::Head(total)) => {
+                        out = Some(OpenOptions::new().write(true).create_new(true).open(&temp)?);
                         transfer.total.store(total.map_or(0, |t: u64| t + 1), Relaxed);
                         last = std::time::Instant::now();
                     }
                     Ok(Chunk::Data(data)) => {
-                        hasher.update(&data);
-                        out.write_all(&data)?;
+                        if let Some(hasher) = &mut hasher { hasher.update(&data); }
+                        out.as_mut().context("download body arrived before headers")?.write_all(&data)?;
                         transfer.bytes.fetch_add(data.len() as u64, Relaxed);
                         last = std::time::Instant::now();
                     }
                     Ok(Chunk::Done) => break,
+                    Ok(Chunk::Unchanged) => return Ok(false),
                     Ok(Chunk::Failed(e)) => return Err(e),
                     Err(RecvTimeoutError::Timeout) => {
                         if last.elapsed() >= stall {
@@ -597,15 +647,15 @@ impl Client {
                     Err(RecvTimeoutError::Disconnected) => anyhow::bail!("download ended early"),
                 }
             }
-            out.sync_all()?;
-            if let Some(expected) = expected_blake3 {
+            out.context("download ended without headers")?.sync_all()?;
+            if let DownloadMode::Representation(Some(expected)) = mode {
                 ensure!(
-                    hasher.finalize().to_hex().as_str() == expected,
+                    hasher.context("missing download digest")?.finalize().to_hex().as_str() == expected,
                     "downloaded bytes do not match the catalog hash"
                 );
             }
             fs::rename(&temp, dest)?;
-            Ok(())
+            Ok(true)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temp);
@@ -1047,10 +1097,10 @@ pub fn sync(library: &mut Library) -> Result<Value> {
     sync_with(library, &mut |_, _, _| {})
 }
 
-/// Also keeps the mirrored embeddings pack fresh (best effort; see `energy::replica`).
+/// Schedules a best-effort embeddings refresh only when a pack is already mirrored.
 pub fn sync_with(library: &mut Library, progress: Progress) -> Result<Value> {
     let value = pull(library, progress, true, None)?;
-    crate::energy::replica::refresh_after_sync(library, value["applied"].as_u64().unwrap_or(0), false);
+    crate::energy::replica::refresh_after_sync(library, value["applied"].as_u64().unwrap_or(0));
     Ok(value)
 }
 
@@ -1897,7 +1947,7 @@ pub fn sync_wait(library: &mut Library, wait: u64) -> Result<Value> {
     let changed = !events.is_empty();
     let mut value = if changed {
         let value = pull(library, &mut |_, _, _| {}, true, Some((after, events)))?;
-        crate::energy::replica::refresh_after_sync(library, value["applied"].as_u64().unwrap_or(0), true);
+        crate::energy::replica::refresh_after_sync(library, value["applied"].as_u64().unwrap_or(0));
         value
     } else {
         json!({"applied":0,"cursor":after})
@@ -1931,6 +1981,97 @@ pub fn semantic_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn download_server(response: &'static [u8]) -> (Client, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Client::new(&Remote {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "conditional-secret".into(),
+            drive_roots: BTreeMap::new(),
+        }).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() { break; }
+                request.push_str(&line);
+            }
+            stream.write_all(response).unwrap();
+            request
+        });
+        (client, server)
+    }
+
+    #[test]
+    fn conditional_download_304_leaves_existing_and_missing_destinations_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("pack");
+        fs::write(&dest, b"valid cached pack").unwrap();
+        let modified = fs::metadata(&dest).unwrap().modified().unwrap();
+        for existing in [true, false] {
+            if !existing { fs::remove_file(&dest).unwrap(); }
+            let (client, server) = download_server(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n");
+            let transfer = Transfer::background();
+            let etag = if existing { "\"version\"" } else { "version" };
+            assert!(!client.download_if_changed("/embeddings/pack?cursor=7", &dest, Some(etag), &transfer).unwrap());
+            assert_eq!(transfer.bytes(), 0);
+            if existing {
+                assert_eq!(fs::read(&dest).unwrap(), b"valid cached pack");
+                assert_eq!(fs::metadata(&dest).unwrap().modified().unwrap(), modified);
+            } else {
+                assert!(!dest.exists());
+            }
+            let request = server.join().unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("get /v1/embeddings/pack?cursor=7 http/1.1\r\n"));
+            assert!(request.contains("if-none-match: \"version\"\r\n"));
+            assert!(request.contains("authorization: bearer conditional-secret\r\n"));
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), usize::from(existing));
+        }
+    }
+
+    #[test]
+    fn conditional_download_200_publishes_body_with_authority_authentication() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("pack");
+        fs::write(&dest, b"old pack").unwrap();
+        let (client, server) = download_server(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnew pack");
+        let transfer = Transfer::background();
+        assert!(client.download_if_changed("/embeddings/pack", &dest, None, &transfer).unwrap());
+        assert_eq!(fs::read(&dest).unwrap(), b"new pack");
+        assert_eq!(transfer.bytes(), 8);
+        assert_eq!(transfer.total(), Some(8));
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer conditional-secret\r\n"));
+        assert!(!request.contains("if-none-match:"));
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn conditional_download_failure_preserves_cache_and_does_not_disclose_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("pack");
+        fs::write(&dest, b"old pack").unwrap();
+        for response in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort"[..],
+            &b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+        ] {
+            let (client, server) = download_server(response);
+            let error = client.download_if_changed("/embeddings/pack", &dest, Some("\"old\""), &Transfer::background()).unwrap_err();
+            assert!(!format!("{error:#}").contains("conditional-secret"));
+            assert_eq!(fs::read(&dest).unwrap(), b"old pack");
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+            server.join().unwrap();
+        }
+        let (mut client, server) = download_server(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx");
+        client.token.clear();
+        assert!(client.download_if_changed("/embeddings/pack", &dest, None, &Transfer::background()).unwrap());
+        assert!(!server.join().unwrap().to_ascii_lowercase().contains("authorization:"));
+    }
+
 
     fn loop_mirror(root: &Path, url: &str, token: &str) -> (Library, Asset) {
         let source = root.join("source.mp4");

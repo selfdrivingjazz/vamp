@@ -119,7 +119,20 @@ impl Proxy {
         }
         server.write_all(b"Connection: close\r\n\r\n").unwrap();
         server.write_all(&body).unwrap();
-        let _ = std::io::copy(&mut server, &mut client);
+        // This fixture serves one request per connection. Tell the downstream pool
+        // explicitly; otherwise it can reuse the socket between body EOF and close.
+        let mut response = BufReader::new(server);
+        loop {
+            let mut line = String::new();
+            if response.read_line(&mut line).unwrap_or(0) == 0 { return; }
+            if line == "\r\n" {
+                if client.write_all(b"Connection: close\r\n\r\n").is_err() { return; }
+                break;
+            }
+            if !line.to_ascii_lowercase().starts_with("connection:")
+                && client.write_all(line.as_bytes()).is_err() { return; }
+        }
+        let _ = std::io::copy(&mut response, &mut client);
     }
 }
 
