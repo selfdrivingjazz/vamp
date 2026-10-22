@@ -495,8 +495,10 @@ impl Library {
                 }
                 match helper {
                     Some(helper) if asset.original.mime.starts_with("image/") || asset.original.mime.starts_with("video/") => {
-                        for kind in ["thumbnail", "preview"] {
+                        let looping = asset.original.mime.starts_with("video/") || matches!(asset.original.mime.as_str(), "image/gif" | "image/webp");
+                        for kind in ["thumbnail", "preview"].into_iter().chain(looping.then_some("loop")) {
                             if let Err(e) = self.generate(&asset.id, kind, helper) {
+                                if kind == "loop" && format!("{e:#}").contains("static images do not have loop previews") { continue; }
                                 warnings.push(format!("{kind}: {e:#}"));
                                 break;
                             }

@@ -579,6 +579,11 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
                 .filter_map(|id| inspect(library, id).ok())
                 .collect::<Vec<_>>()
         )),
+        "stream" => stream(
+            library,
+            asset_id()?,
+            request.kind.as_deref().context("kind is required")?,
+        ),
         "original" => {
             let id = asset_id()?;
             let path = library.fetch(id, "original")?;
@@ -825,10 +830,11 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
 /// Derivatives are optional and regenerable: failures leave the asset without them.
 fn generate_reps(library: &mut Library, asset: &Asset, helper: Option<&Path>) {
     let Some(helper) = helper else { return };
-    if !asset.original.mime.starts_with("image/") {
+    if !asset.original.mime.starts_with("image/") && !asset.original.mime.starts_with("video/") {
         return;
     }
-    for kind in ["thumbnail", "preview"] {
+    let looping = asset.original.mime.starts_with("video/") || matches!(asset.original.mime.as_str(), "image/gif" | "image/webp");
+    for kind in ["thumbnail", "preview"].into_iter().chain(looping.then_some("loop")) {
         if library.generate(&asset.id, kind, helper).is_err() {
             return;
         }
@@ -899,6 +905,39 @@ fn inspect(library: &Library, id: &str) -> Result<Value> {
     Ok(
         json!({"asset":media_item(library, &view.asset, &view.representations)?,"original_path":if original.path.is_empty() {None} else {Some(&original.path)},"source_url":view.asset.metadata.source_url,"human_description":view.asset.metadata.description,"observations":observations,"suggested_tags":view.suggested_tags,"representations":view.representations,"created_at":view.asset.created_at,"folder_ids":library.folder_ids(&view.asset.id)?,"hash_state":original.hash_state,"blake3":(!original.pending()).then_some(&original.blake3)}),
     )
+}
+
+/// Resolve playback without generating, downloading, or opening media. Local `url`
+/// values are file paths; an original's cataloged path is not checked for availability.
+/// Remote values are HTTP URLs with separate auth headers.
+pub fn stream(library: &Library, id: &str, kind: &str) -> Result<Value> {
+    ensure!(
+        !id.is_empty()
+            && id.len() <= 64
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "invalid asset identifier"
+    );
+    ensure!(matches!(kind, "loop" | "original"), "stream kind must be loop or original");
+    #[cfg(feature = "remote")]
+    if library.remote().is_some() {
+        return crate::remote::stream(library, id, kind);
+    }
+    let path = if kind == "original" {
+        library.original_lookup(id)?.local_path()
+    } else {
+        let asset = get_asset(&library.conn, id)?;
+        let document = library.conn.query_row(
+            "SELECT document FROM representations WHERE asset_id=?1 AND kind='loop' AND source_hash=?2",
+            params![id, asset.original.source_key()],
+            |r| r.get::<_, String>(0),
+        ).optional()?;
+        document.map(|document| {
+            let rep: Representation = parse(document)?;
+            local_representation(&library.state_dir, &rep.path)
+        }).transpose()?.filter(|path| path.is_file())
+    };
+    let path = path.context("stream unavailable locally; fetch from the authority")?;
+    Ok(json!({"url":path_text(&path)?,"headers":{},"local":true}))
 }
 
 pub(crate) fn media_item(
@@ -975,6 +1014,7 @@ pub(crate) fn media_item(
         "rating": asset.metadata.rating,
         "colors": asset.metadata.colors,
         "hash_state": asset.original.hash_state,
+        "has_loop": current("loop").is_some(),
         "available_locally": {"thumbnail":thumbnail.is_some(),"preview":preview.is_some(),"original":original},
         "storage": asset.original.storage,
         "thumbnail_path": thumbnail,
@@ -1187,9 +1227,9 @@ fn browse_query(library: &Library, filter: &BrowseFilter) -> Result<BrowseQuery>
 }
 
 /// Every asset a browse with the same filter/sort would list, as compact parallel arrays
-/// (`ids`, `widths`, `heights`; 0 = unknown) so a client can lay out the whole result at
-/// once and fetch cell details (`items`) only for what is on screen. `micro:true` adds
-/// `micro`: base64 micro-thumbnails (or null) in the same order.
+/// (`ids`, `widths`, `heights`, `has_loop`; 0 = unknown dimension) so a client can lay out
+/// the whole result at once and fetch cell details (`items`) only for what is on screen.
+/// `micro:true` adds base64 micro-thumbnails (or null) in the same order.
 pub fn layout(library: &mut Library, filter: &BrowseFilter, micro: bool) -> Result<Value> {
     let BrowseQuery {
         sql,
@@ -1198,21 +1238,23 @@ pub fn layout(library: &mut Library, filter: &BrowseFilter, micro: bool) -> Resu
         order_args,
     } = browse_query(library, filter)?;
     args.extend(order_args);
-    let (mut ids, mut widths, mut heights) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut ids, mut widths, mut heights, mut has_loop) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     {
         let _snapshot = read_snapshot(&library.conn)?;
         // Assets without catalog dimensions take their preview/thumbnail's.
         let mut stmt = library.conn.prepare(&format!(
-            "SELECT a.id, coalesce(a.width,(SELECT json_extract(r.document,'$.width') FROM representations r WHERE r.asset_id=a.id ORDER BY r.kind DESC LIMIT 1),0), coalesce(a.height,(SELECT json_extract(r.document,'$.height') FROM representations r WHERE r.asset_id=a.id ORDER BY r.kind DESC LIMIT 1),0) {sql} ORDER BY {order}"
+            "SELECT a.id, coalesce(a.width,(SELECT json_extract(r.document,'$.width') FROM representations r WHERE r.asset_id=a.id ORDER BY r.kind DESC LIMIT 1),0), coalesce(a.height,(SELECT json_extract(r.document,'$.height') FROM representations r WHERE r.asset_id=a.id ORDER BY r.kind DESC LIMIT 1),0), EXISTS(SELECT 1 FROM representations r WHERE r.asset_id=a.id AND r.kind='loop' AND r.source_hash=a.hash) {sql} ORDER BY {order}"
         ))?;
         let mut rows = stmt.query(rusqlite::params_from_iter(args.iter()))?;
         while let Some(row) = rows.next()? {
             ids.push(row.get::<_, String>(0)?);
             widths.push(row.get::<_, i64>(1)?.clamp(0, u32::MAX as i64) as u32);
             heights.push(row.get::<_, i64>(2)?.clamp(0, u32::MAX as i64) as u32);
+            has_loop.push(row.get::<_, bool>(3)?);
         }
     }
-    let mut value = json!({"total":ids.len(),"widths":widths,"heights":heights});
+    let mut value = json!({"total":ids.len(),"widths":widths,"heights":heights,"has_loop":has_loop});
     if micro {
         let blobs = crate::thumbs::micro_for(library, &ids)?;
         value["micro"] = json!(
@@ -1808,6 +1850,82 @@ mod tests {
             .unwrap();
         fs::remove_file(original).unwrap();
         (library, asset.id, collection.id)
+    }
+
+    fn loop_rep(library: &Library, id: &str, source_hash: String) -> Representation {
+        let rep = Representation {
+            kind: "loop".into(),
+            path: "representations/loop.mp4".into(),
+            source_hash,
+            width: 480,
+            height: 270,
+            mime: "video/mp4".into(),
+            byte_size: 4,
+        };
+        library.conn.execute(
+            "INSERT OR REPLACE INTO representations(asset_id,kind,source_hash,document) VALUES(?1,?2,?3,?4)",
+            params![id, rep.kind, rep.source_hash, json_text(&rep).unwrap()],
+        ).unwrap();
+        rep
+    }
+
+    #[test]
+    fn loop_metadata_follows_current_source_without_local_bytes() {
+        let root = TempDir::new().unwrap();
+        let (mut library, id, _) = fixture(root.path());
+        assert_eq!(items(&library, &[id.clone()]).unwrap()["items"][0]["has_loop"], false);
+        let asset = get_asset(&library.conn, &id).unwrap();
+        let rep = loop_rep(&library, &id, asset.original.source_key());
+        assert!(!library.state_dir.join(&rep.path).exists());
+        assert_eq!(items(&library, &[id.clone()]).unwrap()["items"][0]["has_loop"], true);
+        assert_eq!(browse(&library, &BrowseFilter { limit: 100, ..BrowseFilter::default() }).unwrap()["items"][0]["has_loop"], true);
+        assert_eq!(inspect(&library, &id).unwrap()["asset"]["has_loop"], true);
+        assert_eq!(layout(&mut library, &BrowseFilter::default(), false).unwrap()["has_loop"], json!([true]));
+        let stale = loop_rep(&library, &id, "old-source".into());
+        assert_eq!(media_item(&library, &asset, &[stale]).unwrap()["has_loop"], false);
+        assert_eq!(items(&library, &[id.clone()]).unwrap()["items"][0]["has_loop"], false);
+        assert_eq!(layout(&mut library, &BrowseFilter::default(), false).unwrap()["has_loop"], json!([false]));
+        let mut pending = asset;
+        pending.original.hash_state = "pending".into();
+        pending.original.blake3.clear();
+        pending.original.modified_ns = Some(123);
+        library.conn.execute("UPDATE assets SET hash=?2,document=?3 WHERE id=?1",
+            params![id, pending.original.source_key(), json_text(&pending).unwrap()]).unwrap();
+        loop_rep(&library, &id, pending.original.source_key());
+        assert_eq!(items(&library, &[id]).unwrap()["items"][0]["has_loop"], true);
+        assert_eq!(layout(&mut library, &BrowseFilter::default(), false).unwrap()["has_loop"], json!([true]));
+    }
+
+    #[test]
+    fn authority_stream_resolves_catalog_and_cached_paths_without_hydrating() {
+        let root = TempDir::new().unwrap();
+        let (mut library, id, _) = fixture(root.path());
+        let mut asset = get_asset(&library.conn, &id).unwrap();
+        let original = stream(&library, &id, "original").unwrap();
+        assert_eq!(original, json!({"url":asset.original.path,"headers":{},"local":true}));
+        assert!(stream(&library, &id, "loop").is_err());
+        let rep = loop_rep(&library, &id, asset.original.source_key());
+        fs::write(library.state_dir.join(&rep.path), b"loop").unwrap();
+        let request = serde_json::from_value(json!({"operation":"stream","asset_id":id,"kind":"loop"})).unwrap();
+        assert_eq!(dispatch(&mut library, request).unwrap(), json!({
+            "url":path_text(&library.state_dir.join(&rep.path)).unwrap(),"headers":{},"local":true
+        }));
+        for kind in ["preview", "thumbnail", "", "original/../../secret"] {
+            assert!(stream(&library, &id, kind).is_err());
+        }
+        for bad_id in ["", "../secret", "a?token=secret"] {
+            let error = stream(&library, bad_id, "loop").unwrap_err().to_string();
+            assert_eq!(error, "invalid asset identifier");
+        }
+        assert!(dispatch(&mut library, Request { operation: "stream".into(), asset_id: Some(id.clone()), ..Request::default() }).is_err());
+        asset.original.path.clear();
+        asset.original.locator = Some("s3://example-bucket/original".into());
+        library.conn.execute("UPDATE assets SET document=?2 WHERE id=?1", params![id, json_text(&asset).unwrap()]).unwrap();
+        assert_eq!(stream(&library, &id, "original").unwrap_err().to_string(), "stream unavailable locally; fetch from the authority");
+        let cache = library.state_dir.join(format!("cache/originals/{}{}", asset.original.blake3, storage::original_extension(&asset.original)));
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(&cache, b"source bytes never exported").unwrap();
+        assert_eq!(stream(&library, &id, "original").unwrap(), json!({"url":path_text(&cache).unwrap(),"headers":{},"local":true}));
     }
 
     #[test]

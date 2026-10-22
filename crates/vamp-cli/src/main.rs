@@ -653,6 +653,10 @@ enum MediaCommand {
     Preview {
         id: String,
     },
+    /// Generate a small muted faststart MP4 loop for a video or animated GIF/WebP.
+    LoopPreview {
+        id: String,
+    },
     /// Build a numbered sheet from existing local thumbnails only.
     Sheet {
         #[arg(long, conflicts_with = "ids")]
@@ -674,6 +678,7 @@ enum Kind {
     Original,
     Thumbnail,
     Preview,
+    Loop,
 }
 impl Kind {
     fn as_str(&self) -> &'static str {
@@ -681,6 +686,7 @@ impl Kind {
             Self::Original => "original",
             Self::Thumbnail => "thumbnail",
             Self::Preview => "preview",
+            Self::Loop => "loop",
         }
     }
 }
@@ -1335,6 +1341,11 @@ fn execute(cli: Cli) -> Result<Value> {
                     MediaCommand::Preview { id } => Ok(serde_json::to_value(library.generate(
                         &id,
                         "preview",
+                        &resolve_helper(&home)?,
+                    )?)?),
+                    MediaCommand::LoopPreview { id } => Ok(serde_json::to_value(library.generate(
+                        &id,
+                        "loop",
                         &resolve_helper(&home)?,
                     )?)?),
                     MediaCommand::Sheet {

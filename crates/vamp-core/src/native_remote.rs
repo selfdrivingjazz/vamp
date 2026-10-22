@@ -224,6 +224,7 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
             | "sync_wait"
             | "representation"
             | "original"
+            | "stream"
             | "update"
             | "remove"
             | "ingest"
@@ -278,6 +279,13 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
         let value = sync_wait(&mut library, request.wait.unwrap_or(25))?;
         spawn_downloader(&library, false)?;
         return Ok(Some(value));
+    }
+    if operation == "stream" {
+        return super::native::stream(
+            &library,
+            asset_id()?,
+            request.kind.as_deref().context("kind is required")?,
+        ).map(Some);
     }
     if operation == "representation" || operation == "original" {
         let kind = match operation {

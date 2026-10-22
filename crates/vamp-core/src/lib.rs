@@ -739,8 +739,8 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
         }
         let path = {
             ensure!(
-                kind == "thumbnail" || kind == "preview",
-                "representation must be original, thumbnail or preview"
+                matches!(kind, "thumbnail" | "preview" | "loop"),
+                "representation must be original, thumbnail, preview or loop"
             );
             let rep: Representation = self.conn.query_row("SELECT document FROM representations WHERE asset_id=?1 AND kind=?2 AND source_hash=?3",params![id,kind,asset.original.source_key()],|r|r.get::<_,String>(0)).optional()?.map(parse).transpose()?.with_context(||format!("representation unavailable: {kind}; generate it while the original is accessible"))?;
             local_representation(&self.state_dir, &rep.path)?
@@ -762,7 +762,7 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
     ) -> Result<PathBuf> {
         match (self.fetch(id, kind), helper) {
             (Err(error), Some(helper))
-                if matches!(kind, "thumbnail" | "preview")
+                if matches!(kind, "thumbnail" | "preview" | "loop")
                     && format!("{error:#}").contains("representation unavailable") =>
             {
                 let rep = self.generate(id, kind, helper)?;
@@ -793,8 +793,8 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
     /// original and running the helper).
     pub fn prepare_generation(&self, id: &str, kind: &str) -> Result<Generation> {
         ensure!(
-            kind == "thumbnail" || kind == "preview",
-            "only thumbnail or preview can be generated"
+            matches!(kind, "thumbnail" | "preview" | "loop"),
+            "only thumbnail, preview or loop can be generated"
         );
         let view = self.inspect(id)?;
         if let Some(rep) = view.representations.into_iter().find(|r| r.kind == kind)
@@ -903,17 +903,19 @@ impl GenerationJob {
             original.blake3 == asset.original.blake3,
             "original changed; run media refresh before generating derivatives"
         );
+        let extension = if kind == "loop" { "mp4" } else { "jpg" };
         let relative = format!(
-            "representations/{}/{kind}-{}.jpg",
+            "representations/{}/{kind}-{}.{extension}",
             asset.original.blake3,
             id::simple()
         );
         let output = state_dir.join(&relative);
         fs::create_dir_all(output.parent().unwrap())?;
         let request = ToolRequest {
+            operation: if kind == "loop" { "loop".into() } else { "generate".into() },
             input_path: Some(path_text(&input)?),
             output_path: Some(path_text(&output)?),
-            max_edge: Some(if kind == "thumbnail" { 512 } else { 1600 }),
+            max_edge: Some(match kind { "thumbnail" => 512, "loop" => 480, _ => 1600 }),
             asset: Some(asset.clone()),
             library_id: Some(library_id),
             ..ToolRequest::default()

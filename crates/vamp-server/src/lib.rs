@@ -838,6 +838,13 @@ fn route(
                 None => stream(app, request, id, "original"),
             }
         }
+        (Method::Get, ["v1", "assets", id, "tier", "loop"]) => {
+            // Loop metadata is synced before playback. Never hydrate/generate on this hot path.
+            if app.lock().fetch(id, "loop").is_err() {
+                return Ok(json_reply(404, &json!({"error":{"code":"tier_missing","message":format!("no loop tier for {id} yet")}})));
+            }
+            stream(app, request, id, "loop")
+        }
         (Method::Get, ["v1", "assets", id, "tier", tier]) => {
             // Generated tier files only: never an original, so never Drive.
             let path = vamp_core::thumbs::tier_path(&app.lock(), id, tier)
@@ -1078,8 +1085,13 @@ fn visual_media(mime: &str) -> bool {
 fn generate_in_background(app: &Arc<App>, id: &str) {
     let (app, id) = (app.clone(), id.to_owned());
     std::thread::spawn(move || {
-        for kind in ["thumbnail", "preview"] {
+        let looping = app.lock().inspect(&id).is_ok_and(|view| {
+            let mime = view.asset.original.mime;
+            mime.starts_with("video/") || matches!(mime.as_str(), "image/gif" | "image/webp")
+        });
+        for kind in ["thumbnail", "preview"].into_iter().chain(looping.then_some("loop")) {
             if let Err(HttpError { message, .. }) = representation_path(&app, &id, kind) {
+                if kind == "loop" && message.contains("static images do not have loop previews") { continue; }
                 eprintln!("vamp-server: {kind} for {id} failed: {message}");
                 break;
             }
@@ -1414,7 +1426,7 @@ fn representation_path(app: &Arc<App>, id: &str, kind: &str) -> Result<PathBuf, 
         Err(error) => error,
     };
     let Some(helper) = app.helper.clone().filter(|_| {
-        matches!(kind, "thumbnail" | "preview")
+        matches!(kind, "thumbnail" | "preview" | "loop")
             && format!("{error:#}").contains("representation unavailable")
     }) else {
         return Err(error.into());
@@ -1569,6 +1581,12 @@ fn stream(app: &Arc<App>, request: &Request, id: &str, kind: &str) -> Result<Rep
         // Pending (lazy) fingerprints use their surrogate key as the entity tag.
         let etag = original.source_key();
         (Ok(library.original_lookup(id)?), etag, original.mime)
+    } else if kind == "loop" {
+        let library = app.lock();
+        let path = library.fetch(id, "loop")?;
+        // A representation's unique persisted path is its version; no per-range hashing.
+        let etag = blake3::hash(path.to_string_lossy().as_bytes()).to_hex().to_string();
+        (Err(path), etag, "video/mp4".into())
     } else {
         // Representations live in the state dir (never a cloud folder): read them here.
         let path = representation_path(app, id, kind)?;
@@ -1612,7 +1630,7 @@ fn stream(app: &Arc<App>, request: &Request, id: &str, kind: &str) -> Result<Rep
         header("Content-Type", &mime),
         header("ETag", &etag),
         header("Accept-Ranges", "bytes"),
-        header("Cache-Control", "private, max-age=31536000, immutable"),
+        header("Cache-Control", if kind == "loop" { "private, max-age=3600" } else { "private, max-age=31536000, immutable" }),
     ];
     let range = request_header(request, "Range").and_then(|r| parse_range(r, size));
     let (status, start, len) = match range {
