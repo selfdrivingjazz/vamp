@@ -1,9 +1,9 @@
 //! Compact similarity pack for in-memory "Same Energy" browsing: every live asset's current
 //! image embedding quantized to int8 (per-row scale) plus a 64-bin CIELAB palette vector.
 //! The authority builds it from the catalog and caches it under `energy/pack.bin`, rebuilding
-//! when the catalog fingerprint changes; replicas mirror the file (`GET /v1/embeddings/pack`)
-//! on sync. Clients load it once and rank by brute force, so a click never touches SQLite,
-//! the server lock, or the network.
+//! when the catalog fingerprint changes. Replicas fetch lazily, reuse the persisted file,
+//! and refresh changed rows in the background. Clients rank in memory, so a click never
+//! touches SQLite, the server lock, or the network.
 //!
 //! Layout (little endian): `b"VEPK0001"`, `u32` header length, header JSON
 //! (`PackHeader`), zero padding to 16 bytes, `f32 scales[count]`, `i8 vibe[count*dim]`,
@@ -19,7 +19,7 @@ const PALETTE_SIGMA: f64 = 25.0;
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
 pub struct PackHeader {
     pub format: u32,
-    /// Fingerprint of (asset, source hash, model, palette) rows; changes with any of them.
+    /// Fingerprint of asset/source/model/palette rows and embedding row generations.
     pub version: String,
     pub model: String,
     pub dim: usize,
@@ -27,6 +27,9 @@ pub struct PackHeader {
     pub count: usize,
     pub quant: String,
     pub ids: Vec<String>,
+    /// Authority event checkpoint from the same read snapshot as these rows.
+    #[serde(default)]
+    pub cursor: u64,
 }
 
 pub fn pack_path(state_dir: &Path) -> PathBuf {
@@ -95,7 +98,7 @@ impl Library {
     fn pack_rows_sql(with_vector: bool) -> String {
         format!(
             "SELECT a.id,a.hash,a.colors{} FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 AND a.trashed=0 WHERE e.model=?1 ORDER BY a.id",
-            if with_vector { ",e.vector" } else { "" }
+            if with_vector { ",e.vector" } else { ",e.rowid" }
         )
     }
 
@@ -112,12 +115,14 @@ impl Library {
                 }
                 hasher.update(&[0]);
             }
+            hasher.update(&row.get::<_, i64>(3)?.to_le_bytes());
         }
         Ok(hasher.finalize().to_hex()[..16].to_owned())
     }
 
     /// Authority: the current pack (rebuilt when stale). `None` without any embeddings.
     pub fn energy_pack(&self) -> Result<Option<(PathBuf, PackHeader)>> {
+        let _snapshot = read_snapshot(&self.conn)?;
         let Some(model) = self.pack_model()? else {
             return Ok(None);
         };
@@ -175,6 +180,7 @@ impl Library {
             count: ids.len(),
             quant: "int8".into(),
             ids,
+            cursor: self.last_event()?,
         };
         Ok(encode(&header, &scales, &vibe, &palette))
     }
@@ -198,23 +204,33 @@ pub fn encode(header: &PackHeader, scales: &[f32], vibe: &[u8], palette: &[u8]) 
 /// Parses and validates a pack's header (and its total length) without reading vectors.
 pub fn read_header(path: &Path) -> Result<PackHeader> {
     let mut file = fs::File::open(path)?;
+    let size = file.metadata()?.len() as usize;
     let mut prefix = [0u8; 12];
     file.read_exact(&mut prefix)?;
     ensure!(&prefix[..8] == MAGIC, "not a vamp embeddings pack");
     let len = u32::from_le_bytes(prefix[8..12].try_into()?) as usize;
-    ensure!(len < 1 << 30, "pack header too large");
+    ensure!(len <= size.saturating_sub(12), "truncated pack header");
     let mut json = vec![0u8; len];
     file.read_exact(&mut json)?;
     let header: PackHeader = serde_json::from_slice(&json)?;
-    ensure!(header.ids.len() == header.count, "pack id count mismatch");
-    let body = (12 + len).next_multiple_of(16)
-        + header.count * (4 + header.dim + header.palette_dim);
-    ensure!(
-        file.metadata()?.len() as usize == body,
-        "truncated embeddings pack"
-    );
+    validate_header(&header, len, size)?;
     Ok(header)
 }
+
+fn validate_header(header: &PackHeader, json_len: usize, size: usize) -> Result<()> {
+    ensure!(header.format == 1 && header.quant == "int8", "unsupported embeddings pack");
+    ensure!(header.dim <= 8192 && header.palette_dim == PALETTE_DIM, "invalid pack dimensions");
+    ensure!(header.ids.len() == header.count, "pack id count mismatch");
+    let row = 4usize.checked_add(header.dim).and_then(|n| n.checked_add(header.palette_dim)).context("pack row overflow")?;
+    let body = header.count.checked_mul(row).and_then(|n| (12 + json_len).next_multiple_of(16).checked_add(n)).context("pack size overflow")?;
+    ensure!(size == body, "truncated embeddings pack");
+    Ok(())
+}
+
+mod delta;
+pub use delta::{PackDelta, apply_download, delta_for, header_from_bytes};
+#[cfg(feature = "remote")]
+pub use delta::refresh_download;
 
 /// `{path, version, model, dim, palette_dim, count}` for clients; `ids` stay in the file.
 pub fn describe(path: &Path, header: &PackHeader) -> Value {
@@ -231,68 +247,7 @@ pub fn describe(path: &Path, header: &PackHeader) -> Value {
 }
 
 #[cfg(feature = "remote")]
-pub mod replica {
-    use super::*;
-
-    /// Mirrors the authority's pack when its version differs from the local copy.
-    /// Returns whether a new pack was downloaded.
-    pub fn refresh(library: &Library) -> Result<bool> {
-        refresh_with(&library.remote_client()?, &library.state_dir)
-    }
-
-    fn refresh_with(client: &crate::remote::Client, state_dir: &Path) -> Result<bool> {
-        let meta: Value = client.get_json("/embeddings/pack/meta", &[])?;
-        let Some(version) = meta["version"].as_str() else {
-            return Ok(false); // authority has no embeddings yet
-        };
-        let path = pack_path(state_dir);
-        if read_header(&path).is_ok_and(|h| h.version == version) {
-            return Ok(false);
-        }
-        client.download("/embeddings/pack", &path, None)?;
-        read_header(&path).context("downloaded embeddings pack is invalid")?;
-        Ok(true)
-    }
-
-    /// State dirs with a background refresh in flight.
-    static REFRESHING: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-    /// [`refresh`] on a background thread, at most one per replica at a time.
-    pub fn refresh_in_background(library: &Library) {
-        let client = match library.remote_client() {
-            Ok(client) => client,
-            Err(e) => {
-                eprintln!("embeddings pack: {e:#}");
-                return;
-            }
-        };
-        let state_dir = library.state_dir.clone();
-        let refreshing = || REFRESHING.lock().unwrap_or_else(|e| e.into_inner());
-        if !refreshing().insert(state_dir.clone()) {
-            return;
-        }
-        std::thread::spawn(move || {
-            if let Err(e) = refresh_with(&client, &state_dir) {
-                eprintln!("embeddings pack: {e:#}");
-            }
-            refreshing().remove(&state_dir);
-        });
-    }
-
-    /// Sync hook: refresh after catalog changes or when no pack is mirrored yet. With
-    /// `background` the sync returns at once (live pushes never wait on the pack).
-    pub fn refresh_after_sync(library: &Library, applied: u64, background: bool) {
-        if applied == 0 && read_header(&pack_path(&library.state_dir)).is_ok() {
-            return;
-        }
-        if background {
-            refresh_in_background(library);
-        } else if let Err(e) = refresh(library) {
-            eprintln!("embeddings pack: {e:#}");
-        }
-    }
-}
+pub mod replica;
 
 #[cfg(test)]
 mod tests {
@@ -336,6 +291,7 @@ mod tests {
             dim: 2,
             palette_dim: PALETTE_DIM,
             count: 1,
+            cursor: 0,
             quant: "int8".into(),
             ids: vec!["a".into()],
         };

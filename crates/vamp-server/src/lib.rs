@@ -883,25 +883,35 @@ fn route(
             })
         }
         (Method::Get, ["v1", "embeddings", "pack"]) => {
-            let pack = app.lock().energy_pack()?;
+            let library = app.lock();
+            let pack = library.energy_pack()?;
             let Some((path, pack_header)) = pack else {
-                return Ok(json_reply(
-                    404,
-                    &json!({"error":{"code":"no_embeddings","message":"the library has no embeddings"}}),
-                ));
+                return Ok(json_reply(404, &json!({"error":{"code":"no_embeddings","message":"the library has no embeddings"}})));
             };
+            let etag = format!("\"{}\"", pack_header.version);
+            if request_header(request, "If-None-Match").is_some_and(|value| value.split(',').any(|v| v.trim() == "*" || v.trim().trim_start_matches("W/") == etag)) {
+                return Ok(Response::new(StatusCode(304), vec![header("ETag", &etag), header("Cache-Control", "private, no-cache")], boxed(Vec::new()), Some(0), None));
+            }
             let data = std::fs::read(path).map_err(|e| HttpError::new(500, e.to_string()))?;
-            let len = data.len();
-            Ok(Response::new(
-                StatusCode(200),
-                vec![
-                    header("Content-Type", "application/octet-stream"),
-                    header("ETag", &format!("\"{}\"", pack_header.version)),
-                ],
-                boxed(data),
-                Some(len),
-                None,
-            ))
+            // Another authority connection may have atomically published a newer pack.
+            // Derive the response ETag/checkpoint from the actual bytes being returned.
+            let current = vamp_core::energy::header_from_bytes(&data)?;
+            let etag = format!("\"{}\"", current.version);
+            let after = query.get("after").and_then(|s| s.parse::<u64>().ok());
+            let compatible = after.is_some_and(|a| a > 0 && a <= current.cursor)
+                && query.get("model") == Some(current.model.as_str())
+                && query.get("dim").and_then(|s| s.parse::<usize>().ok()) == Some(current.dim)
+                && query.get("palette_dim").and_then(|s| s.parse::<usize>().ok()) == Some(current.palette_dim);
+            let delta = if compatible {
+                query.get("version").map(|base| vamp_core::energy::delta_for(&library, &current, &data, after.unwrap(), base)).transpose()?
+            } else { None };
+            let delta = delta.map(|d| serde_json::to_vec(&d)).transpose().map_err(anyhow::Error::from)?;
+            let (mime, body) = match delta {
+                Some(delta) if delta.len() < data.len() => ("application/vnd.vamp.embeddings-delta+json", delta),
+                _ => ("application/octet-stream", data),
+            };
+            let len = body.len();
+            Ok(Response::new(StatusCode(200), vec![header("Content-Type", mime), header("ETag", &etag), header("Cache-Control", "private, no-cache")], boxed(body), Some(len), None).with_chunked_threshold(usize::MAX))
         }
         (Method::Get, ["v1", "assets", id, kind]) => stream(app, request, id, kind),
         (Method::Post, ["v1", "assets", id]) => {

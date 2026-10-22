@@ -9,7 +9,7 @@ publish = false
 default = []
 native = ["dep:zip"]
 # HTTP client for replica contexts of a vamp-server authority.
-remote = ["dep:ureq"]
+remote = ["dep:ureq", "dep:form_urlencoded"]
 
 [dependencies]
 anyhow.workspace = true
@@ -25,6 +25,7 @@ libc = "0.2"
 base64 = "0.22"
 zip = { version = "2", default-features = false, optional = true }
 ureq = { version = "3", features = ["json", "gzip"], optional = true }
+form_urlencoded = { version = "1", optional = true }
 
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp"] }
 webp = { version = "0.3.1", default-features = false }

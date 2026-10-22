@@ -46,6 +46,15 @@ array. Native `stream` (`asset_id`, `kind: "loop" | "original"`) returns
 otherwise the authority URL and required HTTP authorization headers. Clients pass
 those headers directly to their player; tokens never belong in URLs or logs.
 
+Similarity packs are persisted under the library's `energy/` directory. Metadata sync
+does not fetch a missing pack: the first explicit similarity consumer requests it.
+An existing pack is usable immediately while rate-limited background checks refresh it.
+Checks use `If-None-Match` (unchanged: HTTP 304, no pack body). Changed packs can transfer
+only rows affected since the cached pack's event checkpoint; source, palette, deletion
+and embedding updates are applied atomically to the cached file. A model/dimension
+change or missing checkpoint needs a full pack. Concurrent startup/sync requests share
+one refresh, and ordinary grid browsing never waits for its network transfer.
+
 ## Share a library
 
 One machine owns a library (the authority); other machines and the Vampire apps attach

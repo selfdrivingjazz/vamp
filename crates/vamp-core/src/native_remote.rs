@@ -67,10 +67,8 @@ fn energy_pack(request: &Request) -> Result<Option<Value>> {
         return Ok(Some(energy::describe(&path, &header)));
     }
     energy::replica::refresh(&library)?;
-    Ok(Some(match energy::read_header(&path) {
-        Ok(header) => energy::describe(&path, &header),
-        Err(_) => json!({ "count": 0 }),
-    }))
+    let header = energy::read_header(&path).context("authority did not provide a valid embeddings pack")?;
+    Ok(Some(energy::describe(&path, &header)))
 }
 
 /// Views recorded on this replica and not yet forwarded to the authority.
