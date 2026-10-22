@@ -786,6 +786,7 @@ fn cache_path(kind: &str, asset_id: &str, source_hash: &str, mime: &str) -> Stri
         "image/png" => "png",
         "image/webp" => "webp",
         "image/gif" => "gif",
+        "video/mp4" => "mp4",
         _ => "bin",
     };
     let hash = &source_hash[..source_hash.len().min(16)];
@@ -1432,6 +1433,37 @@ fn log_thumbnail_ready(tx: &Transaction, library_id: &str, asset_id: &str) -> Re
     Ok(())
 }
 
+/// Resolve replica playback using only the mirror and local cache metadata. Unlike
+/// `representation_with`, this never contacts the authority or fills a cache.
+pub(crate) fn stream(library: &Library, id: &str, kind: &str) -> Result<Value> {
+    safe_id(id)?;
+    ensure!(matches!(kind, "loop" | "original"), "stream kind must be loop or original");
+    let asset = get_asset(&library.conn, id)?;
+    let cached = match kind {
+        "loop" => stored_representation_record(library, &asset, "loop")?
+            .map(|rep| Ok::<_, anyhow::Error>((local_representation(&library.state_dir, &rep.path)?, rep.byte_size)))
+            .transpose()?,
+        _ => Some((original_cache_path(library, &asset.original), asset.original.byte_size)),
+    }.filter(|(path, expected)| path.metadata().is_ok_and(|m| m.is_file() && m.len() == *expected))
+        .map(|(path, _)| path);
+    if let Some(path) = cached {
+        return Ok(json!({"url":path_text(&path)?,"headers":{},"local":true}));
+    }
+    let remote = library.remote().context("context is not a remote replica")?;
+    ensure!(
+        remote.url.starts_with("http://") || remote.url.starts_with("https://"),
+        "remote url must be http:// or https://"
+    );
+    let route = if kind == "loop" { "tier/loop" } else { "original" };
+    let url = format!("{}/v1/assets/{id}/{route}", remote.url.trim_end_matches('/'));
+    let mut headers = serde_json::Map::new();
+    let token = remote.token.trim();
+    if !token.is_empty() {
+        headers.insert("Authorization".into(), json!(format!("Bearer {token}")));
+    }
+    Ok(json!({"url":url,"headers":headers,"local":false}))
+}
+
 /// Local path of a representation. Replicas download and cache it on first use.
 pub fn representation(library: &Library, id: &str, kind: &str) -> Result<PathBuf> {
     representation_with(library, id, kind, &Transfer::default())
@@ -1440,7 +1472,7 @@ pub fn representation(library: &Library, id: &str, kind: &str) -> Result<PathBuf
 /// [`representation`] reporting download progress into `transfer`, abandoned when it is
 /// cancelled there and yielding to foreground downloads when it is background. Replica
 /// previews are the authority's preview tier (`/tier/preview`, WebP), falling back to its
-/// older preview representation.
+/// older preview representation. Loops use `/tier/loop` and never fall back to originals.
 pub fn representation_with(
     library: &Library,
     id: &str,
@@ -1454,12 +1486,12 @@ pub fn representation_with(
     match kind {
         "original" => original(library, &asset, transfer),
         "preview" => preview(library, &asset, transfer),
-        "thumbnail" => {
+        "thumbnail" | "loop" => {
             let dest = stored_representation(library, &asset, kind)?
                 .with_context(|| format!("representation unavailable: {kind}"))?;
             if !dest.is_file() {
                 library.remote_client()?.download_with(
-                    &format!("/assets/{}/{kind}", safe_id(id)?),
+                    &format!("/assets/{}/{}{}", safe_id(id)?, if kind == "loop" { "tier/" } else { "" }, kind),
                     &dest,
                     None,
                     transfer,
@@ -1468,12 +1500,18 @@ pub fn representation_with(
             }
             Ok(dest)
         }
-        _ => anyhow::bail!("representation must be original, thumbnail or preview"),
+        _ => anyhow::bail!("representation must be original, thumbnail, preview or loop"),
     }
 }
 
 /// Cache path of the authority representation `kind` of the current original, if any.
 fn stored_representation(library: &Library, asset: &Asset, kind: &str) -> Result<Option<PathBuf>> {
+    stored_representation_record(library, asset, kind)?
+        .map(|rep| local_representation(&library.state_dir, &rep.path))
+        .transpose()
+}
+
+fn stored_representation_record(library: &Library, asset: &Asset, kind: &str) -> Result<Option<Representation>> {
     library
         .conn
         .query_row(
@@ -1482,20 +1520,21 @@ fn stored_representation(library: &Library, asset: &Asset, kind: &str) -> Result
             |r| r.get::<_, String>(0),
         )
         .optional()?
-        .map(|document| {
-            let rep: Representation = parse(document)?;
-            local_representation(&library.state_dir, &rep.path)
-        })
+        .map(parse)
         .transpose()
+}
+
+fn original_cache_path(library: &Library, original: &Original) -> PathBuf {
+    let ext = crate::storage::original_extension(original);
+    let key = original.source_key().replace(':', "-");
+    library.state_dir.join(format!("cache/original/{key}{ext}"))
 }
 
 fn original(library: &Library, asset: &Asset, transfer: &Transfer) -> Result<PathBuf> {
     if let Some(path) = direct_original(library, &asset.original)? {
         return Ok(path);
     }
-    let ext = crate::storage::original_extension(&asset.original);
-    let key = asset.original.source_key().replace(':', "-");
-    let dest = library.state_dir.join(format!("cache/original/{key}{ext}"));
+    let dest = original_cache_path(library, &asset.original);
     if !dest.is_file() {
         library.remote_client()?.download_with(
             &format!("/assets/{}/original", safe_id(&asset.id)?),
@@ -1892,6 +1931,139 @@ pub fn semantic_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loop_mirror(root: &Path, url: &str, token: &str) -> (Library, Asset) {
+        let source = root.join("source.mp4");
+        fs::write(&source, b"original video").unwrap();
+        let mut library = Library::init(&root.join("home"), "mirror", None, None).unwrap();
+        let asset = library.add(&source, None, Metadata::default()).unwrap();
+        let mut view = library.inspect(&asset.id).unwrap();
+        view.representations.push(Representation {
+            kind: "loop".into(),
+            path: "representations/source/loop.mp4".into(),
+            source_hash: asset.original.source_key(),
+            width: 480,
+            height: 270,
+            mime: "video/mp4".into(),
+            byte_size: 4,
+        });
+        library.context.remote = Some(Remote {
+            url: url.into(),
+            token: token.into(),
+            drive_roots: BTreeMap::new(),
+        });
+        let tx = library.conn.transaction().unwrap();
+        store_view(&tx, &library.state_dir, &view).unwrap();
+        tx.commit().unwrap();
+        (library, asset)
+    }
+
+    #[test]
+    fn stream_urls_use_token_or_tailnet_without_network_or_cache_fill() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let (mut library, asset) = loop_mirror(root.path(), &base, " test-secret ");
+        for (kind, route) in [("loop", "tier/loop"), ("original", "original")] {
+            let request = serde_json::from_value(json!({"operation":"stream","asset_id":asset.id,"kind":kind})).unwrap();
+            let value = crate::native::dispatch(&mut library, request).unwrap();
+            assert_eq!(value, json!({
+                "url":format!("{}v1/assets/{}/{route}", base, asset.id),
+                "headers":{"Authorization":"Bearer test-secret"},
+                "local":false
+            }));
+        }
+        let home = root.path().join("home");
+        atomic_json(&home.join("config.json"), &Config {
+            current: Some("mirror".into()),
+            contexts: BTreeMap::from([("mirror".into(), library.context.clone())]),
+        }).unwrap();
+        let request = serde_json::from_value(json!({
+            "operation":"stream","home":home,"context":"mirror","asset_id":asset.id,"kind":"loop"
+        })).unwrap();
+        assert_eq!(crate::native::request(request).unwrap(), json!({
+            "url":format!("{}v1/assets/{}/tier/loop", base, asset.id),
+            "headers":{"Authorization":"Bearer test-secret"},"local":false
+        }));
+        assert!(!stored_representation(&library, &asset, "loop").unwrap().unwrap().exists());
+        assert!(!original_cache_path(&library, &asset.original).exists());
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        library.context.remote.as_mut().unwrap().token = " \t".into();
+        assert_eq!(crate::native::stream(&library, &asset.id, "loop").unwrap()["headers"], json!({}));
+        assert_eq!(crate::native::items(&library, &[asset.id.clone()]).unwrap()["items"][0]["has_loop"], true);
+        assert_eq!(crate::native::browse(&library, &crate::native::BrowseFilter { limit: 100, ..crate::native::BrowseFilter::default() }).unwrap()["items"][0]["has_loop"], true);
+        assert_eq!(crate::native::layout(&mut library, &crate::native::BrowseFilter::default(), false).unwrap()["has_loop"], json!([true]));
+        let error = crate::native::stream(&library, &asset.id, "preview").unwrap_err().to_string();
+        assert!(!error.contains("test-secret"));
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn stream_prefers_synced_loop_and_original_cache_paths_without_network() {
+        let root = tempfile::tempdir().unwrap();
+        let (library, asset) = loop_mirror(root.path(), "http://127.0.0.1:9", "secret");
+        let loop_path = stored_representation(&library, &asset, "loop").unwrap().unwrap();
+        assert_eq!(loop_path.extension().unwrap(), "mp4");
+        let original_path = original_cache_path(&library, &asset.original);
+        for (kind, path, bytes) in [
+            ("loop", &loop_path, b"loop".as_slice()),
+            ("original", &original_path, b"original video".as_slice()),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, &bytes[..1]).unwrap();
+            assert_eq!(crate::native::stream(&library, &asset.id, kind).unwrap()["local"], false);
+            fs::write(path, bytes).unwrap();
+            assert_eq!(crate::native::stream(&library, &asset.id, kind).unwrap(), json!({
+                "url":path_text(path).unwrap(),"headers":{},"local":true
+            }));
+        }
+        assert_eq!(representation(&library, &asset.id, "loop").unwrap(), loop_path);
+    }
+
+    #[test]
+    fn explicit_loop_fetch_downloads_tier_into_the_synced_cache_path() {
+        use std::io::{BufRead as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let (library, asset) = loop_mirror(root.path(), &url, "loop-test-token");
+        let expected_path = stored_representation(&library, &asset, "loop").unwrap().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() { break; }
+                lines.push(line);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nloop").unwrap();
+            lines
+        });
+        let path = representation(&library, &asset.id, "loop").unwrap();
+        assert_eq!(path, expected_path);
+        assert_eq!(fs::read(&path).unwrap(), b"loop");
+        let lines = server.join().unwrap();
+        assert_eq!(lines[0], format!("GET /v1/assets/{}/tier/loop HTTP/1.1\r\n", asset.id));
+        assert!(lines.iter().any(|line| line.trim().eq_ignore_ascii_case("Authorization: Bearer loop-test-token")));
+        assert_eq!(crate::native::stream(&library, &asset.id, "loop").unwrap(), json!({
+            "url":path_text(&path).unwrap(),"headers":{},"local":true
+        }));
+        // The only server is gone: an explicit second fetch must reuse the same file.
+        assert_eq!(representation(&library, &asset.id, "loop").unwrap(), path);
+    }
+
+    #[test]
+    fn explicit_loop_fetch_requires_a_current_representation_without_original_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let (library, asset) = loop_mirror(root.path(), "http://127.0.0.1:9", "");
+        library.conn.execute("UPDATE representations SET source_hash='old' WHERE asset_id=?1 AND kind='loop'", [&asset.id]).unwrap();
+        let error = representation(&library, &asset.id, "loop").unwrap_err();
+        assert_eq!(error.to_string(), "representation unavailable: loop");
+        assert!(!original_cache_path(&library, &asset.original).exists());
+    }
 
     const DRIVE: &str = "/Users/alice/Library/CloudStorage/GoogleDrive-alice@example.com/My Drive/Refs.library/images/a.info/a.png";
 

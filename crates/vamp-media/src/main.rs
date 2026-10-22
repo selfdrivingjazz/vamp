@@ -47,6 +47,7 @@ fn run() -> Result<()> {
             PROTOCOL_VERSION
         );
         println!("Video posters: first displayed frame via optional ffmpeg on PATH (or VAMP_FFMPEG).\nVideo sources are streamed, not subject to the image source-byte limit; extracted frames\nare bounded to 4096px before normal image limits. Missing ffmpeg is a generation error.");
+        println!("  loop: input_path, output_path; H.264 MP4, muted, <=480px, <=6s, faststart,\n        24fps, CRF28, max1Mbps; videos and animated GIF/WebP only.");
         return Ok(());
     }
     if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
@@ -94,6 +95,14 @@ fn run() -> Result<()> {
         fs::symlink_metadata(output).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
         "output already exists or cannot be inspected"
     );
+    if request.operation == "loop" {
+        let input = Path::new(request.input_path.as_deref().context("input_path is required")?);
+        let representation = video::loop_preview(input, output, request.asset.as_ref())?;
+        serde_json::to_writer(std::io::stdout().lock(), &ToolResponse {
+            representation: Some(representation), observation: None, tiles: None, palette: None,
+        })?;
+        return Ok(());
+    }
     let (image, tiles, source) = match request.operation.as_str() {
         "generate" => {
             let edge = request.max_edge.unwrap_or(512);

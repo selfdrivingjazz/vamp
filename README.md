@@ -31,6 +31,21 @@ derivatives for an existing video. Originals and provenance are never rewritten.
 The authority serves originals with byte ranges and a known `Content-Length`, including
 large MP4 range responses, for progressive video players.
 
+For near-instant inline playback, videos and animated GIF/WebP also receive a `loop`
+representation: muted H.264/yuv420p MP4, at most 480 px on the long edge, 24 fps,
+CRF 28 with a 1 Mbps ceiling, one-second keyframes, faststart, and at most six seconds.
+Static images receive no loop. Server/exploration ingestion generates it with the
+optional ffmpeg helper; `vamp media loop-preview ID` explicitly backfills one asset.
+Loop metadata uses normal representation sync. `GET /v1/assets/ID/tier/loop` streams
+the persisted MP4 with byte ranges (404 `tier_missing` before generation), never
+hydrating or encoding an original during a playback request.
+
+Native `items`/`browse` rows include `has_loop`; compact layouts carry the same flag
+array. Native `stream` (`asset_id`, `kind: "loop" | "original"`) returns
+`{url, headers, local}` without downloading: a local filesystem path when available,
+otherwise the authority URL and required HTTP authorization headers. Clients pass
+those headers directly to their player; tokens never belong in URLs or logs.
+
 ## Share a library
 
 One machine owns a library (the authority); other machines and the Vampire apps attach

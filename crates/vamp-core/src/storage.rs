@@ -749,6 +749,21 @@ struct Hydration {
     cache: PathBuf,
 }
 impl OriginalLookup {
+    /// Already-local playback path, without opening bytes or hydrating cloud storage.
+    /// As with `Library::original_available_locally`, a cataloged original path is
+    /// trusted without stat: even metadata on a cloud-synced folder can block.
+    /// Only the pinned cache (inside the library state directory) is statted.
+    pub fn local_path(&self) -> Option<PathBuf> {
+        if !self.original.pending()
+            && !self.original.blake3.is_empty()
+            && fs::metadata(&self.cache)
+                .is_ok_and(|meta| meta.is_file() && meta.len() == self.original.byte_size)
+        {
+            return Some(self.cache.clone());
+        }
+        (!self.original.path.is_empty()).then(|| PathBuf::from(&self.original.path))
+    }
+
     /// Local bytes of the original: the local copy, else the pinned cache, else a verified
     /// download from cloud storage into state_dir/cache/originals. May block indefinitely on
     /// a stalled cloud-synced folder.
