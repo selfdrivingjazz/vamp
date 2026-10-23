@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Referenced originals now keep authority availability (`present` / `missing`, last checked,
+  last relinked) in their synced asset documents. Missing opens return typed `original_missing`;
+  a bounded server stat sweep does no hashing. Nothing is removed from the catalog.
+- `vamp doctor` reports missing originals, verified relink candidates, ambiguity, unreadable
+  paths and thumbnail/preview gaps as JSON without changing the catalog. `--fix` applies only
+  unique size+BLAKE3 matches; `media relink ID PATH` and `media relink --search DIR` repair
+  references without moving, copying or deleting originals. Pending fingerprints cannot relink.
 - Per-asset embedding requests now return typed `embedding_unavailable` conflicts (HTTP 409),
   distinguishing queued/running, failed, stale-refresh and unqueued analysis. Errors include
   the known processor, distinct queued image count and a short failure category without

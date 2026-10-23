@@ -494,6 +494,10 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
             .context("invalid rules; expected {match, rules:[{field, op, value}]}")
     };
     match request.operation.as_str() {
+        "doctor" => library.doctor(false, &[]),
+        "relink" => Ok(serde_json::to_value(library.relink_original(
+            asset_id()?, request.path.as_deref().context("path is required")?,
+        )?)?),
         "explore_ensure" => {
             explore::agent_actor()?;
             library.explore_ensure(request.slug.as_deref().context("slug is required")?, request.title.as_deref(), request.brief.as_deref())
@@ -615,6 +619,7 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
             let mut errors = Vec::new();
             let mut files = Vec::new();
             for path in &request.paths {
+                if path.is_dir() { library.remember_import_root(path)?; }
                 if let Err(e) = expand(path, &mut files) {
                     errors.push(json!({"path":path,"message":format!("{e:#}")}));
                 }
@@ -1014,6 +1019,8 @@ pub(crate) fn media_item(
         "rating": asset.metadata.rating,
         "colors": asset.metadata.colors,
         "hash_state": asset.original.hash_state,
+        "original_availability": asset.original.availability,
+        "original_path": asset.original.path,
         "has_loop": current("loop").is_some(),
         "available_locally": {"thumbnail":thumbnail.is_some(),"preview":preview.is_some(),"original":original},
         "storage": asset.original.storage,

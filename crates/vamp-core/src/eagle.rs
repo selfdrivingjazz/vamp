@@ -634,6 +634,8 @@ impl Sink<'_> {
             .iter()
             .filter_map(|f| folder_map.get(f).cloned())
             .collect();
+        let mut original = original;
+        original.import_root = Some(root.to_owned());
         let (asset, created) = match existing {
             Some(known) => {
                 let mut asset = get_asset(tx, &known.id)?;
@@ -685,7 +687,7 @@ impl Sink<'_> {
             None => {
                 let taken: Option<String> = tx
                     .query_row(
-                        "SELECT id FROM assets WHERE path=?1",
+                        "SELECT id FROM assets WHERE reference_path=?1 ORDER BY deleted,id LIMIT 1",
                         [&original.path],
                         |r| r.get(0),
                     )

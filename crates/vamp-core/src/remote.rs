@@ -47,6 +47,7 @@ pub struct RemoteStatus {
     pub message: String,
     /// Typed state retained from the authority, also exposed through `Error::source`.
     pub embedding_unavailable: Option<EmbeddingUnavailable>,
+    pub original_missing: Option<OriginalMissing>,
 }
 
 impl std::fmt::Display for RemoteStatus {
@@ -65,6 +66,7 @@ impl std::fmt::Display for RemoteStatus {
 impl std::error::Error for RemoteStatus {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.embedding_unavailable.as_ref().map(|error| error as _)
+            .or_else(|| self.original_missing.as_ref().map(|error| error as _))
     }
 }
 
@@ -277,6 +279,9 @@ impl Client {
                 .to_owned(),
             embedding_unavailable: (body["error"]["code"] == EmbeddingUnavailable::CODE)
                 .then(|| EmbeddingUnavailable::deserialize(&body["error"]).ok())
+                .flatten(),
+            original_missing: (body["error"]["code"] == "original_missing")
+                .then(|| Some(OriginalMissing { asset_id: body["error"]["asset_id"].as_str()?.into(), path: body["error"]["path"].as_str()?.into() }))
                 .flatten(),
         }
         .into())
@@ -905,6 +910,8 @@ pub(crate) fn store_view(tx: &Transaction, state: &Path, view: &AssetView) -> Re
     // Evicted originals have no authority path; the SQL uniqueness key must stay distinct.
     let key = if asset.original.path.is_empty() {
         format!("cloud-only:{id}")
+    } else if asset.original.availability.relinked_at.is_some() {
+        format!("relinked:{id}")
     } else {
         asset.original.path.clone()
     };

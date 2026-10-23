@@ -134,6 +134,10 @@ fn virtual_columns() -> Vec<(&'static str, String)> {
             "hash_state",
             "coalesce(json_extract(document,'$.original.hash_state'),'hashed')".into(),
         ),
+        (
+            "reference_path",
+            "json_extract(document,'$.original.path')".into(),
+        ),
         ("colors", "json_extract(document,'$.metadata.colors')".into()),
         (
             "tag_count",
@@ -213,6 +217,7 @@ CREATE INDEX IF NOT EXISTS assets_ext ON assets(deleted,trashed,ext);
 CREATE INDEX IF NOT EXISTS assets_source ON assets(source_id);
 CREATE INDEX IF NOT EXISTS assets_hash_state ON assets(deleted,hash_state);
 CREATE INDEX IF NOT EXISTS assets_hash ON assets(hash);
+CREATE INDEX IF NOT EXISTS assets_reference_path ON assets(reference_path);
 CREATE INDEX IF NOT EXISTS assets_id_live ON assets(id,deleted,trashed);
 CREATE INDEX IF NOT EXISTS assets_added_by ON assets(added_by,deleted,trashed);
 CREATE INDEX IF NOT EXISTS assets_facets ON assets(deleted,trashed,rating,width,height,ext,byte_size,last_viewed,tag_count,id,colors);",
@@ -1100,6 +1105,7 @@ impl Library {
             let storage = std::mem::take(&mut asset.original.storage);
             asset.original = Original {
                 storage,
+                import_root: asset.original.import_root.clone(),
                 ..original
             };
             bump(&mut asset);
@@ -1677,7 +1683,7 @@ impl Library {
         for id in ids {
             let result = (|| -> Result<PathBuf> {
                 let asset = get_asset(&self.conn, id)?;
-                let source = self.fetch_original(&asset.original)?;
+                let source = self.fetch(id, "original")?;
                 let ext = storage::original_extension(&asset.original);
                 let stem = Path::new(&asset.name)
                     .file_stem()

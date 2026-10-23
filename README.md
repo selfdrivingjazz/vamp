@@ -55,6 +55,38 @@ and embedding updates are applied atomically to the cached file. A model/dimensi
 change or missing checkpoint needs a full pack. Concurrent startup/sync requests share
 one refresh, and ordinary grid browsing never waits for its network transfer.
 
+## Missing originals and repair
+
+`vamp doctor` prints a read-only JSON report: present/missing counts, hash-verified
+relinkable candidates, ambiguous matches, unreadable paths, and derivative tier gaps
+(thumbnail, preview, micro, grid and high-resolution preview).
+It never removes items or changes original files. `vamp doctor --fix` applies only
+unambiguous repairs. `vamp media relink ID PATH` verifies the recorded size and BLAKE3;
+`vamp media relink --search DIR` applies unambiguous repairs found below that directory.
+`doctor --search DIR` limits a read-only search (repeat for multiple roots).
+
+The authority stats at most 128 catalog rows every 30 seconds, with 10 ms between
+files and a separate single I/O worker (2 s deadline); a full pass takes about
+`ceil(items / 128) * 32` seconds on responsive storage. No periodic hashing or
+filesystem watching occurs. Original opens also record ENOENT immediately and return
+HTTP 404 with `error.code: original_missing`, `asset_id`, and the recorded `path`.
+Other stat failures are unreadable, not evidence of deletion.
+
+Health lives in `original.availability` (`state`, `last_checked_at`, `relinked_at`,
+optional `check_error`) and syncs normally. Old catalogs default to present with no
+check time. Repairs keep IDs, revisions, hashes, derivatives and replica caches intact.
+Search uses known import roots and Eagle libraries, plus each missing file’s parent
+and ancestors bounded by its configured/imported root; without a boundary it never
+walks above the parent. It does not follow directory symlinks. Only same-size files
+are hashed, once per scan. No recorded hash (lazy fingerprint still pending), multiple
+matches, or an incomplete search prevents automatic repair.
+
+`GET /v1/doctor` and native `doctor` expose the read-only report to authenticated
+clients; native `relink {asset_id,path}` performs an explicit verified repair.
+On replicas, Locate paths must exist on the authority or use an existing shared-drive
+mapping; the app does not upload, copy, or relocate a selected file.
+
+
 ## Share a library
 
 One machine owns a library (the authority); other machines and the Vampire apps attach

@@ -77,6 +77,12 @@ pass a long-lived tunnel token as a command argument.
 - `vamp media loop-preview <id>` — explicitly generate the video's (or animated GIF/WebP's) bounded 480px, six-second, muted faststart H.264 loop using optional ffmpeg. Static images are rejected, not converted to fake animations. Normal representation sync advertises `has_loop`; players can use native `stream` to play `/v1/assets/ID/tier/loop` with HTTP byte ranges without first downloading it.
 - `vamp media sheet --query "..." --limit 16 --output out.png` — numbered contact sheet to review many results in one image (or `--ids ID,ID,...`).
 - `vamp media export <ids...> --to <dir>` — copy originals into an existing directory for the user.
+- `vamp doctor` — read-only JSON report of missing originals, verified candidates,
+  ambiguity, unreadable paths and tier gaps. Reads candidate bytes only for same-size
+  fingerprint matching. Do not run `--fix` without the owner's request.
+- `vamp doctor --fix` / `vamp media relink --search DIR` — apply only unique size+BLAKE3
+  matches. `vamp media relink ID PATH` verifies one explicit candidate. References only:
+  no original is moved, copied or deleted; pending fingerprints cannot be repaired.
 
 ## Change (always pass `--expected-revision`)
 Read `revision` from `inspect`, then pass it so a concurrent edit fails with a conflict instead of being overwritten. On conflict: re-inspect, re-apply, retry.
