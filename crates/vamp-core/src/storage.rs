@@ -749,6 +749,9 @@ struct Hydration {
     cache: PathBuf,
 }
 impl OriginalLookup {
+    pub fn referenced_path(&self) -> Option<&str> {
+        (self.original.locator.is_none() && !self.original.path.is_empty()).then_some(self.original.path.as_str())
+    }
     /// Already-local playback path, without opening bytes or hydrating cloud storage.
     /// As with `Library::original_available_locally`, a cataloged original path is
     /// trusted without stat: even metadata on a cloud-synced folder can block.
@@ -776,19 +779,15 @@ impl OriginalLookup {
         } = self;
         // Not `is_file`: callers open (and type-check) it on an I/O pool, where a placeholder
         // or special file may block.
-        if !original.path.is_empty() && fs::metadata(&original.path).is_ok_and(|m| !m.is_dir()) {
-            return Ok(PathBuf::from(&original.path));
+        if !original.path.is_empty() {
+            match fs::metadata(&original.path) {
+                Ok(meta) if !meta.is_dir() => return Ok(PathBuf::from(&original.path)),
+                Ok(_) => anyhow::bail!("original must be a regular file"),
+                Err(error) if original.locator.is_none() => return Err(error.into()),
+                Err(_) => {}
+            }
         }
-        let Some(locator) = original.locator.clone() else {
-            anyhow::bail!(
-                "representation unavailable: {}",
-                if original.path.is_empty() {
-                    "original has no local copy or cloud locator"
-                } else {
-                    &original.path
-                }
-            );
-        };
+        let locator = original.locator.clone().context("original has no local copy or cloud locator")?;
         if fs::metadata(&cache).is_ok_and(|m| m.len() == original.byte_size) {
             return Ok(cache);
         }
@@ -911,7 +910,7 @@ impl Library {
                 original_extension(original)
             ))
         } else {
-            if !original.path.is_empty() {
+            if !original.path.is_empty() && original.availability.state != OriginalState::Missing {
                 return true;
             }
             if original.pending() {

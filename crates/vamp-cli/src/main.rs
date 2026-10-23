@@ -90,6 +90,15 @@ enum Command {
         #[command(subcommand)]
         command: MediaCommand,
     },
+    /// Read-only original health, fingerprint relink candidates, and tier gaps (JSON).
+    Doctor {
+        /// Apply only unambiguous, hash-verified relinks; never modifies source files.
+        #[arg(long)]
+        fix: bool,
+        /// Limit the candidate search to these roots instead of known import roots.
+        #[arg(long)]
+        search: Vec<PathBuf>,
+    },
     /// Import references without modifying the source library.
     Import {
         #[command(subcommand)]
@@ -612,6 +621,16 @@ enum MediaCommand {
         #[command(flatten)]
         revision: Revision,
     },
+    /// Repair a missing original's path after verifying size and BLAKE3; never moves files.
+    Relink {
+        #[arg(required_unless_present = "search", conflicts_with = "search")]
+        id: Option<String>,
+        #[arg(requires = "id", required_unless_present = "search", conflicts_with = "search")]
+        path: Option<PathBuf>,
+        /// Bulk: apply unambiguous repairs found under this directory.
+        #[arg(long)]
+        search: Option<PathBuf>,
+    },
     /// Move to the trash (restorable); never deletes original files.
     Remove {
         id: String,
@@ -999,6 +1018,7 @@ fn redacted(mut config: vamp_protocol::Config) -> Result<Value> {
 /// Commands that change a catalog; replica mirrors are written only by sync.
 fn mutates(command: &Command) -> bool {
     match command {
+        Command::Doctor { fix, .. } => *fix,
         Command::Media { command } => !matches!(
             command,
             MediaCommand::List { .. }
@@ -1222,6 +1242,14 @@ fn execute(cli: Cli) -> Result<Value> {
                 "this context is a read-only replica; change the authority library (vamp-server) or use the Vampire app, then vamp sync"
             );
             match command {
+                Command::Doctor { fix, search } => {
+                    #[cfg(feature = "remote")]
+                    if library.context.remote.is_some() {
+                        ensure!(!fix && search.is_empty(), "run doctor --fix or --search on the authority");
+                        return library.remote_client()?.native(&json!({"operation":"doctor"}));
+                    }
+                    library.doctor(fix, &search)
+                }
                 Command::Media { command } => match command {
                     MediaCommand::Add {
                         path,
@@ -1316,6 +1344,13 @@ fn execute(cli: Cli) -> Result<Value> {
                     MediaCommand::Refresh { id, revision } => Ok(serde_json::to_value(
                         library.refresh(&id, revision.expected_revision)?,
                     )?),
+                    MediaCommand::Relink { id, path, search } => match search {
+                        Some(root) => library.doctor(true, &[root]),
+                        None => Ok(serde_json::to_value(library.relink_original(
+                            id.as_deref().context("id is required")?,
+                            path.as_deref().context("path is required")?,
+                        )?)?),
+                    },
                     MediaCommand::Remove { id, revision } => {
                         library.remove(&id, revision.expected_revision)?;
                         Ok(json!({"id":id,"trashed":true,"original_deleted":false}))
@@ -1930,7 +1965,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            if let Some(unavailable) = vamp_core::EmbeddingUnavailable::from_error(&error) {
+            if let Some(missing) = vamp_core::OriginalMissing::from_error(&error) {
+                eprintln!("{}", json!({"protocol_version":vamp_protocol::PROTOCOL_VERSION,"error":missing.to_json()}));
+            } else if let Some(unavailable) = vamp_core::EmbeddingUnavailable::from_error(&error) {
                 eprintln!("{}", json!({"protocol_version":vamp_protocol::PROTOCOL_VERSION,"error":unavailable.to_json()}));
             } else {
                 print_error("operation_failed", format!("{error:#}"));

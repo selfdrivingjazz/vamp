@@ -41,6 +41,8 @@ const MAX_PREVIEW: u64 = 4 * 1024 * 1024;
 /// Library-scoped native operations served by `POST /v1/native` (replicas forward these).
 /// Excluded: operations taking authority filesystem paths. Exploration media is bounded.
 const NATIVE_OPERATIONS: &[&str] = &[
+    "doctor",
+    "relink",
     "browse",
     "similar",
     "embedding_status",
@@ -229,6 +231,7 @@ fn is_media(request: &Request) -> bool {
 pub fn serve(server: Arc<Server>, app: App, threads: usize) {
     let app = Arc::new(app);
     push::spawn_watcher(Arc::downgrade(&app));
+    spawn_original_sweep(Arc::downgrade(&app));
     let threads = threads.max(1);
     let first = app.health.http.add_workers(threads);
     if app.watchdog {
@@ -288,6 +291,37 @@ pub fn serve(server: Arc<Server>, app: App, threads: usize) {
     }
 }
 
+/// One stat worker, at most 128 catalog rows every 30 seconds, with 10 ms between
+/// files. Separate from request I/O; a stalled mount cannot occupy HTTP workers.
+fn spawn_original_sweep(app: std::sync::Weak<App>) {
+    std::thread::Builder::new().name("original-stat-sweep".into()).spawn(move || {
+        let pool = Pool::new("original-stat", 1);
+        let mut after = String::new();
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            let Some(app) = app.upgrade() else { return };
+            let batch = match app.lock().original_check_batch(&after, 128) {
+                Ok(batch) => batch,
+                Err(error) => { eprintln!("vamp-server: original sweep: {error:#}"); continue; }
+            };
+            if batch.is_empty() { after.clear(); continue; }
+            for (id, path) in batch {
+                after.clone_from(&id);
+                if path.is_empty() { continue; }
+                let stat_path = PathBuf::from(&path);
+                let outcome = match pool.run("stat original", Duration::from_secs(2), move || vamp_core::originals::check(&stat_path)) {
+                    Ok(outcome) => outcome,
+                    Err(_) => break,
+                };
+                if let Err(error) = app.lock().record_original_check(&id, &path, outcome) {
+                    eprintln!("vamp-server: original sweep: {error:#}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }).expect("spawn original stat sweep");
+}
+
 fn spawn_watchdog(app: std::sync::Weak<App>) {
     std::thread::spawn(move || {
         loop {
@@ -325,14 +359,18 @@ struct HttpError {
     status: u16,
     message: String,
     embedding_unavailable: Option<vamp_core::EmbeddingUnavailable>,
+    original_missing: Option<vamp_core::OriginalMissing>,
 }
 
 impl HttpError {
     fn new(status: u16, message: String) -> Self {
-        Self { status, message, embedding_unavailable: None }
+        Self { status, message, embedding_unavailable: None, original_missing: None }
     }
 
     fn reply(self) -> Reply {
+        if let Some(missing) = self.original_missing {
+            return json_reply(404, &json!({"error":{"code":"original_missing","message":format!("Original not found at {}",missing.path),"asset_id":missing.asset_id,"path":missing.path}}));
+        }
         if let Some(unavailable) = self.embedding_unavailable {
             return json_reply(409, &json!({"error":unavailable.to_json()}));
         }
@@ -341,6 +379,7 @@ impl HttpError {
 }
 
 fn status_for(error: &anyhow::Error) -> u16 {
+    if error.downcast_ref::<vamp_core::OriginalMissing>().is_some() { return 404; }
     if vamp_core::EmbeddingUnavailable::from_error(error).is_some() {
         // Valid request, but this asset's current derived state cannot answer it yet.
         return 409;
@@ -363,6 +402,7 @@ impl From<anyhow::Error> for HttpError {
             status: status_for(&error),
             message: format!("{error:#}"),
             embedding_unavailable: vamp_core::EmbeddingUnavailable::from_error(&error).cloned(),
+            original_missing: error.downcast_ref::<vamp_core::OriginalMissing>().cloned(),
         }
     }
 }
@@ -719,6 +759,11 @@ fn route(
         }
         // Never takes the library lock: answers even when the catalog is wedged.
         (Method::Get, ["v1", "health"]) => ok(health_report(app)),
+        (Method::Get, ["v1", "doctor"]) => {
+            // Independent connection: a filesystem scan must never hold the request mutex.
+            let mut library = app.lock().reopen()?;
+            ok(library.doctor(false, &[])?)
+        }
         (Method::Get, ["v1", "hello"]) => {
             let library = app.lock();
             ok(json!({
@@ -1007,6 +1052,10 @@ fn route(
             if operation == "hash" {
                 // Reads originals: on the I/O pool, never under the library lock.
                 return ok(hash_pending(app, native.limit.unwrap_or(100))?);
+            }
+            if matches!(operation.as_str(), "doctor" | "relink") {
+                let mut library = app.lock().reopen()?;
+                return ok(vamp_core::native::dispatch(&mut library, native)?);
             }
             ok(vamp_core::native::dispatch(&mut app.lock(), native)?)
         }
@@ -1556,6 +1605,7 @@ fn open_original(
     id: &str,
     lookup: vamp_core::OriginalLookup,
 ) -> Result<(File, u64), HttpError> {
+    let referenced_path = lookup.referenced_path().map(str::to_owned);
     let opened = app.io.run(format!("open original {id}"), app.io_deadline, move || {
         let path = lookup.fetch()?;
         let file = File::open(&path)
@@ -1564,13 +1614,26 @@ fn open_original(
         ensure!(meta.is_file(), "original must be a regular file");
         Ok((file, meta.len()))
     })?;
-    opened.map_err(|e| {
-        if e.downcast_ref::<std::io::Error>().is_some() {
-            HttpError::new(404, format!("{e:#}"))
-        } else {
-            e.into()
+    match opened {
+        Ok(opened) => {
+            if let Some(path) = &referenced_path {
+                let library = app.lock();
+                if library.inspect(id)?.asset.original.availability.state == vamp_protocol::OriginalState::Missing {
+                    library.record_original_check(id, path, vamp_core::originals::Check::Present)?;
+                }
+            }
+            Ok(opened)
         }
-    })
+        Err(error) => {
+            if vamp_core::originals::is_not_found(&error) {
+                if let Some(path) = referenced_path {
+                    app.lock().record_original_check(id, &path, vamp_core::originals::Check::Missing)?;
+                    return Err(anyhow::Error::from(vamp_core::OriginalMissing { asset_id: id.into(), path }).into());
+                }
+            }
+            Err(error.into())
+        }
+    }
 }
 
 fn stream(app: &Arc<App>, request: &Request, id: &str, kind: &str) -> Result<Reply, HttpError> {

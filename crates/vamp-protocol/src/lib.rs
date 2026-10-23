@@ -6,6 +6,23 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_VERSION: &str = "0.1";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginalState {
+    #[default]
+    Present,
+    Missing,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OriginalAvailability {
+    pub state: OriginalState,
+    pub last_checked_at: Option<String>,
+    pub relinked_at: Option<String>,
+    /// Stat failure other than ENOENT; never evidence that the file was deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_error: Option<String>,
+}
+
 /// Original bytes. `path` is the authority-local copy; empty when evicted to cloud storage
 /// (`storage == "cloud"`). `locator` names the durable cloud copy once uploaded.
 ///
@@ -33,6 +50,12 @@ pub struct Original {
     /// Filesystem modification time (ns since epoch) recorded with the fingerprint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<i64>,
+    /// Authority filesystem health, independent of replica caches and cloud storage.
+    #[serde(default)]
+    pub availability: OriginalAvailability,
+    /// Boundary recorded at import; relink search never walks above it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_root: Option<String>,
 }
 impl Original {
     pub fn pending(&self) -> bool {

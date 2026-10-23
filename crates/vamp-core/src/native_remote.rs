@@ -26,6 +26,8 @@ fn patch(request: &Request) -> Result<MetadataPatch> {
 
 /// Library-scoped writes a replica forwards verbatim to the authority's `POST /v1/native`.
 const FORWARDED: &[&str] = &[
+    "doctor",
+    "relink",
     "restore",
     "empty_trash",
     "collection_move",
@@ -372,6 +374,19 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
         "update" if !request.asset_ids.is_empty() => client.native(&forward_body(request)?)?,
         "collection_create" if request.parent_id.is_some() => {
             client.native(&forward_body(request)?)?
+        }
+        "relink" => {
+            let mut body = forward_body(request)?;
+            let path = request.path.as_deref().context("path is required")?;
+            if let Some(remote) = library.remote() {
+                // Reverse the existing authority -> replica mount mappings, most specific first.
+                if let Some((authority, local)) = remote.drive_roots.iter()
+                    .filter(|(_, local)| path.starts_with(Path::new(local.as_str())))
+                    .max_by_key(|(_, local)| local.len()) {
+                    body["path"] = json!(Path::new(authority).join(path.strip_prefix(local)?));
+                }
+            }
+            client.native(&body)?
         }
         op if FORWARDED.contains(&op) => client.native(&forward_body(request)?)?,
         "update" => {

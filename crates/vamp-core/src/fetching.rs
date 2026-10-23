@@ -56,6 +56,8 @@ impl Library {
                 storage: FETCHING.into(),
                 hash_state: "pending".into(),
                 modified_ns: Some(created_ns),
+                availability: OriginalAvailability::default(),
+                import_root: None,
             },
             metadata,
             created_at: timestamp.clone(),

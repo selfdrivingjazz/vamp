@@ -52,6 +52,8 @@ pub mod cache;
 pub mod thumbs;
 pub mod card;
 pub mod explore;
+pub mod originals;
+pub use originals::OriginalMissing;
 
 use anyhow::{Context as _, Result, ensure};
 use chrono::Utc;
@@ -337,6 +339,10 @@ impl Library {
         );
         Self::connect(context)
     }
+    /// Independent connection to this already-open library (background filesystem work).
+    pub fn reopen(&self) -> Result<Self> {
+        Self::connect(self.context.clone())
+    }
     /// Where vamp-server serves this authority library (http base URL), as recorded in
     /// `<state_dir>/server-url.json` by `vamp contexts url`; `vamp explore link` bounces
     /// through it when no URL is given. Replicas use their authority URL instead.
@@ -429,11 +435,15 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
             "originals must not be inside local catalog state"
         );
         let original = fingerprint(&source)?;
+        let mut original = original;
+        original.import_root = self.context.original_root.clone().or_else(|| {
+            source.parent().and_then(|p| p.to_str()).map(str::to_owned)
+        });
         normalize_tags(&mut metadata.tags);
         let existing: Option<(String, bool)> = self
             .conn
             .query_row(
-                "SELECT document,deleted FROM assets WHERE path=?1",
+                "SELECT document,deleted FROM assets WHERE reference_path=?1 ORDER BY deleted,id LIMIT 1",
                 [&original.path],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -698,6 +708,7 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
             snapshot.original.locator.as_deref().unwrap_or("no locator")
         );
         let mut original = fingerprint(Path::new(&snapshot.original.path))?;
+        original.import_root = snapshot.original.import_root.clone();
         if snapshot.original.pending() {
             return self.apply_fingerprint(id, original);
         }
@@ -735,7 +746,14 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
     pub fn fetch(&self, id: &str, kind: &str) -> Result<PathBuf> {
         let asset = get_asset(&self.conn, id)?;
         if kind == "original" {
-            return self.fetch_original(&asset.original);
+            let result = self.fetch_original(&asset.original);
+            if let Err(error) = &result {
+                if originals::is_not_found(error) {
+                    self.record_original_check(&asset.id, &asset.original.path, originals::Check::Missing)?;
+                    return Err(OriginalMissing { asset_id: asset.id, path: asset.original.path }.into());
+                }
+            }
+            return result;
         }
         let path = {
             ensure!(
@@ -1433,6 +1451,8 @@ fn fingerprint(path: &Path) -> Result<Original> {
         storage: "local".into(),
         hash_state: "hashed".into(),
         modified_ns: modified_ns(&after),
+        availability: OriginalAvailability { last_checked_at: Some(now()), ..OriginalAvailability::default() },
+        import_root: None,
     })
 }
 /// Lazy fingerprint from `stat` alone: never opens the file (cloud placeholders stay
@@ -1450,6 +1470,8 @@ fn stat_original(path: &Path) -> Result<Original> {
         storage: "local".into(),
         hash_state: "pending".into(),
         modified_ns: modified_ns(&meta),
+        availability: OriginalAvailability { last_checked_at: Some(now()), ..OriginalAvailability::default() },
+        import_root: None,
     })
 }
 fn modified_ns(meta: &fs::Metadata) -> Option<i64> {
