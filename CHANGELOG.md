@@ -9,6 +9,7 @@
   paths and thumbnail/preview gaps as JSON without changing the catalog. `--fix` applies only
   unique size+BLAKE3 matches; `media relink ID PATH` and `media relink --search DIR` repair
   references without moving, copying or deleting originals. Pending fingerprints cannot relink.
+  Local folder intake also retains its chosen root before expanding individual files.
 - Per-asset embedding requests now return typed `embedding_unavailable` conflicts (HTTP 409),
   distinguishing queued/running, failed, stale-refresh and unqueued analysis. Errors include
   the known processor, distinct queued image count and a short failure category without

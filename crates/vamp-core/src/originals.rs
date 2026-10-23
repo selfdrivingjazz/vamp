@@ -43,6 +43,34 @@ pub fn check(path: &Path) -> Check {
         Err(e) => Check::Unreadable(e.to_string()),
     }
 }
+/// Permission/ACL preflight for doctor, without opening or materializing file bytes.
+#[cfg(unix)]
+fn readable(path: &str, buffer: &mut Vec<u8>) -> Check {
+    buffer.clear();
+    buffer.extend_from_slice(path.as_bytes());
+    buffer.push(0);
+    // `check` already accepted this filesystem path (so it cannot contain NUL).
+    // The buffer is NUL-terminated and lives for the duration of faccessat.
+    if unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            buffer.as_ptr().cast(),
+            libc::R_OK,
+            libc::AT_EACCESS,
+        )
+    } == 0
+    {
+        Check::Present
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Check::Missing
+        } else {
+            Check::Unreadable(error.to_string())
+        }
+    }
+}
+
 fn referenced(original: &Original) -> bool {
     !original.path.is_empty()
         && original.locator.is_none()
@@ -237,9 +265,16 @@ impl Library {
         let mut unreadable = Vec::new();
         let mut present = 0usize;
         let mut tier_gaps = Vec::new();
+        #[cfg(unix)]
+        let mut access_buffer = Vec::new();
         for asset in &assets {
             if referenced(&asset.original) {
                 let outcome = check(Path::new(&asset.original.path));
+                #[cfg(unix)]
+                let outcome = match outcome {
+                    Check::Present => readable(&asset.original.path, &mut access_buffer),
+                    outcome => outcome,
+                };
                 if fix {
                     self.record_original_check(&asset.id, &asset.original.path, outcome.clone())?;
                 }
@@ -569,5 +604,46 @@ mod tests {
                 .iter()
                 .any(|row| row["id"] == first.id && row["status"] == "fingerprint_pending")
         );
+    }
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_folder_intake_retains_its_search_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("imported");
+        let old = root.join("old");
+        fs::create_dir_all(&old).unwrap();
+        let mut lib = Library::init(&tmp.path().join("home"), "test", None, None).unwrap();
+        native::dispatch(
+            &mut lib,
+            serde_json::from_value(json!({"operation":"remember_import_root","path":root}))
+                .unwrap(),
+        )
+        .unwrap();
+        let file = old.join("image.jpg");
+        fs::write(&file, b"original").unwrap();
+        lib.add(&file, None, Metadata::default()).unwrap();
+        let sibling = root.join("new");
+        fs::create_dir(&sibling).unwrap();
+        fs::rename(&file, sibling.join("renamed.jpg")).unwrap();
+        assert_eq!(lib.doctor(false, &[]).unwrap()["counts"]["relinkable"], 1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reports_permission_denial_without_opening_originals() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("original.jpg");
+        fs::write(&file, b"original").unwrap();
+        let mut lib = Library::init(&tmp.path().join("home"), "test", None, None).unwrap();
+        lib.add(&file, None, Metadata::default()).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0)).unwrap();
+        let before = lib.last_event().unwrap();
+        let report = lib.doctor(false, &[]).unwrap();
+        assert_eq!(report["counts"]["unreadable"], 1);
+        assert_eq!(report["counts"]["missing"], 0);
+        assert_eq!(before, lib.last_event().unwrap());
     }
 }

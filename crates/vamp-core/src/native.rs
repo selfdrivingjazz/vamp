@@ -495,6 +495,10 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
     };
     match request.operation.as_str() {
         "doctor" => library.doctor(false, &[]),
+        "remember_import_root" => {
+            library.remember_import_root(request.path.as_deref().context("path is required")?)?;
+            Ok(json!({"recorded":true}))
+        }
         "relink" => Ok(serde_json::to_value(library.relink_original(
             asset_id()?, request.path.as_deref().context("path is required")?,
         )?)?),

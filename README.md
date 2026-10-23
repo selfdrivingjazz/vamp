@@ -60,6 +60,7 @@ one refresh, and ordinary grid browsing never waits for its network transfer.
 `vamp doctor` prints a read-only JSON report: present/missing counts, hash-verified
 relinkable candidates, ambiguous matches, unreadable paths, and derivative tier gaps
 (thumbnail, preview, micro, grid and high-resolution preview).
+On Unix it checks read permissions/ACLs without opening present originals.
 It never removes items or changes original files. `vamp doctor --fix` applies only
 unambiguous repairs. `vamp media relink ID PATH` verifies the recorded size and BLAKE3;
 `vamp media relink --search DIR` applies unambiguous repairs found below that directory.
