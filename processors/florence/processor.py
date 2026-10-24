@@ -100,7 +100,7 @@ def generate(processor, model, image, task, device):
 def loaded(manifest, device):
     state = json.loads(manifest.read_text(encoding="utf-8"))
     if state.get("model") != MODEL_ID or state.get("revision") != MODEL_REVISION:
-        raise ValueError("model manifest is incompatible; rerun vamp setup (florence or models) --install")
+        raise ValueError("model manifest is incompatible; run vamp setup install captions")
     import torch
 
     if device == "auto":

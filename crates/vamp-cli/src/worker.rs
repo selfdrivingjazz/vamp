@@ -1,7 +1,7 @@
 //! `vamp worker`: run this machine's processor implementations for an authority's jobs.
 //!
 //! The authority owns processor registrations and the queue; this process claims jobs for the
-//! processor names it implements locally (from `vamp setup models --install`), downloads the
+//! processor names it implements locally (from `vamp setup install search|captions`), downloads the
 //! job's input representation, runs the local command, and posts the ToolResponse back. Leases
 //! are heartbeated while a processor runs; a crashed worker's jobs are reclaimed by the
 //! authority when the lease expires, so restarts need no local state.

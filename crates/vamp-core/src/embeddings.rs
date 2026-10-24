@@ -387,7 +387,7 @@ impl Library {
     pub fn embed_text(&self, text: &str) -> Result<(String, Vec<f32>)> {
         let spec = self
             .embedder()?
-            .context("no text embedder configured; run vamp setup models --install")?;
+            .context("no text embedder configured; run vamp setup install search")?;
         ensure!(!text.trim().is_empty(), "semantic query cannot be empty");
         ensure!(text.len() <= 4096, "semantic query exceeds 4096 bytes");
         let request = ToolRequest {

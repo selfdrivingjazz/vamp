@@ -112,7 +112,7 @@ fn attributes(body: &Value) -> Vec<(String, String)> {
 }
 
 #[test]
-fn fresh_home_is_off_and_setup_shows_the_choice() {
+fn fresh_home_is_off() {
     let home = tempfile::tempdir().unwrap();
     let status = vamp(home.path(), &["diagnostics", "status"]);
     assert_eq!(status.code, 0, "{}", status.stderr);
@@ -122,12 +122,6 @@ fn fresh_home_is_off_and_setup_shows_the_choice() {
     assert!(status["endpoint"].is_null());
     assert!(!status["sends"].as_array().unwrap().is_empty());
     assert!(!status["never_sends"].as_array().unwrap().is_empty());
-
-    let setup = vamp(home.path(), &["setup"]);
-    assert_eq!(setup.code, 0, "{}", setup.stderr);
-    let setup = json(&setup.stdout);
-    assert_eq!(setup["diagnostics"]["enabled"], false);
-    assert!(setup["diagnostics"]["enable_argv"].is_array());
     assert!(!home.path().join("diagnostics.json").exists());
 }
 

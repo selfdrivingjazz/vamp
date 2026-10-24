@@ -20,6 +20,7 @@ Never parse `--help` text when JSON exists.
 - `vamp serve [--bind 0.0.0.0:PORT]` — serve the current library to other machines and the Vampire apps (default bind 127.0.0.1:7777, this machine only); it prints the URL, the token file and the join command. Long-running: start it only when asked.
 - `vamp self-update [--check]` — replace a release install (`vamp`, `vamp-media`, `vamp-server`, `vamp-store`, from `curl -fsSL https://vamp.sh/install | sh`) with the latest release.
 - `vamp diagnostics status` — whether optional crash/error reports are on (off by default), where they go and exactly what they hold. Enabling (`vamp diagnostics enable --endpoint URL`) or disabling is the owner's choice: never change it unless they ask.
+- `vamp setup plan` — read-only: this machine's optional extras (`search`: semantic search, Find Similar, Riff and Galaxy; `captions`: descriptions and tags), whether each is installed, its size and seconds per item, and what is recommended here (`recommended`, `offered`). `vamp setup install search|captions|recommended` downloads 1–5 GB, registers the processors in the library and queues its items; `vamp setup decline captions` records a "no". Both are the owner's choice: run them only when asked.
 - Set `VAMP_ACTOR=agent:<agent-name>` so catalog events record who made a change; what you add is recorded as added by you (`metadata.extra.added_by`), and the owner's app shows the owner's own items by default (agents' under Agents).
 
 ## MCP clients
@@ -93,7 +94,7 @@ Read `revision` from `inspect`, then pass it so a concurrent edit fails with a c
 
 ## Ingest
 - `vamp media add <path> [--name NAME] [--metadata meta.json]` — catalog a file by reference (the file is hashed, never moved or modified).
-- Captions, model tags and embeddings are produced asynchronously by processors (GPU worker); `vamp jobs list` shows progress. Do not run `vamp jobs run`/`watch` unless asked.
+- Captions, model tags and embeddings are produced asynchronously by processors (installed with `vamp setup install search|captions`; often on a GPU worker); `vamp jobs list` shows progress. Do not run `vamp jobs run`/`watch` unless asked.
 - Eagle import (`vamp import eagle PATH`) is an owner operation — do not run it.
 
 ## Explorations (research missions for the owner)

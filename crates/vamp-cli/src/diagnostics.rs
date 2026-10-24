@@ -267,7 +267,7 @@ fn argv(home: &Path, command: &[&str]) -> Vec<Value> {
         .collect()
 }
 
-/// The choice as `vamp diagnostics status` and `vamp setup` show it; credentials redacted.
+/// The choice as `vamp diagnostics status` shows it; credentials redacted.
 pub fn status(home: &Path) -> Result<Value> {
     let (settings, error) = match settings(home) {
         Ok(settings) => (settings, None),

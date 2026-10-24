@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- `vamp setup` is rebuilt around optional extras; `vamp setup media|florence|models`,
+  `--install` and `--source` are gone. `vamp setup` (`vamp setup plan [--text]`) is a
+  read-only report of this machine (CPU, cores, memory, free disk, NVIDIA or Apple GPU, uv,
+  ffmpeg, `vamp-media`, the active library's item count) and of each extra: `previews`,
+  `video`, `search` (SigLIP: smart search, Find Similar, Riff, Galaxy) and `captions`
+  (Florence-2), with state, download and disk size, seconds per item and whether it is
+  recommended (`search` with 8 GB of memory and 5 GB of free disk, `captions` with an NVIDIA
+  GPU). `vamp setup install search|captions|recommended [--device]` installs into
+  `<home>/tools/models` with the `uv` on PATH or a pinned, SHA256-verified uv downloaded into
+  `<home>/tools/bin`, a uv-managed Python 3.11 in `<home>/tools/python` and the weights in
+  `<home>/tools/cache/hf`; PyTorch is the CUDA 12.8 build for cuda and the CPU build elsewhere
+  on Linux (about 1.2 GB instead of 6.5 GB). It times one cold run of each processor on a
+  sample image, registers the processors in the active (or `--context`) library keeping an
+  existing registration's `placement` (re-running no longer resets `remote` to `any`) and
+  queues the library's items for newly registered processors. `vamp setup decline` records
+  a "no". Choices live in `<home>/setup.json`; `vamp init` registers installed extras in new
+  libraries. `vamp worker` keeps serving installs made by `setup models --install` and
+  updates their scripts. `vamp setup` no longer shows the diagnostics choice
+  (`vamp diagnostics status` does), and `vamp-media` is no longer looked up in
+  `<home>/tools/bin`: it ships beside `vamp`.
 - Referenced originals now keep authority availability (`present` / `missing`, last checked,
   last relinked) in their synced asset documents. Missing opens return typed `original_missing`;
   a bounded server stat sweep does no hashing. Nothing is removed from the catalog.
