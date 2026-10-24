@@ -73,7 +73,7 @@ def prepare(manifest):
 def loaded(manifest, device):
     state = json.loads(manifest.read_text(encoding="utf-8"))
     if state.get("model") != MODEL_ID or state.get("revision") != MODEL_REVISION:
-        raise ValueError("model manifest is incompatible; rerun vamp setup models --install")
+        raise ValueError("model manifest is incompatible; run vamp setup install search")
     device = resolve_device(device)
     processor, model = load_model(state["path"])
     model.to(device)

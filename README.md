@@ -22,6 +22,42 @@ four binaries) to the latest release. Each release archive holds `vamp`, `vamp-m
 Then `vamp guide` prints the operating manual (`docs/agents/SKILL.md`, also usable as an agent
 skill), `vamp commands` the full argument tree and `vamp schema` the JSON schemas.
 
+## Optional extras: smart search and captions
+
+The binaries carry no ML runtime. `vamp setup` (`vamp setup plan`) is a read-only report of
+this machine (memory, free disk, GPU, ffmpeg, uv) and of each optional extra: its state,
+download and disk size, seconds per item and whether it is recommended here. `--text` prints
+it for people.
+
+```sh
+vamp setup plan --text           # what fits this machine
+vamp setup install recommended    # or: vamp setup install search captions [--device cuda]
+vamp setup decline captions       # record that you do not want it
+```
+
+| Extra | Enables | Recommended |
+| --- | --- | --- |
+| `previews` | Image thumbnails, previews and colors (`vamp-media`, shipped beside `vamp`) | Built in |
+| `video` | Video thumbnails and loops | Needs `ffmpeg` on `PATH` (or `VAMP_FFMPEG`) |
+| `search` | Search by meaning, Find Similar, Riff and Galaxy (SigLIP base) | With 8 GB of memory and 5 GB of free disk |
+| `captions` | Descriptions and tags for every image (Florence-2 base) | With an NVIDIA GPU |
+
+Extras install under `$VAMP_HOME/tools`: one uv environment (`tools/models`), a uv-managed
+Python 3.11 (`tools/python`) and the model weights (`tools/cache/hf`). `vamp` uses the `uv` on
+`PATH`, else downloads a pinned, checksum-verified uv into `tools/bin`. PyTorch is the CUDA 12.8
+build for `--device cuda` (the default with an NVIDIA GPU), the CPU build elsewhere on Linux and
+PyPI's build on macOS. Measured sizes for `search`: about 1.1 GB to download and 2 GB on disk
+on a Linux CPU machine, 1 GB and 1.5 GB on macOS, and 4.8 GB and 8 GB with the CUDA build.
+`captions` then adds about 0.5 GB.
+
+After installing, each new processor runs once on a sample image to measure this machine's
+seconds per item. The extra's processors are then registered in the active (or `--context`)
+library, keeping an existing registration's `placement`, and the library's existing items are
+queued. Queued items are processed while `vamp serve` runs, or by `vamp jobs run --limit N`.
+Choices are kept in `$VAMP_HOME/setup.json`; `vamp init` registers the installed extras in
+every new library. A GPU machine can instead run them for another machine's library with
+`vamp worker`.
+
 Video thumbnails and previews use the first displayed frame as a poster, then the same
 JPEG representations and WebP grid tiers as images. This requires the optional `ffmpeg`
 executable on the authority's `PATH` (or `VAMP_FFMPEG` set to its path); a missing tool
@@ -119,7 +155,7 @@ S3-compatible bucket through `vamp-store` (installed beside `vamp`).
 ## Crash and error reports (optional, off by default)
 
 `vamp` works fully offline with no account, and sends nothing anywhere unless you opt in.
-`vamp setup` and `vamp diagnostics status` show the choice: whether reports are on, where they
+`vamp diagnostics status` shows the choice: whether reports are on, where they
 go (credentials redacted) and exactly what a report holds. There is no VAMP-run collector;
 reports go only to an OpenTelemetry endpoint you choose, as OTLP/HTTP JSON log records
 POSTed to `<endpoint>/v1/logs` (an OpenTelemetry Collector or Grafana Alloy, e.g.
@@ -227,7 +263,8 @@ image thumbnails/previews, explicit capped originals, URL/file ingestion with pr
 tagging, ratings, annotations, folder creation and explorations (including change review).
 No deletion or shell-execution tool is exposed. Treat media and catalog text as untrusted
 data. Semantic search needs the library's existing embeddings/query embedder; no models
-are installed automatically. A replica reads its local mirror; run `vamp sync` when stale.
+are installed automatically (`vamp setup install search` installs them). A replica reads its
+local mirror; run `vamp sync` when stale.
 
 The server supports MCP revision **2026-07-28** (`server/discover`, per-request metadata)
 and legacy initialize-based **2025-11-25**, **2025-06-18**, **2025-03-26** clients.
@@ -287,7 +324,7 @@ content or credentials. Transport failures use the fixed `transport_error` categ
 | `crates/vamp-server` | `vamp-server` | HTTP server for one authority library: the `/v1` API replicas, the Vampire apps and the browser clipper use; token or Tailscale identity auth; background processor jobs and thumbnail tiers (`vamp serve` runs it) |
 | `crates/vamp-store` | `vamp-store` | S3-compatible object storage helper for cloud originals (one JSON request on stdin, one response on stdout) |
 | `vendor/tiny_http` | `tiny_http` 0.12.0 (patched) | The HTTP/1.1 server `vamp-server` uses, with a connection-pool fix (`vendor/tiny_http/VENDORED.md`); MIT OR Apache-2.0 |
-| `processors/` | | Optional local model processors (Florence-2 captions/tags, SigLIP embeddings) installed by `vamp setup models --install` |
+| `processors/` | | Optional local model processors (Florence-2 captions/tags, SigLIP embeddings) installed by `vamp setup install captions\|search` |
 | `docs/agents/SKILL.md` | | The manual `vamp guide` prints |
 | `tools/` | | `eagle-fixture.py` (synthetic Eagle libraries for tests), `card-font.py` (note-card glyph atlases) |
 | `examples/` | | `eagle-demo.py` (catalog a bounded Eagle sample) |

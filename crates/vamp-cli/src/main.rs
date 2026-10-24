@@ -31,7 +31,7 @@ use vamp_protocol::{Metadata, MetadataPatch, ProcessorSpec, SheetItem, ToolReque
     name = "vamp",
     version,
     about = "Reference-only media catalog for agents",
-    long_about = "Reference-only media catalog for agents. JSON output is the default. Originals are referenced in place and never modified or deleted (ingested bytes such as clips and exploration findings are copied into the library inbox). Search covers metadata and observations; --semantic ranks by embeddings. Set VAMP_ACTOR to identify event authors. Optional media/ML helpers are installed only by explicit setup --install. Crash and error reports are off unless enabled with `vamp diagnostics enable`. `vamp guide` prints the agent manual."
+    long_about = "Reference-only media catalog for agents. JSON output is the default. Originals are referenced in place and never modified or deleted (ingested bytes such as clips and exploration findings are copied into the library inbox). Search covers metadata and observations; --semantic ranks by embeddings. Set VAMP_ACTOR to identify event authors. Optional extras (smart search, captions) are installed only by an explicit `vamp setup install`. Crash and error reports are off unless enabled with `vamp diagnostics enable`. `vamp guide` prints the agent manual."
 )]
 struct Cli {
     #[arg(
@@ -146,23 +146,11 @@ enum Command {
         #[command(subcommand)]
         command: JobCommand,
     },
-    /// Inspect optional capabilities; installation requires --install.
+    /// Optional extras for this machine: smart search (SigLIP) and captions (Florence-2).
+    /// `vamp setup` is `vamp setup plan`.
     Setup {
-        #[arg(value_enum)]
-        capability: Option<Capability>,
-        #[arg(long)]
-        install: bool,
-        #[arg(
-            long,
-            help = "VAMP source workspace for optional media helper installation"
-        )]
-        source: Option<PathBuf>,
-        #[arg(
-            long,
-            value_parser = ["auto", "cpu", "cuda", "mps"],
-            help = "Model device (models): default cuda on Linux with nvidia-smi, else cpu"
-        )]
-        device: Option<String>,
+        #[command(subcommand)]
+        command: Option<SetupCommand>,
     },
     /// Optional crash and error reports to an OpenTelemetry endpoint you choose (off by
     /// default; `status` lists exactly what a report holds).
@@ -258,6 +246,30 @@ enum Command {
         /// Only report the current and latest versions.
         #[arg(long)]
         check: bool,
+    },
+}
+#[derive(Subcommand)]
+enum SetupCommand {
+    /// Read-only: machine facts, each extra's state, size and speed, and what this machine
+    /// should install.
+    Plan {
+        /// Print the plan for people instead of JSON.
+        #[arg(long)]
+        text: bool,
+    },
+    /// Install extras into <home>/tools/models, register them in the active (or --context)
+    /// library and queue its existing items. `recommended` is the plan's recommendation.
+    Install {
+        #[arg(required = true, value_parser = ["search", "captions", "recommended"])]
+        extras: Vec<String>,
+        /// Model device [default: the installed one, else cuda with an NVIDIA GPU, else cpu].
+        #[arg(long, value_parser = ["auto", "cpu", "cuda", "mps"])]
+        device: Option<String>,
+    },
+    /// Record in <home>/setup.json that these extras are not wanted; uninstalls nothing.
+    Decline {
+        #[arg(required = true, value_parser = ["search", "captions", "recommended"])]
+        extras: Vec<String>,
     },
 }
 #[derive(Subcommand)]
@@ -709,21 +721,6 @@ impl Kind {
         }
     }
 }
-#[derive(Clone, ValueEnum)]
-enum Capability {
-    Media,
-    Florence,
-    Models,
-}
-impl Capability {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Media => "media",
-            Self::Florence => "florence",
-            Self::Models => "models",
-        }
-    }
-}
 #[derive(Subcommand)]
 enum ImportCommand {
     /// Import or incrementally sync an Eagle library without reading originals.
@@ -960,18 +957,20 @@ fn executable(path: &Path) -> bool {
         true
     }
 }
-fn resolve_helper(home: &Path) -> Result<PathBuf> {
+/// The vamp-media helper: `VAMP_MEDIA_HELPER`, else beside the running vamp (every release
+/// ships it there), else on PATH.
+fn resolve_helper() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os("VAMP_MEDIA_HELPER") {
         let path = PathBuf::from(value);
         ensure!(
             executable(&path),
-            "VAMP_MEDIA_HELPER is not an executable file: {}. Set it to a working vamp-media binary or run vamp setup media --install --source PATH",
+            "VAMP_MEDIA_HELPER is not an executable file: {}. Set it to a vamp-media executable, or unset it and put vamp-media beside vamp or on PATH",
             path.display()
         );
         return Ok(path);
     }
     let binary = format!("vamp-media{}", std::env::consts::EXE_SUFFIX);
-    let mut candidates = vec![home.join("tools/bin").join(&binary)];
+    let mut candidates = Vec::new();
     if let Ok(current) = std::env::current_exe()
         && let Some(parent) = current.parent()
     {
@@ -980,7 +979,7 @@ fn resolve_helper(home: &Path) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         candidates.extend(std::env::split_paths(&path).map(|dir| dir.join(&binary)));
     }
-    candidates.into_iter().find(|path| executable(path)).context("optional vamp-media helper is unavailable. Core catalog commands do not need it. Install explicitly with vamp setup media --install --source PATH, or set VAMP_MEDIA_HELPER to an executable")
+    candidates.into_iter().find(|path| executable(path)).context("optional vamp-media helper is unavailable. Core catalog commands do not need it. Put vamp-media beside vamp or on PATH, or set VAMP_MEDIA_HELPER")
 }
 
 fn command_tree(command: &clap::Command) -> Value {
@@ -1067,9 +1066,12 @@ fn execute(cli: Cli) -> Result<Value> {
             original_root,
             state_dir,
         } => {
-            let library =
+            // Extras this machine installed (setup.json) are registered in every new library.
+            let extras = setup::installed_extras(&home)?;
+            let mut library =
                 Library::init(&home, &name, original_root.as_deref(), state_dir.as_deref())?;
-            Ok(json!({"name":name,"context":library.context}))
+            let extras = setup::register_installed(&home, &mut library, &extras)?;
+            Ok(json!({"name":name,"context":library.context,"extras":extras}))
         }
         Command::Contexts { command } => match command {
             ContextCommand::List => redacted(load_config(&home)?),
@@ -1134,19 +1136,14 @@ fn execute(cli: Cli) -> Result<Value> {
             serve::run(&home, cli.context.as_deref(), options)?;
             unreachable!("vamp serve returns only on failure")
         }
-        Command::Setup {
-            capability,
-            install,
-            source,
-            device,
-        } => setup::run(
-            &home,
-            cli.context.as_deref(),
-            capability.as_ref().map(Capability::as_str),
-            install,
-            source.as_deref(),
-            device.as_deref(),
-        ),
+        Command::Setup { command } => match command.unwrap_or(SetupCommand::Plan { text: false }) {
+            SetupCommand::Plan { text: false } => setup::plan(&home, cli.context.as_deref()),
+            SetupCommand::Plan { text: true } => unreachable!("the text plan prints in main"),
+            SetupCommand::Install { extras, device } => {
+                setup::install(&home, cli.context.as_deref(), &extras, device.as_deref())
+            }
+            SetupCommand::Decline { extras } => setup::decline(&home, &extras),
+        },
         Command::Diagnostics { command } => match command {
             DiagnosticsCommand::Status => diagnostics::status(&home),
             DiagnosticsCommand::Enable {
@@ -1371,17 +1368,17 @@ fn execute(cli: Cli) -> Result<Value> {
                     MediaCommand::Thumbnail { id } => Ok(serde_json::to_value(library.generate(
                         &id,
                         "thumbnail",
-                        &resolve_helper(&home)?,
+                        &resolve_helper()?,
                     )?)?),
                     MediaCommand::Preview { id } => Ok(serde_json::to_value(library.generate(
                         &id,
                         "preview",
-                        &resolve_helper(&home)?,
+                        &resolve_helper()?,
                     )?)?),
                     MediaCommand::LoopPreview { id } => Ok(serde_json::to_value(library.generate(
                         &id,
                         "loop",
-                        &resolve_helper(&home)?,
+                        &resolve_helper()?,
                     )?)?),
                     MediaCommand::Sheet {
                         query,
@@ -1415,7 +1412,7 @@ fn execute(cli: Cli) -> Result<Value> {
                                 path: path.to_string_lossy().into_owned(),
                             });
                         }
-                        let helper = resolve_helper(&home)?;
+                        let helper = resolve_helper()?;
                         let request = ToolRequest {
                             operation: "sheet".into(),
                             output_path: Some(output.to_string_lossy().into_owned()),
@@ -1629,7 +1626,7 @@ fn execute(cli: Cli) -> Result<Value> {
                                 }),
                             },
                         };
-                        let helper = resolve_helper(&home).ok();
+                        let helper = resolve_helper().ok();
                         library.explore_add(
                             &slug,
                             Finding { name, note, tags, url, folder, content },
@@ -1930,6 +1927,23 @@ fn main() -> ExitCode {
     if matches!(cli.command, Command::Guide) {
         print!("{}", guide());
         return ExitCode::SUCCESS;
+    }
+    if matches!(
+        cli.command,
+        Command::Setup {
+            command: Some(SetupCommand::Plan { text: true })
+        }
+    ) {
+        return match setup::plan_text(&cli.home.unwrap_or_else(default_home), cli.context.as_deref()) {
+            Ok(text) => {
+                print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                print_error("operation_failed", format!("{error:#}"));
+                ExitCode::FAILURE
+            }
+        };
     }
     if let Command::Mcp(options) = cli.command {
         return match mcp::run(options, &cli.home.unwrap_or_else(default_home), cli.context.as_deref()) {

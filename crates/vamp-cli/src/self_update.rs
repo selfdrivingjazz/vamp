@@ -33,12 +33,7 @@ pub fn run(check: bool) -> Result<Value> {
     let base = std::env::var("VAMP_INSTALL_BASE").ok().filter(|b| !b.is_empty());
     let base = base.as_deref().unwrap_or(DEFAULT_BASE).trim_end_matches('/');
     let current = env!("CARGO_PKG_VERSION");
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_global(Some(Duration::from_secs(600)))
-        .user_agent(concat!("vamp/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into();
+    let agent = agent();
     let sums = String::from_utf8(get(&agent, &format!("{base}/latest/download/SHA256SUMS"), 1 << 20)?)
         .context("SHA256SUMS is not text")?;
     let (asset, sha256, latest) = select_asset(&sums, target)?;
@@ -50,7 +45,7 @@ pub fn run(check: bool) -> Result<Value> {
 
     let archive = get(&agent, &format!("{base}/latest/download/{asset}"), MAX_ARCHIVE)?;
     ensure!(hex(&Sha256::digest(&archive)) == sha256, "checksum mismatch for {asset}; nothing was replaced");
-    let mut files = untar(flate2::read::GzDecoder::new(archive.as_slice()))
+    let mut files = untar(flate2::read::GzDecoder::new(archive.as_slice()), &BINARIES)
         .with_context(|| format!("reading {asset}"))?;
     let exe = std::env::current_exe()
         .and_then(fs::canonicalize)
@@ -70,7 +65,17 @@ pub fn run(check: bool) -> Result<Value> {
     Ok(out)
 }
 
-fn get(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>> {
+/// HTTP client for release downloads (`vamp self-update`, the uv bootstrap of `vamp setup`).
+pub(crate) fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_global(Some(Duration::from_secs(600)))
+        .user_agent(concat!("vamp/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into()
+}
+
+pub(crate) fn get(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>> {
     agent
         .get(url)
         .call()
@@ -130,8 +135,11 @@ fn newer(latest: &str, current: &str) -> Result<bool> {
     })
 }
 
-/// Regular files of a ustar archive named like one of BINARIES (any directory).
-fn untar(mut reader: impl std::io::Read) -> Result<std::collections::HashMap<&'static str, Vec<u8>>> {
+/// Regular files of a ustar archive whose base name is one of `names` (any directory).
+pub(crate) fn untar<'a>(
+    mut reader: impl std::io::Read,
+    names: &[&'a str],
+) -> Result<std::collections::HashMap<&'a str, Vec<u8>>> {
     let mut out = std::collections::HashMap::new();
     let mut header = [0u8; 512];
     loop {
@@ -155,17 +163,17 @@ fn untar(mut reader: impl std::io::Read) -> Result<std::collections::HashMap<&'s
         std::io::copy(&mut (&mut reader).take(padding), &mut std::io::sink())?;
         let name = field(0..100);
         let base = name.rsplit('/').next().unwrap_or("");
-        if matches!(header[156], b'0' | 0) {
-            if let Some(&known) = BINARIES.iter().find(|&&n| n == base) {
-                out.insert(known, data);
-            }
+        if matches!(header[156], b'0' | 0)
+            && let Some(&known) = names.iter().find(|&&n| n == base)
+        {
+            out.insert(known, data);
         }
     }
 }
 
 /// Write `bytes` beside `path` and rename it over `path`, so a running copy keeps its inode
 /// and a failure leaves the old file in place.
-fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("no parent directory")?;
     let name = path.file_name().context("no file name")?.to_string_lossy();
     let temp: PathBuf = dir.join(format!(".{name}.update-{}", std::process::id()));
@@ -186,7 +194,7 @@ fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(result?)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
