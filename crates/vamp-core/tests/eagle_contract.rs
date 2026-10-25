@@ -1,4 +1,4 @@
-//! Eagle import/sync over a generated Eagle 4 library (tools/eagle-fixture.py). Originals are
+//! Library import/sync over a generated source library (tools/library-fixture.py). Originals are
 //! made unreadable (chmod 000) to stand in for Google Drive placeholders: any attempt to read
 //! one during import fails the import.
 #![cfg(feature = "native")]
@@ -12,7 +12,7 @@ use vamp_core::Library;
 use vamp_core::native::{Request, request};
 
 fn fixture(dir: &Path, items: usize, unreadable: bool) -> PathBuf {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/eagle-fixture.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/library-fixture.py");
     let library = dir.join("Fixture.library");
     let mut command = Command::new("python3");
     command
@@ -24,12 +24,12 @@ fn fixture(dir: &Path, items: usize, unreadable: bool) -> PathBuf {
     }
     let status = command
         .status()
-        .expect("python3 is required for Eagle fixtures");
+        .expect("python3 is required for library fixtures");
     assert!(status.success());
     library
 }
 fn mutate(library: &Path) -> Value {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/eagle-fixture.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/library-fixture.py");
     let output = Command::new("python3")
         .arg(&script)
         .arg(library)
@@ -417,7 +417,7 @@ fn background_import_reports_progress_until_finished() {
         failed["error"]
             .as_str()
             .unwrap()
-            .contains("Eagle library unavailable")
+            .contains("import library unavailable")
     );
 }
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Reference a bounded Eagle sample; prove local sheets without original access on macOS.
+"""Reference a bounded library sample; prove local sheets without original access on macOS.
 
-Requires a built/installed vamp and the optional media helper. No Eagle files are
-written or moved. --home must be outside the Eagle library. Output stays in home.
+Requires a built/installed vamp and the optional media helper. No source files are
+written or moved. --home must be outside the source library. Output stays in home.
 """
 import argparse
 import hashlib
@@ -28,7 +28,7 @@ def main():
     executable = str(Path(args.vamp).resolve()) if Path(args.vamp).is_file() else shutil.which(args.vamp)
     if not executable:
         parser.error("vamp executable not found")
-    context = "eagle-demo"
+    context = "library-demo"
 
     def call(*arguments, offline=False, expect_failure=False):
         command = [executable, "--home", str(home), "--context", context, *map(str, arguments)]
@@ -60,9 +60,9 @@ def main():
     if context not in config["contexts"]:
         call("init", "--name", context, "--original-root", library)
     elif config["contexts"][context]["original_root"] != str(library):
-        raise RuntimeError("existing eagle-demo context references another source; choose another --home")
+        raise RuntimeError("existing library-demo context references another source; choose another --home")
     before = snapshot()
-    imported = call("import", "eagle", library, "--limit", args.limit)
+    imported = call("import", "library", library, "--limit", args.limit)
     assets = imported["assets"]
     if not assets:
         raise RuntimeError(f"no source items imported: {imported['skipped']}")
@@ -70,7 +70,7 @@ def main():
     for asset in assets:
         representations.append(call("media", "thumbnail", asset["id"]))
         representations.append(call("media", "preview", asset["id"]))
-    output = home / "demo" / f"eagle-{uuid.uuid4().hex}.jpg"
+    output = home / "demo" / f"library-{uuid.uuid4().hex}.jpg"
     output.parent.mkdir(parents=True, exist_ok=True)
     offline = sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file()
     denied = call("media", "fetch", assets[0]["id"], "--kind", "original", offline=True, expect_failure=True) if offline else None

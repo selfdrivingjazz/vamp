@@ -91,7 +91,7 @@ fn scan(dir: &Path, mtimes: &HashMap<String, i64>, known: &HashMap<String, Known
         let raw = read_json(&dir.join("metadata.json"))?;
         let eid = text(&raw["id"])
             .or_else(|| (!stem.is_empty()).then(|| stem.clone()))
-            .context("Eagle item has no id")?;
+            .context("library item has no id")?;
         let deleted = raw["isDeleted"] == true;
         let stamp = format!(
             "{}:{}:{}:{}",
@@ -105,11 +105,11 @@ fn scan(dir: &Path, mtimes: &HashMap<String, i64>, known: &HashMap<String, Known
             return Ok(Scan::Unchanged(eid, mt));
         }
         let ext = text(&raw["ext"])
-            .context("Eagle item has no extension")?
+            .context("library item has no extension")?
             .to_ascii_lowercase();
         ensure!(
             ext.bytes().all(|b| b.is_ascii_alphanumeric()),
-            "invalid Eagle extension"
+            "invalid library item extension"
         );
         let name = text(&raw["name"]).unwrap_or_else(|| eid.clone());
         let (original, thumb) = locate(dir, &name, &ext)?;
@@ -169,7 +169,7 @@ fn read_json(path: &Path) -> Result<Value> {
     let meta = fs::metadata(path)?;
     ensure!(
         meta.len() <= MAX_METADATA,
-        "Eagle metadata exceeds size limit"
+        "library metadata exceeds size limit"
     );
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
@@ -275,7 +275,7 @@ fn locate(dir: &Path, name: &str, ext: &str) -> Result<(PathBuf, Option<PathBuf>
                 .extension()
                 .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case(ext))
     })
-    .context("original file missing from Eagle item")?;
+    .context("original file missing from library item")?;
     Ok((original, thumb))
 }
 
@@ -318,18 +318,18 @@ impl Library {
         report("scanning", 0, 0, &Counts::default());
         ensure!(
             self.context.remote.is_none(),
-            "Eagle import runs on the authority, not on replicas"
+            "library import runs on the authority, not on replicas"
         );
-        let root = root.canonicalize().context("Eagle library unavailable")?;
+        let root = root.canonicalize().context("import library unavailable")?;
         let images = root.join("images");
         ensure!(
             images.is_dir(),
-            "not an Eagle library (missing images/): {}",
+            "not an importable library (missing images/): {}",
             root.display()
         );
         ensure!(
             !self.state_dir.starts_with(&root) && !root.starts_with(&self.state_dir),
-            "Eagle library and local catalog state must not contain each other"
+            "import library and local catalog state must not contain each other"
         );
         let root_text = path_text(&root)?;
         let library_meta = match root.join("metadata.json") {
@@ -810,7 +810,7 @@ struct CopiedThumbnail {
 fn copy_thumbnail(state_dir: &Path, queued: &QueuedThumbnail) -> Result<CopiedThumbnail> {
     let bytes = fs::read(&queued.path)?;
     let (width, height, mime, ext) =
-        image_format(&bytes).context("Eagle thumbnail is not a PNG, JPEG, GIF or WebP image")?;
+        image_format(&bytes).context("imported thumbnail is not a PNG, JPEG, GIF or WebP image")?;
     let relative = format!(
         "representations/eagle/{}-{}.{ext}",
         queued.asset_id,
@@ -966,7 +966,7 @@ impl Library {
                     } else {
                         let state_dir = state_dir.clone();
                         crate::io::background().try_run(
-                            format!("eagle thumbnail {}", q.asset_id),
+                            format!("imported thumbnail {}", q.asset_id),
                             crate::io::DRIVE_DEADLINE,
                             move || {
                                 if q.generate {

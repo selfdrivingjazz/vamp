@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "vamp-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "vamp-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "vamp-media"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "avif-rust",
@@ -2035,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "vamp-protocol"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "schemars",
  "serde",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "vamp-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2066,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "vamp-store"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "blake3",

@@ -333,7 +333,7 @@ fn import_status_value(
 fn import_eagle_start(mut library: Library, request: &Request) -> Result<Value> {
     ensure!(
         library.context.remote.is_none(),
-        "Eagle import runs on the authority, not on replicas"
+        "library import runs on the authority, not on replicas"
     );
     let path = request.path.clone().context("path is required")?;
     let full = hash_mode(request)?;
@@ -349,7 +349,7 @@ fn import_eagle_start(mut library: Library, request: &Request) -> Result<Value> 
     );
     let id = job_id.clone();
     std::thread::Builder::new()
-        .name(format!("eagle-import-{id}"))
+        .name(format!("library-import-{id}"))
         .spawn(move || {
             let mut last = queued;
             let result = library.import_eagle_with(&path, full, &mut |progress| {
@@ -414,7 +414,7 @@ fn copy_thumbnails_until_empty(library: &mut Library, progress: &mut dyn FnMut(&
         progress(value)
     };
     if let Err(e) = library.copy_eagle_thumbnails(usize::MAX, &mut notify) {
-        eprintln!("eagle thumbnails: {e:#}");
+        eprintln!("imported thumbnails: {e:#}");
     }
     thumbnails_landed();
     THUMBNAIL_COPIERS
@@ -467,7 +467,7 @@ fn spawn_thumbnail_copier(home: &Path, context: Option<&str>) -> Result<()> {
         return Ok(());
     }
     std::thread::Builder::new()
-        .name("eagle-thumbnails".into())
+        .name("imported-thumbnails".into())
         .spawn(move || copy_thumbnails_until_empty(&mut library, &mut |_| {}))?;
     Ok(())
 }

@@ -141,13 +141,13 @@ fn every_add_path_records_its_actor() {
 fn eagle_import_records_the_importer() {
     let env = Env::new();
     let library = env.dir.path().join("Fixture.library");
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/eagle-fixture.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/library-fixture.py");
     let status = Command::new("python3")
         .arg(&script)
         .arg(&library)
         .args(["--items", "6", "--seed", "7"])
         .status()
-        .expect("python3 is required for Eagle fixtures");
+        .expect("python3 is required for library fixtures");
     assert!(status.success());
     as_actor("local", || ok(&env.home, json!({"operation":"import_eagle","path":library})));
     let page = ok(&env.home, json!({"operation":"browse","limit":100,"trash":false}));

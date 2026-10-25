@@ -112,7 +112,7 @@ Other stat failures are unreadable, not evidence of deletion.
 Health lives in `original.availability` (`state`, `last_checked_at`, `relinked_at`,
 optional `check_error`) and syncs normally. Old catalogs default to present with no
 check time. Repairs keep IDs, revisions, hashes, derivatives and replica caches intact.
-Search uses known import roots and Eagle libraries, plus each missing file’s parent
+Search uses known import roots and imported libraries, plus each missing file’s parent
 and ancestors bounded by its configured/imported root; without a boundary it never
 walks above the parent. It does not follow directory symlinks. Only same-size files
 are hashed, once per scan. No recorded hash (lazy fingerprint still pending), multiple
@@ -131,7 +131,7 @@ replicas that sync from it.
 
 ```sh
 vamp init --name refs            # on the authority
-for f in ~/Pictures/refs/*.jpg; do vamp media add "$f"; done   # or vamp import eagle LIBRARY
+for f in ~/Pictures/refs/*.jpg; do vamp media add "$f"; done   # or vamp import library LIBRARY
 vamp serve --bind 0.0.0.0:7777   # default 127.0.0.1:7777: this machine only
 ```
 
@@ -318,7 +318,7 @@ content or credentials. Transport failures use the fixed `transport_error` categ
 | Path | Crate / file | What it is |
 | --- | --- | --- |
 | `crates/vamp-protocol` | `vamp-protocol` | Serialized types, generated JSON schemas and the semantic contract (`protocol/contract.json`) |
-| `crates/vamp-core` | `vamp-core` | The engine: SQLite catalog, Eagle import, thumbnails, processors and jobs, explorations, replica sync (feature `remote`), native operations (feature `native`) |
+| `crates/vamp-core` | `vamp-core` | The engine: SQLite catalog, library import, thumbnails, processors and jobs, explorations, replica sync (feature `remote`), native operations (feature `native`) |
 | `crates/vamp-cli` | `vamp-cli` (binary `vamp`) | The command-line tool |
 | `crates/vamp-media` | `vamp-media` | Optional helper `vamp` and `vamp-core` call for image decoding (HEIC/AVIF/PSD included), video posters (optional ffmpeg), thumbnails and colors |
 | `crates/vamp-server` | `vamp-server` | HTTP server for one authority library: the `/v1` API replicas, the Vampire apps and the browser clipper use; token or Tailscale identity auth; background processor jobs and thumbnail tiers (`vamp serve` runs it) |
@@ -326,10 +326,10 @@ content or credentials. Transport failures use the fixed `transport_error` categ
 | `vendor/tiny_http` | `tiny_http` 0.12.0 (patched) | The HTTP/1.1 server `vamp-server` uses, with a connection-pool fix (`vendor/tiny_http/VENDORED.md`); MIT OR Apache-2.0 |
 | `processors/` | | Optional local model processors (Florence-2 captions/tags, SigLIP embeddings) installed by `vamp setup install captions\|search` |
 | `docs/agents/SKILL.md` | | The manual `vamp guide` prints |
-| `tools/` | | `eagle-fixture.py` (synthetic Eagle libraries for tests), `card-font.py` (note-card glyph atlases) |
-| `examples/` | | `eagle-demo.py` (catalog a bounded Eagle sample) |
+| `tools/` | | Synthetic library fixtures for tests and note-card glyph atlases |
+| `examples/` | | Bounded library import and catalog examples |
 
-The protocol version is `0.1`; the Rust packages are `0.4.0`. Only `vamp-protocol` is meant
+The protocol version is `0.1`; the Rust packages are `0.4.1`. Only `vamp-protocol` is meant
 for crates.io; the others are `publish = false`.
 
 ## Build and test
@@ -343,7 +343,7 @@ cargo run -p vamp-protocol --example schema   # the bundle `vamp schema` prints
 
 Feature `remote` of `vamp-cli` adds replica contexts of a `vamp-server` authority (`vamp join`,
 `vamp contexts remote`, `vamp sync`) and `vamp self-update`. `vamp serve` needs a
-`vamp-server` beside `vamp` or on `PATH` (`cargo build --release -p vamp-server`). Tests need `python3` (Eagle
+`vamp-server` beside `vamp` or on `PATH` (`cargo build --release -p vamp-server`). Tests need `python3` (library
 fixtures). Release archives are built with `VAMP_RELEASE_TARGET=<target triple>` set, which
 is what lets `vamp self-update` pick its asset; source builds refuse to self-update.
 

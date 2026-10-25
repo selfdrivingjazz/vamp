@@ -26,7 +26,7 @@ pub struct OriginalAvailability {
 /// Original bytes. `path` is the authority-local copy; empty when evicted to cloud storage
 /// (`storage == "cloud"`). `locator` names the durable cloud copy once uploaded.
 ///
-/// Lazy fingerprint: references cataloged without reading bytes (Eagle import) have
+/// Lazy fingerprint: references cataloged without reading bytes (library import) have
 /// `hash_state == "pending"`, an empty `blake3`, and `modified_ns` from `stat`. Their source
 /// key (see [`Original::source_key`]) is `pending:<byte_size>:<modified_ns>` until the bytes
 /// are first read, when the digest is computed and every source-keyed record is rekeyed.
@@ -245,12 +245,12 @@ pub struct Collection {
     pub sort_order: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Eagle `iconColor` (e.g. `red`) when imported.
+    /// Source catalog `iconColor` (e.g. `red`) when imported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    /// Foreign identity, e.g. `eagle:<folder id>`.
+    /// Foreign identity from an imported source catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
 }
@@ -290,7 +290,7 @@ pub struct SmartFolder {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsupported: Vec<Value>,
 }
-/// Named tag group (Eagle `tagsGroups`). Tags remain plain strings on assets.
+/// Named tag group (imported `tagsGroups`). Tags remain plain strings on assets.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TagGroup {
     pub id: String,

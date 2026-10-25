@@ -1,6 +1,6 @@
 ---
 name: vamp
-description: Search, inspect, fetch, tag, rate, organize and ingest images/media in the owner's VAMP library (reference-only media catalog shared over the tailnet) via the `vamp` CLI. Use when the user asks about their images, references, mood boards, Eagle library, or wants media found, tagged or filed.
+description: Search, inspect, fetch, tag, rate, organize and ingest images/media in the owner's VAMP library (reference-only media catalog shared over the tailnet) via the `vamp` CLI. Use when the user asks about their images, references, mood boards, media library, or wants media found, tagged or filed.
 ---
 
 # VAMP for agents
@@ -95,7 +95,7 @@ Read `revision` from `inspect`, then pass it so a concurrent edit fails with a c
 ## Ingest
 - `vamp media add <path> [--name NAME] [--metadata meta.json]` — catalog a file by reference (the file is hashed, never moved or modified).
 - Captions, model tags and embeddings are produced asynchronously by processors (installed with `vamp setup install search|captions`; often on a GPU worker); `vamp jobs list` shows progress. Do not run `vamp jobs run`/`watch` unless asked.
-- Eagle import (`vamp import eagle PATH`) is an owner operation — do not run it.
+- Library import (`vamp import library PATH`) is an owner operation — do not run it.
 
 ## Explorations (research missions for the owner)
 An exploration is a folder `Explorations/<title>` found by a stable slug (`[a-z0-9-]`; the owner may rename or move it). Its description holds your brief and a running findings summary (the app's inspector shows it when nothing is selected). Findings are assets filed into it or its sub-folders (`people`, `studios/<name>`, `themes`…), each with a name, a why-it-matters note (description), tags and the source page URL.
@@ -125,6 +125,6 @@ vamp explore link vamp-sh --asset <asset_id>   # the same, selecting one item
 ## Safety rules
 - Never delete files. `vamp media remove <id>` moves to the trash (restorable with `vamp media restore <id>`). Do not run `vamp media empty-trash` unless the user explicitly asks.
 - Always use `--expected-revision` for updates/removals; never retry a 409/conflict blindly.
-- Never write into the Eagle library (`*.library` folders) or the originals' directories.
+- Never write into imported libraries (`*.library` folders) or the originals' directories.
 - Bulk changes (more than ~20 assets, tag renames/deletes, collection deletes): show the plan and get confirmation first.
 - Replicas: run `vamp sync` to pull the latest catalog before large reads if results look stale.

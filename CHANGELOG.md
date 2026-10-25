@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 — 2026-10-24
+
+- Use generic library terminology throughout the documentation, agent guide, import help,
+  progress and errors. Import libraries with `vamp import library PATH`; existing scripts
+  and catalogs remain compatible.
+
 ## 0.4.0 — 2026-10-24
 
 - `vamp setup` is rebuilt around optional extras; `vamp setup media|florence|models`,
@@ -118,7 +124,7 @@
 ## 0.1.0 — 2026-10-15
 - Open-source the `vamp` CLI under MIT: `vamp-core` (engine), `vamp-cli` (binary `vamp`),
   `vamp-media` (image helper), the model processors, the agent manual (`docs/agents/SKILL.md`,
-  printed by `vamp guide`) and the Eagle test fixture tool now live here, added as fresh files
+  printed by `vamp guide`) and the library test fixture tool now live here, added as fresh files
   (no Vampire history). The Vampire apps, native bridge, `vamp-server` and `vamp-store` stay
   proprietary in Vampire, which builds against these crates by path.
 - CLI releases are GitHub releases of this repository (`vamp-VERSION-TARGET.tar.gz` with the
@@ -129,7 +135,7 @@
   (`<state_dir>/server-url.json`; no URL prints it, `--clear` forgets it, replicas refuse it),
   and `vamp explore link` falls back to it after `--server-url`/`VAMP_SERVER_URL` and a
   replica's authority URL. `vamp guide` prints the manual as is.
-- Eagle contract tests format expected dates in Rust instead of BSD-only `date -r`, so they
+- Library import contract tests format expected dates in Rust instead of BSD-only `date -r`, so they
   pass on Linux.
 - Add the DejaVu font license for the note-card glyph atlases
   (`crates/vamp-core/assets/LICENSE-DejaVu.txt`).

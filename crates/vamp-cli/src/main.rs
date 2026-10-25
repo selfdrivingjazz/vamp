@@ -723,10 +723,11 @@ impl Kind {
 }
 #[derive(Subcommand)]
 enum ImportCommand {
-    /// Import or incrementally sync an Eagle library without reading originals.
-    Eagle {
+    /// Import or incrementally sync a library without reading originals.
+    #[command(alias = "eagle")]
+    Library {
         path: PathBuf,
-        /// Accepted for clarity: every run is an incremental sync by Eagle item id.
+        /// Accepted for clarity: every run is an incremental sync by source item id.
         #[arg(long)]
         sync: bool,
         /// lazy/none: never read originals; full: hash every original afterwards.
@@ -1447,11 +1448,11 @@ fn execute(cli: Cli) -> Result<Value> {
                     }
                 },
                 Command::Import {
-                    command: ImportCommand::Eagle { path, hash, .. },
+                    command: ImportCommand::Library { path, hash, .. },
                 } => library.import_eagle_with(&path, hash == "full", &mut |p| {
                     // Human progress on stderr; stdout stays one JSON document.
                     eprintln!(
-                        "eagle import: {} {}/{} (created {}, updated {}, trashed {})",
+                        "library import: {} {}/{} (created {}, updated {}, trashed {})",
                         p.phase, p.done, p.total, p.created, p.updated, p.trashed
                     );
                 }),
@@ -1997,6 +1998,24 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_import_help_and_compatibility_alias() {
+        for name in ["library", "eagle"] {
+            let cli = Cli::try_parse_from(["vamp", "import", name, "Fixture.library"]).unwrap();
+            assert!(matches!(cli.command, Command::Import {
+                command: ImportCommand::Library { .. }
+            }));
+        }
+        for args in [
+            vec!["vamp", "import", "--help"],
+            vec!["vamp", "import", "library", "--help"],
+        ] {
+            let help = Cli::try_parse_from(args).err().unwrap().to_string();
+            assert!(help.contains("library"));
+            assert!(!help.to_ascii_lowercase().contains("eagle"));
+        }
+    }
 
     /// Shell-like split: quotes group (and are removed); `quoted` marks tokens that had any.
     fn words(line: &str) -> Vec<(String, bool)> {

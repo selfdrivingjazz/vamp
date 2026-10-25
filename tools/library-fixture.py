@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Generate (or mutate) a synthetic Eagle 4 library for VAMP import/sync tests.
+"""Generate (or mutate) a synthetic importable library for VAMP import/sync tests.
 
 Usage:
-  eagle-fixture.py OUT.library --items N [--seed S] [--unreadable] [--no-thumbnail-every K]
-  eagle-fixture.py OUT.library --mutate [--seed S] [--count N]
+  library-fixture.py OUT.library --items N [--seed S] [--unreadable] [--no-thumbnail-every K]
+  library-fixture.py OUT.library --mutate [--seed S] [--count N]
 
-Layout mirrors Eagle 4: metadata.json (folders, smartFolders, quickAccess, tagsGroups),
+Layout: metadata.json (folders, smartFolders, quickAccess, tagsGroups),
 tags.json, mtime.json, images/<ID>.info/{metadata.json, <name>.<ext>, <name>_thumbnail.png}.
-Every 7th thumbnail (index % 7 == 3) holds WebP bytes, like real Eagle libraries; every K-th
-item has no thumbnail (Eagle shows small originals directly).
+Every 7th thumbnail (index % 7 == 3) holds WebP bytes, like real source libraries; every K-th
+item has no thumbnail (the source shows small originals directly).
 Item 0 is always `red-square` (512x512 png, palettes[0]=[255,0,0] 90%, star 5).
 --unreadable chmods every original to 000 (simulates cloud placeholders).
 --mutate edits an existing library and prints {changed, deleted, added, removed_folders} JSON.
@@ -209,7 +209,7 @@ def make_item(rng, used, index, folder_ids, cache, no_thumb_every, t):
         meta["star"] = star
     thumb = cache.thumbnail(shape, main, secondary, ratio) if has_thumb else None
     if thumb is not None and index % 7 == 3:
-        thumb = WEBP_1X1  # Eagle often writes WebP bytes into <name>_thumbnail.png
+        thumb = WEBP_1X1  # Source libraries may write WebP bytes into <name>_thumbnail.png
     return meta, original, thumb
 
 
