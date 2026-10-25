@@ -329,7 +329,7 @@ content or credentials. Transport failures use the fixed `transport_error` categ
 | `tools/` | | `eagle-fixture.py` (synthetic Eagle libraries for tests), `card-font.py` (note-card glyph atlases) |
 | `examples/` | | `eagle-demo.py` (catalog a bounded Eagle sample) |
 
-The protocol version is `0.1`; the Rust packages are `0.3.0`. Only `vamp-protocol` is meant
+The protocol version is `0.1`; the Rust packages are `0.4.0`. Only `vamp-protocol` is meant
 for crates.io; the others are `publish = false`.
 
 ## Build and test

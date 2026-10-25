@@ -16,7 +16,7 @@ exclude = ["vendor"]
 tiny_http = { path = "vendor/tiny_http" }
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 
@@ -30,8 +30,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 blake3 = "1"
 rusqlite = { version = "0.39", features = ["bundled", "functions"] }
 clap = { version = "4", features = ["derive", "env"] }
-vamp-protocol = { version = "0.3.0", path = "crates/vamp-protocol" }
-vamp-core = { version = "0.3.0", path = "crates/vamp-core" }
+vamp-protocol = { version = "0.4.0", path = "crates/vamp-protocol" }
+vamp-core = { version = "0.4.0", path = "crates/vamp-core" }
 
 [profile.release]
 opt-level = 3
