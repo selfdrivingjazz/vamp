@@ -17,6 +17,7 @@ use clap::{Args, CommandFactory, FromArgMatches as _, Parser, Subcommand, ValueE
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
+    io::IsTerminal as _,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -71,10 +72,14 @@ enum Command {
     /// Connect this machine to your hosted MCP relay.
     #[cfg(feature = "remote")]
     Relay(relay::Args),
-    /// Create an empty reference-only catalog.
+    /// Create a reference-only catalog, optionally adding a folder recursively.
     Init {
-        #[arg(long)]
-        name: String,
+        #[arg(value_name = "NAME", required_unless_present = "name")]
+        display_name: Option<String>,
+        #[arg(long, conflicts_with = "display_name")]
+        name: Option<String>,
+        #[arg(value_name = "DIR")]
+        folder: Option<PathBuf>,
         #[arg(long)]
         original_root: Option<PathBuf>,
         #[arg(long)]
@@ -191,8 +196,8 @@ enum Command {
     /// option). Binds 127.0.0.1:7777, this machine only, unless --bind says otherwise; prints
     /// the URL, where the token is and how another machine joins.
     Serve {
-        /// `host:port` [default: 127.0.0.1:7777]. 0.0.0.0:PORT accepts other machines;
-        /// `tailnet[:PORT]` binds this machine's Tailscale address.
+        /// `host:port` [default: 127.0.0.1:7777, this machine only].
+        /// `tailnet[:PORT]` accepts other machines on your Tailscale network.
         #[arg(long)]
         bind: Option<String>,
         /// Request auth [default: tailscale on a tailnet address, else token].
@@ -567,7 +572,7 @@ fn added_by_filter(value: &str) -> Result<String, String> {
 }
 #[derive(Subcommand)]
 enum MediaCommand {
-    /// Explicitly read and hash an original, storing only its reference.
+    /// Reference a file or a folder recursively; originals stay in place.
     Add {
         path: PathBuf,
         #[arg(long)]
@@ -1064,15 +1069,19 @@ fn execute(cli: Cli) -> Result<Value> {
         }
         Command::Init {
             name,
+            display_name,
+            folder,
             original_root,
             state_dir,
         } => {
+            let name = display_name.or(name).context("library name is required")?;
+            let root = original_root.as_deref().or(folder.as_deref());
             // Extras this machine installed (setup.json) are registered in every new library.
             let extras = setup::installed_extras(&home)?;
-            let mut library =
-                Library::init(&home, &name, original_root.as_deref(), state_dir.as_deref())?;
+            let mut library = Library::init(&home, &name, root, state_dir.as_deref())?;
             let extras = setup::register_installed(&home, &mut library, &extras)?;
-            Ok(json!({"name":name,"context":library.context,"extras":extras}))
+            let intake = folder.as_deref().map(|path| add_folder(&mut library, path, Metadata::default())).transpose()?;
+            Ok(json!({"name":vamp_core::library_context_name(name.trim())?,"display_name":name.trim(),"context":library.context,"extras":extras,"intake":intake}))
         }
         Command::Contexts { command } => match command {
             ContextCommand::List => redacted(load_config(&home)?),
@@ -1259,6 +1268,14 @@ fn execute(cli: Cli) -> Result<Value> {
                             .map(json_file)
                             .transpose()?
                             .unwrap_or_default();
+                        let path = match library.context.original_root.as_deref() {
+                            Some(root) if path.is_relative() => Path::new(root).join(path),
+                            _ => path,
+                        };
+                        if path.is_dir() {
+                            ensure!(name.is_none(), "--name applies to a single file, not a folder");
+                            return add_folder(&mut library, &path, metadata);
+                        }
                         Ok(serde_json::to_value(library.add(
                             &path,
                             name.as_deref(),
@@ -1899,9 +1916,25 @@ fn print_error(code: &str, message: String) {
 fn guide() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/guide.md"))
 }
+fn add_folder(library: &mut Library, path: &Path, metadata: Metadata) -> Result<Value> {
+    eprintln!("Adding folder {}", path.display());
+    let summary = library.add_folder_with(path, metadata, |done, total, file| {
+        eprintln!("[{done}/{total}] {}", file.display());
+    })?;
+    eprintln!("Cataloged {} of {} files; {} failed.", summary["cataloged"], summary["total"], summary["failed"]);
+    Ok(summary)
+}
+
 fn main() -> ExitCode {
     vamp_core::allow_cloud_placeholder_reads();
     let mut command = Cli::command();
+    if std::env::args_os().len() == 1 && std::io::stdout().is_terminal() {
+        if command.print_help().is_err() {
+            return ExitCode::FAILURE;
+        }
+        println!("\n\nNext: vamp init \"My refs\" ~/Pictures/refs");
+        return ExitCode::SUCCESS;
+    }
     let parsed = command
         .try_get_matches_from_mut(std::env::args_os())
         .and_then(|mut matches| {
@@ -1998,6 +2031,18 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn init_accepts_display_names_and_optional_folder() {
+        for args in [
+            vec!["vamp", "init", "Edge City"],
+            vec!["vamp", "init", "--name", "Edge City"],
+            vec!["vamp", "init", "Edge City", "pictures"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        assert!(Cli::try_parse_from(["vamp", "init"]).is_err());
+    }
+
 
     #[test]
     fn library_import_help_and_compatibility_alias() {

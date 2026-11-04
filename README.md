@@ -2,7 +2,7 @@
 
 VAMP is an experimental, reference-only media catalog for people and agents: files stay where
 they are, the catalog records them (metadata, tags, folders, thumbnails, model captions and
-embeddings), and every `vamp` command prints JSON. This repository holds the protocol, the
+embeddings), and `vamp` commands print JSON unless noted below. This repository holds the protocol, the
 engine, the `vamp` command-line tool, the `vamp-server` library server and the `vamp-store`
 cloud storage helper, all MIT-licensed. Pre-alpha: expect breaking changes.
 
@@ -19,8 +19,25 @@ checksum-verified. `vamp self-update` (`--check` only reports) moves a release i
 four binaries) to the latest release. Each release archive holds `vamp`, `vamp-media`,
 `vamp-server`, `vamp-store`, `LICENSE` and `THIRD-PARTY-NOTICES.txt`.
 
-Then `vamp guide` prints the operating manual (`docs/agents/SKILL.md`, also usable as an agent
-skill), `vamp commands` the full argument tree and `vamp schema` the JSON schemas.
+Start a library and add a folder (including nested folders):
+
+```sh
+vamp init "My refs" ~/Pictures/refs
+vamp doctor
+vamp serve                      # this machine only; keep this terminal open
+```
+
+Or create it with `vamp init "Edge City"` and add files later with
+`vamp media add ~/Pictures/refs`. Display names are saved in the library; context keys
+remain machine-readable (`Edge City` becomes `edge-city`). `--name "Edge City"` is also
+accepted. Folder intake skips hidden entries and symlinks, reports per-file progress on
+stderr and prints a JSON summary (`cataloged`, `total`, `failed`, `errors`) on stdout.
+Existing references are kept; available `vamp-media` generates thumbnails and previews.
+
+Bare `vamp` in a terminal prints help and the next command. Pipes and agents still receive
+JSON errors for missing arguments. `vamp guide` prints the operating manual
+(`docs/agents/SKILL.md`, also usable as an agent skill), `vamp commands` the full argument
+tree and `vamp schema` the JSON schemas.
 
 ## Optional extras: smart search and captions
 
@@ -130,9 +147,8 @@ One machine owns a library (the authority); other machines and the Vampire apps 
 replicas that sync from it.
 
 ```sh
-vamp init --name refs            # on the authority
-for f in ~/Pictures/refs/*.jpg; do vamp media add "$f"; done   # or vamp import library LIBRARY
-vamp serve --bind 0.0.0.0:7777   # default 127.0.0.1:7777: this machine only
+vamp init "My refs" ~/Pictures/refs   # on the authority; recursively adds the folder
+vamp serve --bind tailnet            # other machines on your Tailscale network
 ```
 
 `vamp serve` runs `vamp-server` for the current library (`--context NAME` for another). It

@@ -25,7 +25,7 @@ enum Command {
     /// Serve the /v1 API and (unless --no-jobs) drain processor jobs in the background.
     Serve {
         /// `host:port`; `tailnet` = this machine's Tailscale IPv4 on :7777 (`tailnet:PORT`
-        /// for another port). Use 0.0.0.0:7777 or a Tailscale address to accept other machines.
+        /// for another port). Use `tailnet` to accept other machines on your Tailscale network.
         #[arg(long, default_value = "127.0.0.1:7777")]
         bind: String,
         /// Default: `tailscale` when bound to a tailnet address, else `token`.
@@ -243,7 +243,7 @@ fn main() -> Result<()> {
                 format!("http://{addr}")
             };
             let reach = if addr.ip().is_loopback() {
-                " (this machine only; --bind 0.0.0.0:PORT accepts other machines)"
+                " (this machine only; --bind tailnet:PORT accepts machines on your Tailscale network)"
             } else {
                 ""
             };

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- `vamp init "Edge City" [DIR]` keeps the display name and derives the context key
+  `edge-city`; `--name` also accepts display names.
+- `vamp media add DIR` adds non-hidden files recursively, with progress on stderr and a
+  JSON summary. Folder intake generates available thumbnails and previews and does not
+  follow symlinks.
+- Bare `vamp` in a terminal prints plain help and a next command; missing arguments in
+  pipes retain JSON errors.
+- Server help, banner and connection examples recommend `--bind tailnet` for other
+  machines instead of exposing an HTTP bearer token on every interface.
+
 ## 0.4.1 — 2026-10-24
 
 - Use generic library terminology throughout the documentation, agent guide, import help,

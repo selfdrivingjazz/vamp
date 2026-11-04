@@ -126,6 +126,22 @@ fn validate_name(name: &str) -> Result<()> {
     );
     Ok(())
 }
+/// Stable context key for a human-readable library name.
+pub fn library_context_name(name: &str) -> Result<String> {
+    if validate_name(name).is_ok() {
+        return Ok(name.to_owned());
+    }
+    let mut slug = String::new();
+    for word in name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()) {
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        slug.extend(word.chars().map(|c| c.to_ascii_lowercase()));
+    }
+    validate_name(&slug).context("library name must produce a context of 1–64 ASCII letters, digits, hyphens or underscores")?;
+    Ok(slug)
+}
+
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("missing parent directory")?;
     fs::create_dir_all(parent)?;
@@ -251,7 +267,8 @@ impl Library {
         original_root: Option<&Path>,
         state_dir: Option<&Path>,
     ) -> Result<Self> {
-        validate_name(name)?;
+        let display_name = name.trim();
+        let name = library_context_name(display_name)?;
         let home = destination(home)?;
         let root = original_root
             .map(Path::canonicalize)
@@ -267,7 +284,7 @@ impl Library {
         let _lock = config_lock(&home)?;
         let mut config = load_config(&home)?;
         ensure!(
-            !config.contexts.contains_key(name),
+            !config.contexts.contains_key(&name),
             "context already exists: {name}"
         );
         let library_id = id();
@@ -296,13 +313,13 @@ impl Library {
         };
         atomic_json(
             &state.join("library.json"),
-            &json!({"protocol_version": PROTOCOL_VERSION, "library_id": context.library_id, "storage": "referenced", "writer_model": "local_authority"}),
+            &json!({"protocol_version": PROTOCOL_VERSION, "library_id": context.library_id, "storage": "referenced", "writer_model": "local_authority", "display_name": display_name}),
         )?;
         let lib = Self::connect(context)?;
         config
             .contexts
-            .insert(name.into(), stored_context(&home, &lib.context)?);
-        config.current = Some(name.into());
+            .insert(name.clone(), stored_context(&home, &lib.context)?);
+        config.current = Some(name);
         atomic_json(&home.join("config.json"), &config)?;
         Ok(lib)
     }
@@ -414,6 +431,37 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
             conn,
         })
     }
+    /// Recursively reference a folder using the same intake and derivatives as the app.
+    /// Progress is emitted after each file; per-file failures remain in the summary.
+    #[cfg(feature = "native")]
+    pub fn add_folder_with(
+        &mut self,
+        path: &Path,
+        metadata: Metadata,
+        mut progress: impl FnMut(usize, usize, &Path),
+    ) -> Result<Value> {
+        let root = path.canonicalize().context("folder unavailable")?;
+        ensure!(root.is_dir(), "expected a directory");
+        self.remember_import_root(&root)?;
+        let mut files = Vec::new();
+        native::expand(&root, &mut files)?;
+        let total = files.len();
+        let helper = media_helper();
+        let mut cataloged = 0;
+        let mut errors = Vec::new();
+        for (index, path) in files.iter().enumerate() {
+            match self.add(path, None, metadata.clone()) {
+                Ok(asset) => {
+                    native::generate_reps(self, &asset, helper.as_deref());
+                    cataloged += 1;
+                }
+                Err(error) => errors.push(json!({"path":path,"message":format!("{error:#}")})),
+            }
+            progress(index + 1, total, path);
+        }
+        Ok(json!({"total":total,"cataloged":cataloged,"failed":errors.len(),"errors":errors}))
+    }
+
     pub fn add(
         &mut self,
         path: &Path,

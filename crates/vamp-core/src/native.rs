@@ -284,7 +284,7 @@ pub fn request(request: Request) -> Result<Value> {
     if request.operation == "init" {
         let name = request.name.as_deref().context("name is required")?;
         let library = Library::init(&request.home, name, request.path.as_deref(), None)?;
-        return context_value(&request.home, name, &library.context);
+        return context_value(&request.home, &library_context_name(name.trim())?, &library.context);
     }
     #[cfg(feature = "remote")]
     if let Some(value) = super::native_remote::request(&request)? {
@@ -837,7 +837,7 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
 }
 
 /// Derivatives are optional and regenerable: failures leave the asset without them.
-fn generate_reps(library: &mut Library, asset: &Asset, helper: Option<&Path>) {
+pub(crate) fn generate_reps(library: &mut Library, asset: &Asset, helper: Option<&Path>) {
     let Some(helper) = helper else { return };
     if !asset.original.mime.starts_with("image/") && !asset.original.mime.starts_with("video/") {
         return;
@@ -861,6 +861,11 @@ pub(crate) fn expand(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     entries.sort();
     for entry in entries {
+        // Do not follow directory symlinks (including cycles), or open pipes/devices.
+        let kind = fs::symlink_metadata(&entry)?.file_type();
+        if !kind.is_dir() && !kind.is_file() {
+            continue;
+        }
         if entry
             .file_name()
             .is_some_and(|n| n.to_string_lossy().starts_with('.'))

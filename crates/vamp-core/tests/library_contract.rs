@@ -11,6 +11,58 @@ fn library() -> (TempDir, Library, std::path::PathBuf) {
     (dir, lib, source)
 }
 
+#[cfg(feature = "native")]
+#[test]
+fn readable_names_keep_display_names_and_detect_context_collisions() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    let lib = Library::init(&home, "Edge City", None, None).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(lib.state_dir.join("library.json")).unwrap()).unwrap();
+    assert_eq!(manifest["display_name"], "Edge City");
+    assert_eq!(vamp_core::load_config(&home).unwrap().current.as_deref(), Some("edge-city"));
+    assert!(Library::open(&home, Some("edge-city")).is_ok());
+    assert!(Library::init(&home, "Edge-City!", None, None).is_err());
+    assert!(Library::init(&home, "   ", None, None).is_err());
+    assert!(Library::init(&home, &"x".repeat(65), None, None).is_err());
+    let contexts = vamp_core::native::request(serde_json::from_value(serde_json::json!({
+        "operation":"contexts", "home":home
+    })).unwrap()).unwrap();
+    assert!(contexts.to_string().contains("Edge City"));
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn folder_intake_recurses_reports_progress_and_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    let source = dir.path().join("source");
+    fs::create_dir_all(source.join("nested/deeper")).unwrap();
+    fs::create_dir_all(source.join(".hidden")).unwrap();
+    fs::write(source.join("one.txt"), b"one").unwrap();
+    fs::write(source.join("nested/two.txt"), b"two").unwrap();
+    fs::write(source.join("nested/deeper/three.txt"), b"three").unwrap();
+    fs::write(source.join(".hidden/skip.txt"), b"skip").unwrap();
+    fs::write(source.join(".skip.txt"), b"skip").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&source, source.join("nested/cycle")).unwrap();
+    let mut lib = Library::init(&home, "refs", None, None).unwrap();
+    let mut progress = Vec::new();
+    let result = lib.add_folder_with(&source, Metadata::default(), |done, total, _| {
+        progress.push((done, total));
+    }).unwrap();
+    assert_eq!(progress, [(1, 3), (2, 3), (3, 3)]);
+    assert_eq!(result["cataloged"], 3);
+    assert_eq!(result["failed"], 0);
+    let again = lib.add_folder_with(&source, Metadata::default(), |_, _, _| {}).unwrap();
+    assert_eq!(again["cataloged"], 3);
+    fs::write(source.join("one.txt"), b"changed").unwrap();
+    let changed = lib.add_folder_with(&source, Metadata::default(), |_, _, _| {}).unwrap();
+    assert_eq!(changed["failed"], 1);
+    assert_eq!(changed["cataloged"], 2);
+    assert_eq!(fs::read(source.join("one.txt")).unwrap(), b"changed");
+}
+
 #[test]
 fn rejected_state_location_never_creates_files_inside_original_storage() {
     let dir = TempDir::new().unwrap();
