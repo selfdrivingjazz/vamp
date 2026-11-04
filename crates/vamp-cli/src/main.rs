@@ -924,6 +924,14 @@ enum JobCommand {
         /// processor for this and later runs, instead of starting one per job.
         #[arg(long)]
         warm: bool,
+        /// Inactivity timeout for a newly started warm server (default: 900 seconds).
+        #[arg(long, requires = "warm", value_parser = clap::value_parser!(u64).range(1..=86400))]
+        idle_seconds: Option<u64>,
+    },
+    /// Stop this library's warm processor servers, including an in-flight model load.
+    StopWarm {
+        #[arg(long)]
+        processor: Option<String>,
     },
     /// Continuously drain queued jobs; emit JSON lines for nonempty batches and continue after job failures.
     Watch {
@@ -997,7 +1005,7 @@ fn command_tree(command: &clap::Command) -> Value {
         let parser = arg.get_value_parser();
         let kind = if matches!(arg.get_action(), clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Help | clap::ArgAction::HelpShort | clap::ArgAction::HelpLong | clap::ArgAction::Version) { "boolean" }
             else { match arg.get_id().as_str() {
-                "limit" | "offset" | "after" | "expected_revision" | "columns" | "cell_size" | "interval_seconds" => "integer",
+                "limit" | "offset" | "after" | "expected_revision" | "columns" | "cell_size" | "interval_seconds" | "idle_seconds" => "integer",
                 "home" | "original_root" | "state_dir" | "source" | "path" | "metadata" | "patch" | "output" | "spec" | "headers_file" => "path",
                 _ => "string",
             }};
@@ -1707,16 +1715,34 @@ fn execute(cli: Cli) -> Result<Value> {
                     JobCommand::List { status, limit } => Ok(serde_json::to_value(
                         library.jobs(status.as_deref(), limit)?,
                     )?),
-                    JobCommand::Run { limit, warm } => {
+                    JobCommand::Run { limit, warm, idle_seconds } => {
                         ensure!(limit > 0, "job run limit must be positive");
                         if warm {
                             library.warm = warm_processors(&home)?;
+                            library.warm_idle_seconds = idle_seconds.unwrap_or(vamp_core::SERVE_IDLE_SECONDS);
                         }
                         let result = library.run_jobs(limit)?;
                         if result.get("failed").and_then(Value::as_u64).unwrap_or(0) > 0 {
                             bail!("one or more jobs or uploads failed: {result}");
                         }
                         Ok(result)
+                    }
+                    JobCommand::StopWarm { processor } => {
+                        #[cfg(unix)]
+                        {
+                            let names = match processor {
+                                Some(name) => vec![name],
+                                None => library.processors()?.into_iter().map(|p| p.name).collect(),
+                            };
+                            let mut stopped = Vec::new();
+                            for name in names {
+                                let (socket, _) = library.warm_paths(&name)?;
+                                if vamp_core::stop_server(&socket)? { stopped.push(name); }
+                            }
+                            Ok(json!({"stopped":stopped}))
+                        }
+                        #[cfg(not(unix))]
+                        bail!("warm processors require Unix sockets")
                     }
                     JobCommand::Watch {
                         interval_seconds,

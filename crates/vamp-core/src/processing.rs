@@ -311,11 +311,34 @@ impl Library {
         Ok(job)
     }
     /// Socket and log of a warm processor server for this library (`Library::warm`).
-    pub fn warm_paths(&self, name: &str) -> (PathBuf, PathBuf) {
-        (
-            self.state_dir.join(format!("{name}.sock")),
-            self.state_dir.join(format!("{name}.log")),
-        )
+    pub fn warm_paths(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
+        validate_name(name)?;
+        let socket = self.state_dir.join(format!("{name}.sock"));
+        if socket.as_os_str().as_encoded_bytes().len() < 100 {
+            return Ok((socket, self.state_dir.join(format!("{name}.log"))));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+            let uid = unsafe { libc::geteuid() };
+            // Darwin's per-user TMPDIR may itself exceed sun_path, so use short /tmp.
+            let directory = Path::new("/tmp").join(format!("vamp-warm-{uid}"));
+            match fs::DirBuilder::new().mode(0o700).create(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            let metadata = fs::symlink_metadata(&directory)?;
+            ensure!(metadata.is_dir() && !metadata.file_type().is_symlink() &&
+                metadata.uid() == uid && metadata.mode() & 0o077 == 0,
+                "warm server directory must be private and owned by this user");
+            let identity = format!("{}:{name}", self.state_dir.display());
+            let digest = blake3::hash(identity.as_bytes()).to_hex();
+            return Ok((directory.join(format!("{}.sock", &digest[..24])),
+                directory.join(format!("{}.log", &digest[..24]))));
+        }
+        #[cfg(not(unix))]
+        bail!("warm processors require Unix sockets");
     }
     pub fn run_jobs(&mut self, limit: usize) -> Result<Value> {
         ensure!((1..=1000).contains(&limit), "job run limit must be 1–1000");
@@ -630,8 +653,8 @@ impl Library {
         };
         #[cfg(unix)]
         let response = if self.warm.contains(&spec.name) {
-            let (socket, log) = self.warm_paths(&spec.name);
-            crate::run_served(&spec.command, &request, spec.timeout_seconds, &socket, &log)?
+            let (socket, log) = self.warm_paths(&spec.name)?;
+            crate::run_served(&spec.command, &request, spec.timeout_seconds, &socket, &log, self.warm_idle_seconds)?
         } else {
             run_tool(&spec.command, &request, spec.timeout_seconds)?
         };

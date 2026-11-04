@@ -427,6 +427,7 @@ impl Library {
                             &spec.command,
                             &socket,
                             &self.state_dir.join("embedder.log"),
+                            tools::SERVE_IDLE_SECONDS,
                         );
                     }
                 }

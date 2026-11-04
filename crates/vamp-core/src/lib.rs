@@ -35,8 +35,8 @@ pub use embeddings::{EmbedderSpec, EmbeddingState, EmbeddingUnavailable, Scored}
 pub use processing::{ClaimedJob, LEASE_SECONDS, MAX_LEASE_ATTEMPTS};
 mod tools;
 #[cfg(unix)]
-pub use tools::run_served;
-pub use tools::run_tool;
+pub use tools::{run_served, stop_server};
+pub use tools::{run_tool, SERVE_IDLE_SECONDS};
 mod storage;
 pub mod fetching;
 pub mod io;
@@ -262,6 +262,8 @@ pub struct Library {
     /// Processors whose commands accept `--serve`: `run_jobs` keeps each loaded in one server
     /// (a Unix socket in the state dir) instead of one cold process per job. Empty by default.
     pub warm: std::collections::HashSet<String>,
+    /// Inactivity timeout for newly started warm servers.
+    pub warm_idle_seconds: u64,
 }
 impl Library {
     pub fn init(
@@ -433,6 +435,7 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
             state_dir,
             conn,
             warm: Default::default(),
+            warm_idle_seconds: tools::SERVE_IDLE_SECONDS,
         })
     }
     /// Recursively reference a folder using the same intake and derivatives as the app.

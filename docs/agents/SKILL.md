@@ -95,6 +95,7 @@ Read `revision` from `inspect`, then pass it so a concurrent edit fails with a c
 ## Ingest
 - `vamp media add <path> [--name NAME] [--metadata meta.json]` — catalog a file by reference (the file is hashed, never moved or modified).
 - Captions, model tags and embeddings are produced asynchronously by processors (installed with `vamp setup install search|captions`; often on a GPU worker); `vamp jobs list` shows progress. Do not run `vamp jobs run`/`watch` unless asked.
+- `vamp jobs run --warm [--idle-seconds N] [--limit N]` — reuse installed model servers between batches (default inactivity exit: 900 seconds, set when started). `vamp jobs stop-warm [--processor NAME]` stops this library's warm servers. Run or stop processing only when asked.
 - Library import (`vamp import library PATH`) is an owner operation — do not run it.
 
 ## Explorations (research missions for the owner)

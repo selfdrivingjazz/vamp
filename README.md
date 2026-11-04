@@ -71,6 +71,12 @@ After installing, each new processor runs once on a sample image to measure this
 seconds per item. The extra's processors are then registered in the active (or `--context`)
 library, keeping an existing registration's `placement`, and the library's existing items are
 queued. Queued items are processed while `vamp serve` runs, or by `vamp jobs run --limit N`.
+Use `vamp jobs run --warm --idle-seconds 60 --limit N` to keep installed model processors
+loaded between batches (default idle timeout: 900 seconds). The timeout applies when the
+server starts; existing servers keep their original timeout. `vamp jobs stop-warm`
+stops this library's warm model servers, or use `--processor siglip-embedding` to stop
+only search. Socket files are owner-only; long state paths use a private per-user
+temporary directory. Concurrent local job drains retain the existing worker-lock refusal.
 Choices are kept in `$VAMP_HOME/setup.json`; `vamp init` registers the installed extras in
 every new library. A GPU machine can instead run them for another machine's library with
 `vamp worker`.

@@ -310,6 +310,7 @@ fn process(shared: &Shared, claim: &Value) -> Result<bool> {
                 spec.timeout_seconds,
                 &shared.servers.join(format!("{processor}.sock")),
                 &shared.servers.join(format!("{processor}.log")),
+                vamp_core::SERVE_IDLE_SECONDS,
             )?
         } else {
             vamp_core::run_tool(&spec.command, &request, spec.timeout_seconds)?

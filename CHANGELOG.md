@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Warm job batches accept `--idle-seconds N` (default 900); `vamp jobs stop-warm
+  [--processor NAME]` promptly stops this library's model servers. Warm starts are locked
+  across processes, recover stale sockets, and use private short socket paths for long
+  library directories.
 - `vamp init "Edge City" [DIR]` keeps the display name and derives the context key
   `edge-city`; `--name` also accepts display names.
 - `vamp media add DIR` adds non-hidden files recursively, with progress on stderr and a
