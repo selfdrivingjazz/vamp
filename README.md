@@ -351,7 +351,7 @@ content or credentials. Transport failures use the fixed `transport_error` categ
 | `tools/` | | Synthetic library fixtures for tests and note-card glyph atlases |
 | `examples/` | | Bounded library import and catalog examples |
 
-The protocol version is `0.1`; the Rust packages are `0.4.1`. Only `vamp-protocol` is meant
+The protocol version is `0.1`; the Rust packages are `0.4.2`. Only `vamp-protocol` is meant
 for crates.io; the others are `publish = false`.
 
 ## Build and test

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 — 2026-11-04
 
 - Warm job batches accept `--idle-seconds N` (default 900); `vamp jobs stop-warm
   [--processor NAME]` promptly stops this library's model servers. Warm starts are locked
