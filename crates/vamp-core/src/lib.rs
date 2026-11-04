@@ -259,6 +259,9 @@ pub struct Library {
     pub context: Context,
     pub state_dir: PathBuf,
     pub(crate) conn: Connection,
+    /// Processors whose commands accept `--serve`: `run_jobs` keeps each loaded in one server
+    /// (a Unix socket in the state dir) instead of one cold process per job. Empty by default.
+    pub warm: std::collections::HashSet<String>,
 }
 impl Library {
     pub fn init(
@@ -429,6 +432,7 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
             context,
             state_dir,
             conn,
+            warm: Default::default(),
         })
     }
     /// Recursively reference a folder using the same intake and derivatives as the app.

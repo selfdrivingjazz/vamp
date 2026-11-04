@@ -920,6 +920,10 @@ enum JobCommand {
     Run {
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Keep installed model processors (`vamp setup install`) loaded in one server per
+        /// processor for this and later runs, instead of starting one per job.
+        #[arg(long)]
+        warm: bool,
     },
     /// Continuously drain queued jobs; emit JSON lines for nonempty batches and continue after job failures.
     Watch {
@@ -1703,8 +1707,11 @@ fn execute(cli: Cli) -> Result<Value> {
                     JobCommand::List { status, limit } => Ok(serde_json::to_value(
                         library.jobs(status.as_deref(), limit)?,
                     )?),
-                    JobCommand::Run { limit } => {
+                    JobCommand::Run { limit, warm } => {
                         ensure!(limit > 0, "job run limit must be positive");
+                        if warm {
+                            library.warm = warm_processors(&home)?;
+                        }
                         let result = library.run_jobs(limit)?;
                         if result.get("failed").and_then(Value::as_u64).unwrap_or(0) > 0 {
                             bail!("one or more jobs or uploads failed: {result}");
@@ -2125,4 +2132,20 @@ mod tests {
         }
         assert!(failures.is_empty(), "manual commands that do not parse:\n{}", failures.join("\n"));
     }
+}
+
+/// Installed model processors that accept `--serve` (`jobs run --warm`).
+#[cfg(feature = "remote")]
+fn warm_processors(home: &Path) -> Result<std::collections::HashSet<String>> {
+    Ok(setup::model_processors(home)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, serve)| *serve)
+        .map(|(spec, _)| spec.name)
+        .collect())
+}
+
+#[cfg(not(feature = "remote"))]
+fn warm_processors(_home: &Path) -> Result<std::collections::HashSet<String>> {
+    bail!("jobs run --warm needs a build with the remote feature")
 }

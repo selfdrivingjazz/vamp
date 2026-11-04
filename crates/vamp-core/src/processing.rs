@@ -310,6 +310,13 @@ impl Library {
         tx.commit()?;
         Ok(job)
     }
+    /// Socket and log of a warm processor server for this library (`Library::warm`).
+    pub fn warm_paths(&self, name: &str) -> (PathBuf, PathBuf) {
+        (
+            self.state_dir.join(format!("{name}.sock")),
+            self.state_dir.join(format!("{name}.log")),
+        )
+    }
     pub fn run_jobs(&mut self, limit: usize) -> Result<Value> {
         ensure!((1..=1000).contains(&limit), "job run limit must be 1–1000");
         let lock = OpenOptions::new()
@@ -621,6 +628,14 @@ impl Library {
             event_id: Some(job.event_id.clone()),
             ..ToolRequest::default()
         };
+        #[cfg(unix)]
+        let response = if self.warm.contains(&spec.name) {
+            let (socket, log) = self.warm_paths(&spec.name);
+            crate::run_served(&spec.command, &request, spec.timeout_seconds, &socket, &log)?
+        } else {
+            run_tool(&spec.command, &request, spec.timeout_seconds)?
+        };
+        #[cfg(not(unix))]
         let response = run_tool(&spec.command, &request, spec.timeout_seconds)?;
         if spec.input == "original" {
             ensure!(
