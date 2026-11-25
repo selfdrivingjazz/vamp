@@ -39,6 +39,9 @@ JSON errors for missing arguments. `vamp guide` prints the operating manual
 (`docs/agents/SKILL.md`, also usable as an agent skill), `vamp commands` the full argument
 tree and `vamp schema` the JSON schemas.
 
+For the choices to make before installing, service setup and connecting another device,
+see **Set up a new library with a person** in `vamp guide`.
+
 ## Optional extras: smart search and captions
 
 The binaries carry no ML runtime. `vamp setup` (`vamp setup plan`) is a read-only report of
@@ -77,9 +80,24 @@ server starts; existing servers keep their original timeout. `vamp jobs stop-war
 stops this library's warm model servers, or use `--processor siglip-embedding` to stop
 only search. Socket files are owner-only; long state paths use a private per-user
 temporary directory. Concurrent local job drains retain the existing worker-lock refusal.
-Choices are kept in `$VAMP_HOME/setup.json`; `vamp init` registers the installed extras in
-every new library. A GPU machine can instead run them for another machine's library with
-`vamp worker`.
+Choices are kept in `$VAMP_HOME/setup.json`; `vamp init` registers installed extras
+with their recorded versions. A GPU machine can run processors for another machine's
+library with `vamp worker`.
+
+`recommended` is a bundled, versioned toolkit. `vamp setup plan` shows the profile
+and pinned model revisions; a library keeps its own processor and query-model
+registrations. v1 uses SigLIP base and Florence-2 base with the same names and weights
+as 0.4.2. A newer VAMP can recommend newer versions without switching a library's
+existing processors. Pass `--profile VERSION` with named components to select a bundled
+version other than the current one. To switch a library, pick a component explicitly:
+
+```sh
+vamp --context my-refs setup install search --upgrade
+```
+
+Changing the search model queues fresh embeddings from the new processor. Old and new
+embedding spaces have separate keys; queries use only the active model, so results
+rebuild as jobs finish. Existing originals and older observations are not deleted.
 
 Video thumbnails and previews use the first displayed frame as a poster, then the same
 JPEG representations and WebP grid tiers as images. This requires the optional `ffmpeg`
@@ -166,13 +184,29 @@ vamp join http://authority-host:7777 --token TOKEN   # attach a replica and sync
 vamp sync                                            # pull later changes (--watch keeps going)
 ```
 
-The Vampire Mac app connects with **Connect to Server…** (mode *URL + token*); the iOS app
-with **Connect via Tailnet** (host, port, optional token). On a [Tailscale](https://tailscale.com) network, `vamp serve --bind
-tailnet` binds this machine's tailnet address and admits allowlisted identities without a
-token (`vamp-server allow --user LOGIN` / `--tag tag:NAME`; by default this machine's own
-Tailscale user). `vamp-server install-agent` writes a macOS launch agent; on Linux run
-`vamp-server serve` under systemd. `vamp storage set s3 …` keeps originals in an
+The Vampire Mac app offers running local servers and nearby DNS-SD servers in its welcome
+and **Connect to Server…** sheet. It checks the server's ID before offering it and doesn't
+connect without a choice. The iOS app uses **Connect via Tailnet** (host, port, optional token).
+On [Tailscale](https://tailscale.com), `vamp serve --bind tailnet` binds to this machine's
+tailnet address and admits allowlisted identities without a token (`vamp-server allow
+--user LOGIN` / `--tag tag:NAME`; by default this machine's Tailscale user).
+`vamp-server install-service` writes a user service on Linux (systemd) or macOS (launchd)
+and prints the command to start it. `vamp storage set s3 …` keeps originals in an
 S3-compatible bucket through `vamp-store` (installed beside `vamp`).
+
+- Local discovery uses one owner-only JSON file per server PID under
+  `$XDG_STATE_HOME/vamp/servers` (Linux default `~/.local/state/vamp/servers`; macOS
+  `~/Library/Application Support/VAMP/servers`). These are per-user runtime records,
+  separate from any catalog location. Clients check the PID and the running endpoint;
+  a later server start can prune records for dead processes.
+- Add `--advertise` to a LAN or Tailscale bind to announce `_vamp._tcp` on the local link.
+  TXT carries the library ID, display name, host, and auth mode, and a Tailscale bind
+  also announces its tailnet address. Local multicast doesn't cross the tailnet, so
+  devices away from this LAN still use the server address. Advertising does not change
+  who is allowed to connect.
+- `GET /v1/discovery` is an unauthenticated identity check, not an access grant. Neither it
+  nor the registry nor DNS-SD contains credentials or catalog paths; reading and changing
+  catalog contents still require normal authorization.
 
 ## Crash and error reports (optional, off by default)
 

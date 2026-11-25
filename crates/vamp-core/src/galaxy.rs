@@ -307,7 +307,7 @@ impl Library {
         let Some((model, dim)) = self
             .conn
             .query_row(
-                "SELECT e.model,e.dim FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 GROUP BY e.model,e.dim ORDER BY e.model=?1 DESC,count(*) DESC LIMIT 1",
+                "SELECT e.model,e.dim FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 WHERE (?1 IS NULL OR e.model=?1) GROUP BY e.model,e.dim ORDER BY count(*) DESC LIMIT 1",
                 [preferred],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )

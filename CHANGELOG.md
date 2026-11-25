@@ -8,6 +8,13 @@
   replica that had been asleep for twenty minutes had to download the whole catalog again
   before its next edit finished.
 - A replica edit reports the catch-up sync it waits for in `sync_status`.
+- `vamp guide` walks an agent through setting up a library for someone. `vamp init
+  --no-extras` skips inherited processors; `vamp-server install-service` writes a user
+  service on Linux or macOS.
+- Running servers register per user for local discovery. `serve --advertise` also announces
+  the library to nearby Vampire Macs via DNS-SD, without sharing any credentials.
+- `vamp setup install recommended` uses a bundled, versioned toolkit. Libraries keep
+  their registered processors and embedding model unless explicitly upgraded.
 
 ## 0.4.2 — 2026-11-04
 

@@ -1,11 +1,8 @@
 //! `vamp setup`: optional extras for this machine.
 //!
-//! `plan` (read-only) reports machine facts, each extra's state, size and speed, and what this
-//! machine should install. `install` sets up smart search (SigLIP image and text embeddings)
-//! and captions (Florence-2 descriptions and tags) in one uv environment at
-//! `<home>/tools/models`, times one cold run of each processor, registers the processors in the
-//! active (or --context) library and queues its existing items. `decline` records that an
-//! extra is not wanted. Choices live in `<home>/setup.json`.
+//! `plan` reports the recommended toolkit and its machine and library status. `install`
+//! prepares its pinned components if needed, registers them in the selected authority,
+//! and queues new processors for existing items. Choices live in `<home>/setup.json`.
 
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -23,13 +20,10 @@ use std::{
 use vamp_core::{EmbedderSpec, Library};
 use vamp_protocol::{ProcessorSpec, ToolRequest};
 
-const FLORENCE_SCRIPT: &str = include_str!("../../../processors/florence/processor.py");
-const SIGLIP_SCRIPT: &str = include_str!("../../../processors/siglip/processor.py");
-const PYPROJECT: &str = include_str!("../../../processors/pyproject.toml");
-const SIGLIP_MODEL: &str = "google/siglip-base-patch16-224";
-const SIGLIP_REVISION: &str = "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed";
-const FLORENCE_MODEL: &str = "florence-community/Florence-2-base";
-const FLORENCE_REVISION: &str = "00921df66db728a9ceb750f5eca43e5c203a2051";
+mod profile;
+use profile::{Profile, RECOMMENDED, SUPPORTED};
+#[cfg(test)]
+use profile::{FLORENCE_SCRIPT, SIGLIP_MODEL, SIGLIP_SCRIPT};
 const DEVICES: [&str; 4] = ["auto", "cpu", "cuda", "mps"];
 const CHOICES_FILE: &str = "setup.json";
 
@@ -85,38 +79,10 @@ impl Extra {
             Self::Captions => "descriptions and tags for every image",
         }
     }
-    fn script(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Search => ("siglip.py", SIGLIP_SCRIPT),
-            Self::Captions => ("florence.py", FLORENCE_SCRIPT),
-        }
-    }
-    fn manifest(self) -> &'static str {
-        match self {
-            Self::Search => "siglip.json",
-            Self::Captions => "florence.json",
-        }
-    }
-    fn model(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Search => (SIGLIP_MODEL, SIGLIP_REVISION),
-            Self::Captions => (FLORENCE_MODEL, FLORENCE_REVISION),
-        }
-    }
     fn weights(self) -> u64 {
         match self {
             Self::Search => SIGLIP_WEIGHTS,
             Self::Captions => FLORENCE_WEIGHTS,
-        }
-    }
-    /// (processor name, extra arguments, timeout seconds)
-    fn processors(self) -> &'static [(&'static str, &'static [&'static str], u64)] {
-        match self {
-            Self::Search => &[("siglip-embedding", &[], 300)],
-            Self::Captions => &[
-                ("florence-description", &[], 600),
-                ("florence-tags", &["--task", "tags"], 600),
-            ],
         }
     }
 }
@@ -176,27 +142,31 @@ fn absolute(home: &Path) -> Result<PathBuf> {
     })
 }
 
-/// The shared model environment `<home>/tools/models`: one uv venv, a script and a weights
-/// manifest per extra, and `device`, the device its PyTorch build was installed for.
+/// Each profile has its own runtime and manifests; v1 owns the original 0.4.2 directory.
 struct Models {
     root: PathBuf,
     python: PathBuf,
+    profile: &'static Profile,
 }
 impl Models {
-    fn new(home: &Path) -> Self {
-        let root = home.join("tools/models");
+    fn new(home: &Path, profile: &'static Profile) -> Self {
+        let root = if profile.version == 1 {
+            home.join("tools/models")
+        } else {
+            home.join("tools/toolkits").join(profile.version.to_string())
+        };
         let python = if cfg!(windows) {
             root.join("Scripts/python.exe")
         } else {
             root.join("bin/python")
         };
-        Self { root, python }
+        Self { root, python, profile }
     }
     fn script(&self, extra: Extra) -> PathBuf {
-        self.root.join(extra.script().0)
+        self.root.join(self.profile.component(extra).script)
     }
     fn manifest(&self, extra: Extra) -> PathBuf {
-        self.root.join(extra.manifest())
+        self.root.join(self.profile.component(extra).manifest)
     }
     fn recorded_device(&self) -> Option<String> {
         fs::read_to_string(self.root.join("device"))
@@ -211,23 +181,53 @@ impl Models {
     }
     /// Runtime, a script (of any vamp version) and a verified weights manifest are present.
     fn prepared(&self, extra: Extra) -> bool {
-        let (model, revision) = extra.model();
         self.python.is_file()
             && self.script(extra).is_file()
-            && manifest_present(&self.manifest(extra), model, revision)
+            && manifest_present(&self.manifest(extra), self.profile.component(extra))
     }
     /// Prepared, with this vamp's script.
     fn installed(&self, extra: Extra) -> bool {
         self.prepared(extra)
-            && fs::read_to_string(self.script(extra)).is_ok_and(|text| text == extra.script().1)
+            && fs::read_to_string(self.script(extra))
+                .is_ok_and(|text| text == self.profile.component(extra).source)
     }
-    /// Replace the scripts of prepared extras written by an earlier vamp with this vamp's.
+    fn write_script(&self, extra: Extra) -> Result<()> {
+        self.check_manifest_identity(extra)?;
+        let script = self.script(extra);
+        let temporary = script.with_extension(format!("{}.tmp", std::process::id()));
+        let result = fs::write(&temporary, self.profile.component(extra).source)
+            .and_then(|()| fs::rename(&temporary, &script));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.with_context(|| format!("cannot write {}", script.display()))
+    }
+    fn check_manifest_identity(&self, extra: Extra) -> Result<()> {
+        let path = self.manifest(extra);
+        match read_manifest(&path)? {
+            None => {
+                let script = self.script(extra);
+                match fs::read_to_string(&script) {
+                    Ok(text) => ensure!(text == self.profile.component(extra).source,
+                        "cannot verify the model revision of {}", script.display()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).with_context(|| format!("cannot read {}", script.display())),
+                }
+                Ok(())
+            }
+            Some(state) => {
+                ensure!(manifest_matches(&state, self.profile.component(extra)),
+                    "{} belongs to a different model or revision", path.display());
+                Ok(())
+            }
+        }
+    }
+    /// Keep legacy worker installations usable, but never refresh a foreign manifest.
+    #[cfg(feature = "remote")]
     fn refresh_scripts(&self) -> Result<()> {
         for extra in Extra::ALL {
             if self.prepared(extra) && !self.installed(extra) {
-                let script = self.script(extra);
-                fs::write(&script, extra.script().1)
-                    .with_context(|| format!("cannot update {}", script.display()))?;
+                self.write_script(extra)?;
             }
         }
         Ok(())
@@ -247,17 +247,15 @@ impl Models {
     /// The extra's processors. Their commands also accept --serve --socket PATH --idle-seconds
     /// N, which `vamp worker` uses to keep them warm.
     fn specs(&self, extra: Extra, device: &str) -> Result<Vec<ProcessorSpec>> {
-        extra
-            .processors()
-            .iter()
-            .map(|&(name, arguments, timeout_seconds)| {
+        self.profile.component(extra).processors.iter()
+            .map(|processor| {
                 Ok(ProcessorSpec {
-                    name: name.into(),
+                    name: processor.name.into(),
                     events: vec!["representation_ready".into()],
-                    command: self.command(extra, device, arguments)?,
+                    command: self.command(extra, device, processor.arguments)?,
                     input: "preview".into(),
                     output: "observation".into(),
-                    timeout_seconds,
+                    timeout_seconds: processor.timeout,
                     placement: Default::default(),
                 })
             })
@@ -269,27 +267,37 @@ impl Models {
     fn embedder(&self) -> Result<EmbedderSpec> {
         Ok(EmbedderSpec {
             command: self.command(Extra::Search, "auto", &[])?,
-            model: SIGLIP_MODEL.into(),
+            model: self.profile.component(Extra::Search).embedding_model
+                .context("search profile has no embedding key")?.into(),
             timeout_seconds: 120,
             serve: true,
         })
     }
 }
 
-fn manifest_present(manifest: &Path, model: &str, revision: &str) -> bool {
-    fs::read(manifest)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .is_some_and(|state| {
-            state["model"].as_str() == Some(model)
-                && state["revision"].as_str() == Some(revision)
-                && state["path"].as_str().is_some_and(|path| {
-                    let path = Path::new(path);
-                    path.join("config.json").is_file()
-                        && (path.join("model.safetensors").is_file()
-                            || path.join("model.safetensors.index.json").is_file())
-                })
+fn read_manifest(path: &Path) -> Result<Option<Value>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid {}", path.display()))?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+fn manifest_matches(state: &Value, component: &profile::Component) -> bool {
+    state["model"].as_str() == Some(component.model)
+        && state["revision"].as_str() == Some(component.revision)
+}
+
+fn manifest_present(path: &Path, component: &profile::Component) -> bool {
+    read_manifest(path).ok().flatten().is_some_and(|state| {
+        manifest_matches(&state, component) && state["path"].as_str().is_some_and(|path| {
+            let path = Path::new(path);
+            path.join("config.json").is_file()
+                && (path.join("model.safetensors").is_file()
+                    || path.join("model.safetensors.index.json").is_file())
         })
+    })
 }
 
 /// `cuda` with an NVIDIA GPU, else `cpu` (one-shot Florence was slower on MPS than on the CPU
@@ -580,9 +588,16 @@ struct Choice {
     state: String,
     /// RFC 3339 time of the choice.
     at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_version: Option<u32>,
     /// Measured by `install`: one cold run of each of the extra's processors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seconds_per_item: Option<f64>,
+}
+impl Choice {
+    fn profile_version(&self) -> u32 {
+        self.profile_version.unwrap_or(1)
+    }
 }
 impl Choices {
     fn load(home: &Path) -> Result<Self> {
@@ -630,13 +645,14 @@ impl Choices {
     fn get(&self, extra: Extra) -> Option<&Choice> {
         self.extras.get(extra.name())
     }
-    fn record(&mut self, extra: Extra, state: &str, seconds_per_item: Option<f64>) {
+    fn record(&mut self, extra: Extra, state: &str, seconds_per_item: Option<f64>, version: u32) {
         let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.extras.insert(
             extra.name().into(),
             Choice {
                 state: state.into(),
                 at,
+                profile_version: (state == "installed" && version != 1).then_some(version),
                 seconds_per_item,
             },
         );
@@ -648,6 +664,7 @@ struct Status {
     extra: Extra,
     /// `installed`, `available` or `declined`.
     state: &'static str,
+    registration: Option<&'static str>,
     recommended: bool,
     why: String,
 }
@@ -673,29 +690,69 @@ fn rule(extra: Extra, machine: &Machine) -> (bool, String) {
     (true, why.into())
 }
 
-fn assess(machine: &Machine, models: &Models, choices: &Choices) -> Vec<Status> {
-    Extra::ALL
-        .into_iter()
-        .map(|extra| {
-            let state = if models.installed(extra) {
-                "installed"
-            } else if choices
-                .get(extra)
-                .is_some_and(|choice| choice.state == "declined")
-            {
-                "declined"
-            } else {
-                "available"
-            };
-            let (fits, why) = rule(extra, machine);
-            Status {
-                extra,
-                state,
-                recommended: fits && state == "available",
-                why,
-            }
+struct Registrations {
+    processors: BTreeMap<String, ProcessorSpec>,
+    embedder: Option<EmbedderSpec>,
+}
+
+impl Registrations {
+    fn read(library: &Library) -> Result<Self> {
+        Ok(Self {
+            processors: library.processors()?.into_iter()
+                .map(|spec| (spec.name.clone(), spec)).collect(),
+            embedder: library.embedder()?,
         })
-        .collect()
+    }
+
+    fn superseded(&self, profile: &Profile, extra: Extra) -> Vec<&ProcessorSpec> {
+        let current = profile.component(extra);
+        self.processors.values()
+            .filter(|old| !current.processors.iter().any(|p| p.name == old.name))
+            .filter(|old| SUPPORTED.iter().any(|prior| prior.component(extra).processors
+                .iter().any(|p| p.name == old.name)))
+            .collect()
+    }
+
+    fn state(&self, profile: &Profile, extra: Extra) -> &'static str {
+        let component = profile.component(extra);
+        if !self.superseded(profile, extra).is_empty()
+            || component.embedding_model.is_some_and(|model| {
+                self.embedder.as_ref().is_some_and(|spec| spec.model != model)
+            })
+        {
+            return "different";
+        }
+        let processors_ready = component.processors.iter()
+            .all(|p| self.processors.contains_key(p.name));
+        let embedder_ready = component.embedding_model.is_none() || self.embedder.is_some();
+        if processors_ready && embedder_ready { "registered" } else { "missing" }
+    }
+}
+
+fn assess(
+    machine: &Machine,
+    models: &Models,
+    choices: &Choices,
+    registrations: Option<&Registrations>,
+) -> Vec<Status> {
+    Extra::ALL.into_iter().map(|extra| {
+        let installed = models.installed(extra);
+        let declined = choices.get(extra).is_some_and(|choice| choice.state == "declined");
+        let state = if installed { "installed" } else if declined { "declined" } else { "available" };
+        let registration = registrations.map(|r| r.state(models.profile, extra));
+        let (fits, mut why) = rule(extra, machine);
+        let recommended = !declined && match registration {
+            Some("missing") => installed || fits,
+            Some(_) => false,
+            None => !installed && fits,
+        };
+        if registration == Some("different") {
+            why = "library uses a different processor or embedding model".into();
+        } else if installed && registration == Some("missing") {
+            why = "installed here, not registered in this library".into();
+        }
+        Status { extra, state, registration, recommended, why }
+    }).collect()
 }
 
 fn recommended(statuses: &[Status]) -> Vec<Extra> {
@@ -735,14 +792,18 @@ fn footprint(extra: Extra, device: &str, machine: &Machine, runtime_present: boo
 }
 
 /// The active (or --context) library: (context name, library).
-fn active_library(home: &Path, context: Option<&str>) -> Result<(String, Library)> {
+fn active_library(home: &Path, context: Option<&str>, read_only: bool) -> Result<(String, Library)> {
     let name = match context {
         Some(name) => name.to_owned(),
         None => vamp_core::load_config(home)?
             .current
             .context("no active context; run vamp init")?,
     };
-    let library = Library::open(home, Some(&name))?;
+    let library = if read_only {
+        Library::open_read_only(home, Some(&name))?
+    } else {
+        Library::open(home, Some(&name))?
+    };
     Ok((name, library))
 }
 
@@ -757,13 +818,16 @@ pub fn plan_text(home: &Path, context: Option<&str>) -> Result<String> {
 }
 
 fn plan_for(home: &Path, context: Option<&str>, machine: &Machine) -> Result<Value> {
-    let models = Models::new(home);
+    let models = Models::new(home, RECOMMENDED);
     let choices = Choices::load(home)?;
     let device = models
         .recorded_device()
         .unwrap_or_else(|| default_device(machine.nvidia()).into());
-    let library = active_library(home, context)
-        .ok()
+    let active = active_library(home, context, true).ok();
+    let registrations = active.as_ref()
+        .filter(|(_, library)| library.context.remote.is_none())
+        .map(|(_, library)| Registrations::read(library)).transpose()?;
+    let library = active.as_ref()
         .and_then(|(name, library)| {
             let items = library.sidebar().ok()?["all"].as_u64()?;
             Some(json!({"context":name, "library_id":library.context.library_id, "items":items}))
@@ -792,11 +856,12 @@ fn plan_for(home: &Path, context: Option<&str>, machine: &Machine) -> Result<Val
             "download_bytes":null, "disk_bytes":null, "seconds_per_item":null, "seconds_measured":false,
             "library_seconds":null}),
     ];
-    let statuses = assess(machine, &models, &choices);
+    let statuses = assess(machine, &models, &choices, registrations.as_ref());
     for status in &statuses {
         let extra = status.extra;
         let measured = choices
             .get(extra)
+            .filter(|choice| choice.profile_version() == models.profile.version)
             .and_then(|choice| choice.seconds_per_item);
         let seconds = measured.unwrap_or_else(|| estimate(extra, &device, machine));
         let (download, disk) = if status.state == "installed" {
@@ -806,7 +871,12 @@ fn plan_for(home: &Path, context: Option<&str>, machine: &Machine) -> Result<Val
         };
         extras.push(json!({"name":extra.name(), "title":extra.title(), "enables":extra.enables(),
             "installable":true, "state":status.state, "recommended":status.recommended, "why":status.why,
-            "hint":(status.state != "installed").then(|| format!("vamp setup install {}", extra.name())),
+            "registration":status.registration,
+            "hint":if status.registration == Some("different") {
+                Some(format!("vamp setup install {} --upgrade", extra.name()))
+            } else if status.state != "installed" || status.registration == Some("missing") {
+                Some(format!("vamp setup install {}", extra.name()))
+            } else { None },
             "download_bytes":download, "disk_bytes":disk, "seconds_per_item":(seconds * 10.0).round() / 10.0,
             "seconds_measured":measured.is_some(),
             "library_seconds":items.map(|items| (items as f64 * seconds).round() as u64)}));
@@ -820,10 +890,12 @@ fn plan_for(home: &Path, context: Option<&str>, machine: &Machine) -> Result<Val
     };
     Ok(json!({
         "home":home, "choices_file":home.join(CHOICES_FILE), "machine":machine.json(),
+        "profile":models.profile.json(),
         "tools":{"uv":find_uv(home), "ffmpeg":ffmpeg, "vamp_media":vamp_media},
         "device":device, "library":library, "extras":extras,
         "recommended":names(&|status| status.recommended),
-        "offered":names(&|status| status.state != "installed"),
+        "offered":names(&|status| status.registration != Some("different") &&
+            (status.state != "installed" || status.registration == Some("missing"))),
     }))
 }
 
@@ -901,6 +973,7 @@ fn render(plan: &Value) -> String {
         }
         _ => out.push_str("No library yet. Create one with vamp init --name NAME.\n"),
     }
+    let _ = writeln!(out, "Processor toolkit: recommended v{}", plan["profile"]["version"]);
     out.push('\n');
     for extra in plan["extras"].as_array().into_iter().flatten() {
         let state = extra["state"].as_str().unwrap_or("");
@@ -931,10 +1004,10 @@ fn render(plan: &Value) -> String {
                 "recommended: {}",
                 extra["why"].as_str().unwrap_or("")
             ));
-        } else if !matches!(state, "installed" | "ready") {
+        } else if !matches!(state, "installed" | "ready") || extra["registration"] == "different" {
             parts.extend(extra["why"].as_str().map(str::to_owned));
         }
-        if extra["installable"] == false {
+        if extra["installable"] == false || extra["registration"] == "different" {
             parts.extend(extra["hint"].as_str().map(str::to_owned));
         }
         let _ = writeln!(
@@ -964,7 +1037,7 @@ fn render(plan: &Value) -> String {
             offered.join("|")
         );
     } else {
-        out.push_str("Every extra is installed.\n");
+        out.push_str("No additional extras to install.\n");
     }
     out
 }
@@ -1037,44 +1110,70 @@ fn bench(specs: &[ProcessorSpec], sample: &Path) -> Result<Vec<(String, f64)>> {
         .collect()
 }
 
-/// Register `extras`' processors (and the SigLIP text embedder for search) in `library`,
-/// keeping each existing registration's placement. Only newly registered processors queue
-/// the library's existing items (those without a completed job). Returns (registered, backfill).
+fn ensure_compatible(
+    existing: &Registrations,
+    profile: &Profile,
+    extras: &[Extra],
+    upgrade: bool,
+) -> Result<()> {
+    for &extra in extras {
+        ensure!(upgrade || existing.state(profile, extra) != "different",
+            "this library uses a different {} processor or model; to switch, run vamp setup install {} --upgrade",
+            extra.name(), extra.name());
+    }
+    Ok(())
+}
+
+/// Backfill new processor identities before switching the query model. Older vectors remain
+/// available under their old key, and running jobs keep their old processor snapshot.
 fn register(
     library: &mut Library,
     models: &Models,
     extras: &[Extra],
     device: &str,
+    upgrade: bool,
 ) -> Result<(Value, Value)> {
-    let existing: BTreeMap<String, ProcessorSpec> = library
-        .processors()?
-        .into_iter()
-        .map(|spec| (spec.name.clone(), spec))
-        .collect();
+    let existing = Registrations::read(library)?;
+    ensure_compatible(&existing, models.profile, extras, upgrade)?;
     let mut processors = Vec::new();
     let mut backfill = Map::new();
     let mut embedder = Value::Null;
+    let mut retired = Vec::new();
     for &extra in extras {
-        for mut spec in models.specs(extra, device)? {
-            let previous = existing.get(&spec.name);
-            if let Some(previous) = previous {
-                spec.placement = previous.placement;
+        let superseded = existing.superseded(models.profile, extra);
+        let component = models.profile.component(extra);
+        for (mut spec, processor) in models.specs(extra, device)?.into_iter().zip(component.processors) {
+            let previous = existing.processors.get(&spec.name);
+            let prior = previous.or_else(|| SUPPORTED.iter()
+                .flat_map(|profile| profile.component(extra).processors)
+                .filter(|p| p.role == processor.role)
+                .find_map(|p| existing.processors.get(p.name)));
+            if let Some(prior) = prior {
+                spec.placement = prior.placement;
             }
             library.processor_add(spec.clone())?;
             processors.push(
                 json!({"name":spec.name, "placement":spec.placement, "new":previous.is_none()}),
             );
-            if previous.is_none() {
+            if previous.is_none() || !superseded.is_empty() {
                 backfill.insert(spec.name.clone(), library.enqueue_all(&spec.name, true)?);
             }
         }
         if extra == Extra::Search {
-            library.embedder_set(models.embedder()?)?;
-            embedder = json!(SIGLIP_MODEL);
+            let spec = models.embedder()?;
+            embedder = json!(spec.model);
+            library.embedder_set(spec)?;
+        }
+        for old in superseded {
+            library.processor_remove(&old.name)?;
+            library.cancel_jobs("pending", Some(&old.name))?;
+            library.cancel_jobs("failed", Some(&old.name))?;
+            retired.push(old.name.as_str());
         }
     }
     Ok((
-        json!({"library_id":library.context.library_id, "processors":processors, "embedder":embedder}),
+        json!({"library_id":library.context.library_id, "processors":processors,
+            "embedder":embedder, "retired_processors":retired}),
         Value::Object(backfill),
     ))
 }
@@ -1084,12 +1183,35 @@ pub fn install(
     context: Option<&str>,
     names: &[String],
     device: Option<&str>,
+    upgrade: bool,
+    profile_version: Option<u32>,
 ) -> Result<Value> {
     let home = absolute(home)?;
+    if profile_version.is_some() || upgrade {
+        ensure!(!names.iter().any(|name| name == "recommended"),
+            "--profile and --upgrade require named components, not recommended");
+    }
     let machine = Machine::detect(&home);
-    let models = Models::new(&home);
+    let profile = match profile_version {
+        Some(version) => SUPPORTED.iter().copied().find(|p| p.version == version)
+            .with_context(|| format!("processor toolkit v{version} is not bundled"))?,
+        None => RECOMMENDED,
+    };
+    let models = Models::new(&home, profile);
     let mut choices = Choices::load(&home)?;
-    let extras = select(names, || recommended(&assess(&machine, &models, &choices)))?;
+    let active = active_library(&home, context, false);
+    let registrations = active.as_ref().ok()
+        .filter(|(_, library)| library.context.remote.is_none())
+        .map(|(_, library)| Registrations::read(library)).transpose()?;
+    if upgrade {
+        ensure!(registrations.is_some(), "--upgrade requires an authority library");
+    }
+    let extras = select(names, || recommended(&assess(
+        &machine, &models, &choices, registrations.as_ref()
+    )))?;
+    if let Some(existing) = &registrations {
+        ensure_compatible(existing, models.profile, &extras, upgrade)?;
+    }
     let recorded = models.recorded_device();
     let device = match device {
         Some(device) => device.to_owned(),
@@ -1104,12 +1226,62 @@ pub fn install(
     if extras.is_empty() {
         return Ok(
             json!({"installed":[], "device":device, "registered":null, "backfill":{},
+            "profile":models.profile.json(),
             "bench":{}, "choices":choices}),
         );
     }
-    let extras = with_moved(extras, &models, recorded.as_deref(), &device);
-    let backend = torch_backend(&device, machine.os, machine.nvidia());
-    let uv = uv(&home)?;
+    let work = if recorded.as_deref().is_some_and(|old| old != device.as_str()) {
+        with_moved(extras.clone(), &models, recorded.as_deref(), &device)
+    } else {
+        extras.iter().copied().filter(|&extra| !models.installed(extra)).collect()
+    };
+    let timings = if work.is_empty() {
+        Map::new()
+    } else {
+        prepare(&home, &machine, &models, &work, recorded.as_deref(), &device)?
+    };
+    for extra in Extra::ALL {
+        let installed = choices.get(extra).is_some_and(|choice|
+            choice.state == "installed" && choice.profile_version() == models.profile.version);
+        let measured = timings.get(extra.name()).and_then(|item| item["seconds_per_item"].as_f64());
+        if (extras.contains(&extra) || installed) && (measured.is_some() || !installed) {
+            choices.record(extra, "installed", measured, profile.version);
+        }
+    }
+    choices.save(&home)?;
+    // A device change updates already-registered components sharing this runtime, but
+    // doesn't opt this library into an additional component (or change its profile).
+    let mut to_register = extras.clone();
+    if let Some(existing) = &registrations {
+        to_register.extend(work.iter().copied().filter(|extra|
+            !extras.contains(extra) && existing.state(models.profile, *extra) == "registered"));
+    }
+    let (registered, backfill) = match active {
+        Ok((name, library)) if library.context.remote.is_some() => (
+            json!({"skipped":format!("context {name} is a replica; install extras on its authority")}),
+            json!({}),
+        ),
+        Ok((_, mut library)) => register(&mut library, &models, &to_register, &device, upgrade)?,
+        Err(error) => (json!({"skipped":format!("{error:#}")}), json!({})),
+    };
+    Ok(json!({"installed":extras.iter().map(|extra| extra.name()).collect::<Vec<_>>(),
+        "profile":models.profile.json(), "device":device, "registered":registered,
+        "backfill":backfill, "bench":timings, "choices":choices}))
+}
+
+fn prepare(
+    home: &Path,
+    machine: &Machine,
+    models: &Models,
+    extras: &[Extra],
+    recorded: Option<&str>,
+    device: &str,
+) -> Result<Map<String, Value>> {
+    for &extra in extras {
+        models.check_manifest_identity(extra)?;
+    }
+    let backend = torch_backend(device, machine.os, machine.nvidia());
+    let uv = uv(home)?;
     let names: Vec<&str> = extras.iter().map(|extra| extra.name()).collect();
     eprintln!(
         "vamp setup: installing {} into {} (device {device})",
@@ -1117,7 +1289,7 @@ pub fn install(
         models.root.display()
     );
     if !models.python.is_file() {
-        run(uv_command(&uv, &home)
+        run(uv_command(&uv, home)
             .args([
                 "venv",
                 "--managed-python",
@@ -1128,8 +1300,8 @@ pub fn install(
             .arg(&models.root))?;
     }
     let pyproject = models.root.join("pyproject.toml");
-    fs::write(&pyproject, PYPROJECT).context("cannot write model requirements")?;
-    let mut packages = uv_command(&uv, &home);
+    fs::write(&pyproject, models.profile.requirements).context("cannot write model requirements")?;
+    let mut packages = uv_command(&uv, home);
     packages
         .args(["pip", "install", "--python"])
         .arg(&models.python);
@@ -1139,7 +1311,7 @@ pub fn install(
     // Another PyTorch build must replace the installed one: the `==` pins accept any local
     // version (2.8.0+cpu satisfies torch==2.8.0).
     if recorded
-        .is_some_and(|recorded| torch_backend(&recorded, machine.os, machine.nvidia()) != backend)
+        .is_some_and(|recorded| torch_backend(recorded, machine.os, machine.nvidia()) != backend)
     {
         packages.args([
             "--reinstall-package",
@@ -1149,33 +1321,30 @@ pub fn install(
         ]);
     }
     run(packages.arg("-r").arg(&pyproject))?;
-    fs::write(models.root.join("device"), &device).context("cannot record model device")?;
-    // Extras installed earlier run on the same packages: give them this vamp's scripts too.
-    models.refresh_scripts()?;
-    for &extra in &extras {
-        let script = models.script(extra);
-        fs::write(&script, extra.script().1)
-            .with_context(|| format!("cannot write {}", script.display()))?;
-        let (model, revision) = extra.model();
-        if !manifest_present(&models.manifest(extra), model, revision) {
+    fs::write(models.root.join("device"), device).context("cannot record model device")?;
+    for &extra in extras {
+        if !models.installed(extra) {
+            models.write_script(extra)?;
+        }
+        if !manifest_present(&models.manifest(extra), models.profile.component(extra)) {
             // Weights go to <home>/tools/cache/hf; inference loads them only from the path the
             // manifest records, so processors need no environment.
-            let argv = models.command(extra, &device, &["--prepare"])?;
+            let argv = models.command(extra, device, &["--prepare"])?;
             run(Command::new(&argv[0])
                 .args(&argv[1..])
                 .env("HF_HOME", home.join("tools/cache/hf"))
                 .env_remove("HF_HUB_CACHE")
                 .env_remove("HUGGINGFACE_HUB_CACHE")
                 .env_remove("TRANSFORMERS_CACHE"))?;
+            ensure!(models.installed(extra), "could not prepare {}", extra.name());
         }
     }
     let sample = home.join("tools/cache/sample.jpg");
     write_sample(&sample)?;
     let mut timings = Map::new();
     let timed = extras.iter().try_for_each(|&extra| -> Result<()> {
-        let runs = bench(&models.specs(extra, &device)?, &sample)?;
+        let runs = bench(&models.specs(extra, device)?, &sample)?;
         let seconds = (runs.iter().map(|(_, seconds)| seconds).sum::<f64>() * 10.0).round() / 10.0;
-        choices.record(extra, "installed", Some(seconds));
         let processors: Map<String, Value> = runs
             .into_iter()
             .map(|(name, seconds)| (name, json!((seconds * 10.0).round() / 10.0)))
@@ -1188,19 +1357,7 @@ pub fn install(
     });
     let _ = fs::remove_file(&sample);
     timed?;
-    choices.save(&home)?;
-    let (registered, backfill) = match active_library(&home, context) {
-        Ok((name, library)) if library.context.remote.is_some() => (
-            json!({"skipped":format!("context {name} is a replica; install extras on its authority")}),
-            json!({}),
-        ),
-        Ok((_, mut library)) => register(&mut library, &models, &extras, &device)?,
-        Err(error) => (json!({"skipped":format!("{error:#}")}), json!({})),
-    };
-    Ok(
-        json!({"installed":names, "device":device, "registered":registered, "backfill":backfill,
-        "bench":timings, "choices":choices}),
-    )
+    Ok(timings)
 }
 
 pub fn decline(home: &Path, names: &[String]) -> Result<Value> {
@@ -1208,10 +1365,10 @@ pub fn decline(home: &Path, names: &[String]) -> Result<Value> {
     let mut choices = Choices::load(&home)?;
     let extras = select(names, || {
         let machine = Machine::detect(&home);
-        recommended(&assess(&machine, &Models::new(&home), &choices))
+        recommended(&assess(&machine, &Models::new(&home, RECOMMENDED), &choices, None))
     })?;
     for &extra in &extras {
-        choices.record(extra, "declined", None);
+        choices.record(extra, "declined", None, RECOMMENDED.version);
     }
     if !extras.is_empty() {
         choices.save(&home)?;
@@ -1224,59 +1381,85 @@ pub fn decline(home: &Path, names: &[String]) -> Result<Value> {
 
 /// Extras `vamp init` registers in a new library: recorded as installed in setup.json and
 /// present on disk. Read before the library exists, so a broken setup.json stops init early.
-pub fn installed_extras(home: &Path) -> Result<Vec<Extra>> {
+pub fn installed_extras(home: &Path) -> Result<Vec<(Extra, &'static Profile)>> {
     let home = absolute(home)?;
-    let models = Models::new(&home);
     let choices = Choices::load(&home)?;
-    Ok(Extra::ALL
-        .into_iter()
-        .filter(|&extra| {
-            choices
-                .get(extra)
-                .is_some_and(|choice| choice.state == "installed")
-                && models.installed(extra)
-        })
-        .collect())
+    Ok(Extra::ALL.into_iter().filter_map(|extra| {
+        let choice = choices.get(extra).filter(|choice| choice.state == "installed")?;
+        let profile = SUPPORTED.iter().copied().find(|p| p.version == choice.profile_version())?;
+        Models::new(&home, profile).installed(extra).then_some((extra, profile))
+    }).collect())
 }
 
 /// Register `extras` (from [`installed_extras`]) in a library `vamp init` just created.
 pub fn register_installed(
     home: &Path,
     library: &mut Library,
-    extras: &[Extra],
+    extras: &[(Extra, &'static Profile)],
 ) -> Result<Vec<&'static str>> {
-    if extras.is_empty() {
-        return Ok(Vec::new());
+    let home = absolute(home)?;
+    for &(extra, profile) in extras {
+        let models = Models::new(&home, profile);
+        register(library, &models, &[extra], &models.device(), false)?;
     }
-    let models = Models::new(&absolute(home)?);
-    register(library, &models, extras, &models.device())?;
-    Ok(extras.iter().map(|extra| extra.name()).collect())
+    Ok(extras.iter().map(|(extra, _)| extra.name()).collect())
+}
+
+#[cfg(feature = "remote")]
+pub(crate) fn validate_processor_response(name: &str, response: &vamp_protocol::ToolResponse) -> Result<()> {
+    let (component, processor) = SUPPORTED.iter()
+        .flat_map(|profile| Extra::ALL.map(|extra| profile.component(extra)))
+        .find_map(|component| component.processors.iter().find(|p| p.name == name)
+            .map(|processor| (component, processor)))
+        .context("unknown bundled processor")?;
+    let observation = response.observation.as_ref().context("processor returned no observation")?;
+    let model_matches = match component.embedding_model {
+        Some(model) => observation.value["embedding"]["model"].as_str() == Some(model),
+        None => observation.model.as_deref() == Some(component.model),
+    };
+    ensure!(observation.kind == processor.role && model_matches
+        && observation.value["revision"].as_str() == Some(component.revision),
+        "processor {name} returned the wrong observation kind, model or revision");
+    Ok(())
+}
+
+#[cfg(all(test, feature = "remote"))]
+#[test]
+fn worker_refuses_a_result_from_another_model_or_revision() {
+    let expected = profile::V1.component(Extra::Search);
+    let response = |model, revision| serde_json::from_value(json!({
+        "observation":{"kind":"embedding", "model":expected.model,
+            "value":{"embedding":{"model":model},"revision":revision}}
+    })).unwrap();
+    let accepts = |model, revision| validate_processor_response(
+        "siglip-embedding", &response(model, revision)
+    ).is_ok();
+    assert!(accepts(expected.embedding_model.unwrap(), expected.revision));
+    assert!(!accepts(expected.embedding_model.unwrap(), "different-revision"));
+    assert!(!accepts("different-model", expected.revision));
 }
 
 /// This machine's installed extras' processors as `vamp worker` runs them: (spec, servable).
 /// Scripts written by an earlier vamp are replaced with this vamp's first.
 #[cfg(feature = "remote")]
 pub fn model_processors(home: &Path) -> Result<Vec<(ProcessorSpec, bool)>> {
-    let models = Models::new(&absolute(home)?);
-    models.refresh_scripts()?;
-    let device = models.device();
-    let mut processors = Vec::new();
-    for extra in Extra::ALL
-        .into_iter()
-        .filter(|&extra| models.installed(extra))
-    {
-        processors.extend(
-            models
-                .specs(extra, &device)?
-                .into_iter()
-                .map(|spec| (spec, true)),
-        );
+    let home = absolute(home)?;
+    let mut processors = BTreeMap::new();
+    for &profile in SUPPORTED {
+        let models = Models::new(&home, profile);
+        models.refresh_scripts()?;
+        let device = models.device();
+        for extra in Extra::ALL.into_iter().filter(|&extra| models.installed(extra)) {
+            for spec in models.specs(extra, &device)? {
+                processors.entry(spec.name.clone()).or_insert((spec, true));
+            }
+        }
     }
     ensure!(
         !processors.is_empty(),
         "no model processors are installed here; run vamp setup install search (or captions)"
     );
-    Ok(processors)
+    Ok(processors.into_values().collect())
 }
 
 #[cfg(test)]
@@ -1321,20 +1504,134 @@ mod tests {
 
     /// An extra as `install` leaves it on disk: venv python, `script`, verified weights.
     fn fake_install(home: &Path, extra: Extra, script: &str) {
-        let models = Models::new(home);
+        let models = Models::new(home, RECOMMENDED);
         fs::create_dir_all(models.python.parent().unwrap()).unwrap();
         fs::write(&models.python, "").unwrap();
         let weights = home.join("weights").join(extra.name());
         fs::create_dir_all(&weights).unwrap();
         fs::write(weights.join("config.json"), "{}").unwrap();
         fs::write(weights.join("model.safetensors"), "").unwrap();
-        let (model, revision) = extra.model();
+        let component = models.profile.component(extra);
         fs::write(
             models.manifest(extra),
-            json!({"model":model, "revision":revision, "path":weights}).to_string(),
+            json!({"model":component.model, "revision":component.revision, "path":weights}).to_string(),
         )
         .unwrap();
         fs::write(models.script(extra), script).unwrap();
+    }
+
+    #[test]
+    fn toolkit_manifest_pins_the_legacy_implementations() {
+        let v1 = &profile::V1;
+        assert_eq!(v1.json(), json!({"name":"recommended", "version":1, "components":{
+            "search":{"model":"google/siglip-base-patch16-224",
+                "revision":"7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
+                "embedding_model":"google/siglip-base-patch16-224",
+                "processors":[{"name":"siglip-embedding","version":1}]},
+            "captions":{"model":"florence-community/Florence-2-base",
+                "revision":"00921df66db728a9ceb750f5eca43e5c203a2051", "embedding_model":null,
+                "processors":[{"name":"florence-description","version":1},
+                    {"name":"florence-tags","version":1}]}
+        }}));
+        for (i, profile) in SUPPORTED.iter().enumerate() {
+            assert!(SUPPORTED[i + 1..].iter().all(|old| old.version < profile.version));
+            for extra in Extra::ALL {
+                let current = profile.component(extra);
+                assert!(current.source.contains(current.model));
+                assert!(current.source.contains(current.revision));
+                for prior in &SUPPORTED[i + 1..] {
+                    let old = prior.component(extra);
+                    if extra == Extra::Search
+                        && (current.model, current.revision, current.source)
+                            != (old.model, old.revision, old.source)
+                    {
+                        assert_ne!(current.embedding_model, old.embedding_model);
+                    }
+                    for p in current.processors {
+                        for q in old.processors.iter().filter(|q| q.name == p.name) {
+                            assert_eq!((current.model, current.revision, current.source),
+                                (old.model, old.revision, old.source));
+                            assert_eq!((p.role, p.version, p.arguments), (q.role, q.version, q.arguments));
+                            assert_eq!(current.embedding_model, old.embedding_model);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recommended_registers_a_prepared_component_without_running_its_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fake_install(&home, Extra::Search, SIGLIP_SCRIPT);
+        fs::write(home.join("tools/models/device"), "cpu").unwrap();
+        decline(&home, &["captions".into()]).unwrap();
+        let mut library = Library::init(&home, "refs", None, None).unwrap();
+        add_items(&mut library, dir.path(), 1);
+        let selected = ["recommended".into()];
+        let result = install(&home, Some("refs"), &selected, None, false, None).unwrap();
+        assert_eq!(result["installed"], json!(["search"]));
+        assert_eq!(result["bench"], json!({}));
+        assert_eq!(result["backfill"]["siglip-embedding"]["enqueued"], 1);
+        assert_eq!(library.embedder().unwrap().unwrap().model, SIGLIP_MODEL);
+        let again = install(&home, Some("refs"), &selected, None, false, None).unwrap();
+        assert_eq!(again["installed"], json!([]));
+        assert_eq!(again["backfill"], json!({}));
+        assert_eq!(library.jobs(Some("pending"), 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn foreign_revision_is_never_refreshed() {
+        let home = tempfile::tempdir().unwrap();
+        let models = Models::new(home.path(), &profile::V1);
+        fake_install(home.path(), Extra::Search, "# other revision");
+        let manifest = models.manifest(Extra::Search);
+        let mut state = read_manifest(&manifest).unwrap().unwrap();
+        state["revision"] = json!("foreign");
+        let bytes = state.to_string();
+        fs::write(&manifest, &bytes).unwrap();
+        assert!(!models.prepared(Extra::Search));
+        assert!(models.write_script(Extra::Search).unwrap_err().to_string().contains("different model or revision"));
+        #[cfg(feature = "remote")]
+        models.refresh_scripts().unwrap();
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), bytes);
+        assert_eq!(fs::read_to_string(models.script(Extra::Search)).unwrap(), "# other revision");
+    }
+
+    #[test]
+    fn new_profile_needs_an_explicit_library_upgrade_and_a_matching_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let mut first = Library::init(&home, "first", None, None).unwrap();
+        let mut other = Library::init(&home, "other", None, None).unwrap();
+        add_items(&mut first, dir.path(), 1);
+        let legacy = Models::new(&home, &profile::V1);
+        let new = Models::new(&home, &profile::TEST_NEXT);
+        assert_ne!(legacy.python, new.python);
+        assert_ne!(legacy.script(Extra::Search), new.script(Extra::Search));
+        assert_ne!(legacy.manifest(Extra::Search), new.manifest(Extra::Search));
+        let search = [Extra::Search];
+        register(&mut first, &legacy, &search, "cpu", false).unwrap();
+        register(&mut other, &legacy, &search, "cpu", false).unwrap();
+        first.processor_placement("siglip-embedding", Placement::Remote).unwrap();
+        assert_eq!(Registrations::read(&first).unwrap().state(new.profile, Extra::Search), "different");
+        assert!(register(&mut first, &new, &search, "cpu", false).is_err());
+        assert_eq!(first.embedder().unwrap().unwrap().model, SIGLIP_MODEL);
+
+        let (registered, backfill) = register(&mut first, &new, &search, "cpu", true).unwrap();
+        assert_eq!(registered["retired_processors"], json!(["siglip-embedding"]));
+        assert_eq!(registered["processors"][0]["placement"], "remote");
+        assert_eq!(backfill["siglip-embedding-v2"]["enqueued"], 1);
+        assert_ne!(first.embedder().unwrap().unwrap().model, SIGLIP_MODEL);
+        assert_eq!(other.embedder().unwrap().unwrap().model, SIGLIP_MODEL);
+        assert_eq!(other.processors().unwrap()[0].name, "siglip-embedding");
+        assert!(first.claim_jobs("old-worker", &["siglip-embedding".into()], 1, 60).unwrap().is_empty());
+        let matching = first.claim_jobs("new-worker", &["siglip-embedding-v2".into()], 1, 60).unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].job.processor.name, "siglip-embedding-v2");
+        let (_, again) = register(&mut first, &new, &search, "cpu", true).unwrap();
+        assert_eq!(again, json!({}));
     }
 
     fn add_items(library: &mut Library, dir: &Path, count: usize) {
@@ -1443,7 +1740,7 @@ mod tests {
     #[test]
     fn another_device_moves_the_installed_extras() {
         let dir = tempfile::tempdir().unwrap();
-        let models = Models::new(dir.path());
+        let models = Models::new(dir.path(), RECOMMENDED);
         assert_eq!(
             with_moved(vec![Extra::Captions], &models, None, "cuda"),
             [Extra::Captions]
@@ -1480,12 +1777,13 @@ mod tests {
                 placement: Placement::Remote,
             })
             .unwrap();
-        let models = Models::new(&home);
+        let models = Models::new(&home, RECOMMENDED);
         let (registered, backfill) = register(
             &mut library,
             &models,
             &[Extra::Search, Extra::Captions],
             "cpu",
+            false,
         )
         .unwrap();
         let specs: BTreeMap<String, ProcessorSpec> = library
@@ -1537,6 +1835,7 @@ mod tests {
             &models,
             &[Extra::Search, Extra::Captions],
             "cpu",
+            false,
         )
         .unwrap();
         assert_eq!(again, json!({}));
@@ -1607,7 +1906,7 @@ mod tests {
                 extras: BTreeMap::new()
             }
         );
-        choices.record(Extra::Search, "installed", Some(3.2));
+        choices.record(Extra::Search, "installed", Some(3.2), 1);
         choices.save(&home).unwrap();
         let saved: Value =
             serde_json::from_slice(&fs::read(home.join("setup.json")).unwrap()).unwrap();
@@ -1659,6 +1958,7 @@ mod tests {
                 "library",
                 "machine",
                 "offered",
+                "profile",
                 "recommended",
                 "tools"
             ]
@@ -1689,7 +1989,7 @@ mod tests {
             .map(|extra| extra["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, ["previews", "video", "search", "captions"]);
-        for extra in extras {
+        for extra in &extras[..2] {
             assert_eq!(
                 sorted_keys(extra),
                 [
@@ -1743,8 +2043,8 @@ mod tests {
         fake_install(&home, Extra::Search, SIGLIP_SCRIPT);
         fs::write(home.join("tools/models/device"), "cpu").unwrap();
         let mut choices = Choices::load(&home).unwrap();
-        choices.record(Extra::Search, "installed", Some(2.5));
-        choices.record(Extra::Captions, "declined", None);
+        choices.record(Extra::Search, "installed", Some(2.5), 1);
+        choices.record(Extra::Captions, "declined", None, 1);
         choices.save(&home).unwrap();
         let mut library = Library::init(&home, "refs", None, None).unwrap();
         add_items(&mut library, dir.path(), 4);
@@ -1758,8 +2058,9 @@ mod tests {
         assert_eq!(plan["library"]["items"], 4);
         let (search, captions) = (&plan["extras"][2], &plan["extras"][3]);
         assert_eq!(search["state"], "installed");
-        assert_eq!(search["recommended"], false);
-        assert_eq!(search["hint"], Value::Null);
+        assert_eq!(search["registration"], "missing");
+        assert_eq!(search["recommended"], true);
+        assert_eq!(search["hint"], "vamp setup install search");
         assert_eq!(
             (
                 search["download_bytes"].as_u64(),
@@ -1779,8 +2080,8 @@ mod tests {
             captions["library_seconds"],
             (SECONDS_CPU.1 * 4.0).round() as u64
         );
-        assert_eq!(plan["recommended"], json!([]));
-        assert_eq!(plan["offered"], json!(["captions"]));
+        assert_eq!(plan["recommended"], json!(["search"]));
+        assert_eq!(plan["offered"], json!(["search", "captions"]));
         // A script from an earlier vamp is not this vamp's install.
         fs::write(home.join("tools/models/siglip.py"), "# earlier\n").unwrap();
         assert_eq!(
@@ -1796,7 +2097,7 @@ mod tests {
         fake_install(&home, Extra::Search, SIGLIP_SCRIPT);
         fs::write(home.join("tools/models/device"), "cpu").unwrap();
         let mut choices = Choices::load(&home).unwrap();
-        choices.record(Extra::Search, "installed", Some(2.5));
+        choices.record(Extra::Search, "installed", Some(2.5), 1);
         choices.save(&home).unwrap();
         let mut library = Library::init(&home, "refs", None, None).unwrap();
         add_items(&mut library, dir.path(), 4);
@@ -1832,7 +2133,7 @@ mod tests {
         assert!(captions.ends_with("best with an NVIDIA GPU"), "{text}");
         assert_eq!(
             *lines.last().unwrap(),
-            "Nothing else is recommended for this machine. To install anyway: vamp setup install captions"
+            "Install the recommended extras: vamp setup install recommended"
         );
     }
 

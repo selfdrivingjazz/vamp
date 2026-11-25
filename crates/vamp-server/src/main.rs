@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result, anyhow, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use vamp_core::{Library, default_home, load_config};
@@ -31,6 +31,9 @@ enum Command {
         /// Default: `tailscale` when bound to a tailnet address, else `token`.
         #[arg(long, value_enum)]
         auth: Option<AuthMode>,
+        /// Announce this library on the local network (name and ID, never credentials).
+        #[arg(long)]
+        advertise: bool,
         /// HTTP workers. Requests never touch cloud folders (originals go through a separate
         /// bounded I/O pool), so workers are cheap.
         #[arg(long, default_value_t = 16)]
@@ -47,18 +50,9 @@ enum Command {
         dist: Option<PathBuf>,
     },
     /// Write ~/Library/LaunchAgents/com.selfdrivingjazz.vamp.server.<context>.plist (does not load it).
-    InstallAgent {
-        #[arg(long, default_value = "127.0.0.1:7777")]
-        bind: String,
-        #[arg(long)]
-        no_jobs: bool,
-        /// Pass `--dist DIR` to serve (installer + release files).
-        #[arg(long)]
-        dist: Option<PathBuf>,
-        /// Replace an existing plist.
-        #[arg(long)]
-        force: bool,
-    },
+    InstallAgent(ServiceArgs),
+    /// Write a user service (launchd on macOS, systemd on Linux) without loading it.
+    InstallService(ServiceArgs),
     /// Admit Tailscale identities without a token (`serve --auth tailscale`). With no
     /// flags, prints the allowlist. The default allowlist is this machine's Tailscale user.
     Allow {
@@ -74,6 +68,23 @@ enum Command {
     },
 }
 
+#[derive(Args)]
+struct ServiceArgs {
+    #[arg(long, default_value = "127.0.0.1:7777")]
+    bind: String,
+    /// Announce this library on the local network.
+    #[arg(long)]
+    advertise: bool,
+    #[arg(long)]
+    no_jobs: bool,
+    /// Pass `--dist DIR` to serve (installer + release files).
+    #[arg(long)]
+    dist: Option<PathBuf>,
+    /// Replace an existing service definition.
+    #[arg(long)]
+    force: bool,
+}
+
 fn context_name(cli: &Cli, home: &Path) -> Result<String> {
     match &cli.context {
         Some(name) => Ok(name.clone()),
@@ -83,43 +94,44 @@ fn context_name(cli: &Cli, home: &Path) -> Result<String> {
     }
 }
 
-fn install_agent(
-    home: &Path,
-    name: &str,
-    bind: &str,
-    no_jobs: bool,
-    dist: Option<&Path>,
-    force: bool,
-) -> Result<()> {
-    let user_home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
-    let label = format!("com.selfdrivingjazz.vamp.server.{name}");
-    let agents = user_home.join("Library/LaunchAgents");
-    let path = agents.join(format!("{label}.plist"));
-    ensure!(
-        force || !path.exists(),
-        "{} exists; pass --force to replace it",
-        path.display()
-    );
-    let program = std::env::current_exe()?.canonicalize()?;
+fn service_args(name: &str, options: &ServiceArgs) -> Result<Vec<String>> {
     let mut args = vec![
         "serve".to_owned(),
         "--context".to_owned(),
         name.to_owned(),
         "--bind".to_owned(),
-        bind.to_owned(),
+        options.bind.clone(),
     ];
-    if no_jobs {
+    if options.advertise {
+        args.push("--advertise".into());
+    }
+    if options.no_jobs {
         args.push("--no-jobs".into());
     }
-    if let Some(dist) = dist {
+    if let Some(dist) = &options.dist {
         args.push("--dist".into());
         args.push(dist.canonicalize()?.to_string_lossy().into_owned());
     }
+    Ok(args)
+}
+
+fn install_agent(home: &Path, name: &str, options: &ServiceArgs) -> Result<()> {
+    let user_home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    let label = format!("com.selfdrivingjazz.vamp.server.{name}");
+    let agents = user_home.join("Library/LaunchAgents");
+    let path = agents.join(format!("{label}.plist"));
+    ensure!(
+        options.force || !path.exists(),
+        "{} exists; pass --force to replace it",
+        path.display()
+    );
+    let program = std::env::current_exe()?.canonicalize()?;
+    let args = service_args(name, options)?;
     let mut env = vec![(
         "VAMP_HOME",
         home.canonicalize()?.to_string_lossy().into_owned(),
     )];
-    for key in ["VAMP_MEDIA_HELPER", "VAMP_STORE_HELPER"] {
+    for key in ["VAMP_MEDIA_HELPER", "VAMP_STORE_HELPER", "VAMP_FFMPEG", "XDG_STATE_HOME"] {
         if let Some(helper) = std::env::var_os(key) {
             env.push((key, helper.to_string_lossy().into_owned()));
         }
@@ -142,6 +154,72 @@ fn install_agent(
     println!("unload: launchctl bootout gui/$(id -u)/{label}");
     println!("log:    {}", log.display());
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_systemd(home: &Path, name: &str, options: &ServiceArgs) -> Result<()> {
+    // The library context is already validated, but an attached legacy context may contain dots.
+    ensure!(
+        !name.is_empty()
+            && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.')),
+        "context name {name:?} cannot be used in a service name"
+    );
+    let user_home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| user_home.join(".config"));
+    let unit_name = format!("vamp-server-{name}.service");
+    let path = config.join("systemd/user").join(&unit_name);
+    ensure!(
+        options.force || !path.exists(),
+        "{} exists; pass --force to replace it",
+        path.display()
+    );
+    let program = std::env::current_exe()?.canonicalize()?;
+    let home = home.canonicalize()?;
+    let args = service_args(name, options)?;
+    fn quoted(text: &str) -> String {
+        // systemd.syntax quoting plus protection from specifier and ExecStart expansions.
+        format!(
+            "\"{}\"",
+            text.replace('\\', "\\\\").replace('"', "\\\"")
+                .replace('\n', "\\n").replace('\r', "\\r").replace('%', "%%").replace('$', "$$")
+        )
+    }
+    let paths = [program.as_path(), Path::new("--home"), home.as_path()];
+    let exec = paths.iter().copied().chain(args.iter().map(Path::new))
+        .map(|value| value.to_str().map(quoted).context("service arguments must be UTF-8"))
+        .collect::<Result<Vec<_>>>()?.join(" ");
+    let mut env = String::new();
+    for key in ["PATH", "VAMP_MEDIA_HELPER", "VAMP_STORE_HELPER", "VAMP_FFMPEG", "XDG_STATE_HOME"] {
+        if let Ok(value) = std::env::var(key) {
+            // Environment= does not expand variables, unlike ExecStart.
+            let assignment = format!("{key}={value}");
+            env.push_str(&format!("Environment={}\n", quoted(&assignment).replace("$$", "$")));
+        }
+    }
+    let unit = format!(
+        "[Unit]\nDescription=VAMP library server ({name})\n\
+        \n[Service]\nExecStart={exec}\n{env}Restart=on-failure\nRestartSec=5\n\
+        \n[Install]\nWantedBy=default.target\n"
+    );
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, unit)?;
+    println!("wrote {}", path.display());
+    println!("start:  systemctl --user daemon-reload && systemctl --user enable --now {unit_name}");
+    println!("stop:   systemctl --user disable --now {unit_name}");
+    println!("log:    journalctl --user -u {unit_name} -f");
+    Ok(())
+}
+
+fn install_service(home: &Path, name: &str, options: &ServiceArgs) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return install_systemd(home, name, options);
+    #[cfg(target_os = "macos")]
+    return install_agent(home, name, options);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::bail!("install-service is supported on Linux and macOS; run serve under a supervisor")
 }
 
 /// `tailnet[:port]` -> this machine's Tailscale IPv4 (default port 7777).
@@ -191,15 +269,12 @@ fn main() -> Result<()> {
             }
             println!("{}", serde_json::to_string(&allow)?);
         }
-        Command::InstallAgent {
-            bind,
-            no_jobs,
-            dist,
-            force,
-        } => install_agent(&home, &name, &bind, no_jobs, dist.as_deref(), force)?,
+        Command::InstallAgent(options) => install_agent(&home, &name, &options)?,
+        Command::InstallService(options) => install_service(&home, &name, &options)?,
         Command::Serve {
             bind,
             auth,
+            advertise,
             threads,
             no_jobs,
             jobs_interval,
@@ -208,10 +283,12 @@ fn main() -> Result<()> {
             let tailscale = Tailscale::discover();
             let bind = resolve_bind(&bind, &tailscale)?;
             let server = tiny_http::Server::http(&bind).map_err(|e| anyhow!("bind {bind}: {e}"))?;
-            let on_tailnet = server
-                .server_addr()
-                .to_ip()
-                .is_some_and(|a| vamp_server::auth::tailnet_ip(a.ip()));
+            let addr = server.server_addr().to_ip().context("server has no IP address")?;
+            ensure!(
+                !advertise || !addr.ip().is_loopback(),
+                "--advertise requires a LAN or tailnet bind"
+            );
+            let on_tailnet = vamp_server::auth::tailnet_ip(addr.ip());
             let auth = auth.unwrap_or(if on_tailnet {
                 AuthMode::Tailscale
             } else {
@@ -236,7 +313,7 @@ fn main() -> Result<()> {
                 );
                 app = app.with_dist(dir);
             }
-            let addr = server.server_addr().to_ip().context("server has no IP address")?;
+            let _discovery = app.register_discovery(addr, advertise);
             let url = if addr.ip().is_unspecified() {
                 format!("http://<this-machine>:{}", addr.port())
             } else {
@@ -257,7 +334,7 @@ fn main() -> Result<()> {
                 AuthMode::Tailscale => format!("vamp join {url} (allowlisted) or add --token TOKEN"),
             };
             eprintln!(
-                "vamp-server: other machines: {join} (later changes: vamp sync); Vampire app: Connect to Server… with this URL and token"
+                "vamp-server: other machines: {join} (later changes: vamp sync); Vampire: Connect to Server…"
             );
             if !no_jobs {
                 vamp_server::spawn_jobs(

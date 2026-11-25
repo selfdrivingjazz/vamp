@@ -329,6 +329,28 @@ impl Library {
         Ok(lib)
     }
     pub fn open(home: &Path, name: Option<&str>) -> Result<Self> {
+        Self::connect(Self::load_context(home, name)?)
+    }
+
+    /// Open an existing catalog for inspection without running schema migrations.
+    pub fn open_read_only(home: &Path, name: Option<&str>) -> Result<Self> {
+        let context = Self::load_context(home, name)?;
+        let state_dir = PathBuf::from(&context.state_dir);
+        let conn = Connection::open_with_flags(
+            state_dir.join("catalog.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(Duration::from_secs(10))?;
+        Ok(Self {
+            context,
+            state_dir,
+            conn,
+            warm: Default::default(),
+            warm_idle_seconds: tools::SERVE_IDLE_SECONDS,
+        })
+    }
+
+    fn load_context(home: &Path, name: Option<&str>) -> Result<Context> {
         let config = load_config(home)?;
         let name = name
             .or(config.current.as_deref())
@@ -359,7 +381,7 @@ impl Library {
                 .is_file(),
             "local catalog unavailable; refusing to create an empty replacement"
         );
-        Self::connect(context)
+        Ok(context)
     }
     /// Independent connection to this already-open library (background filesystem work).
     pub fn reopen(&self) -> Result<Self> {

@@ -1,7 +1,7 @@
 //! HTTP/1.1 JSON API over one local library (the authority for replica contexts).
-//! Every `/v1` request needs `Authorization: Bearer <token>` (the token lives in
-//! `<state_dir>/server-token`, 0600) or, with Tailscale auth, an allowlisted tailnet
-//! identity (see [`auth`]). Browser-extension origins get CORS.
+//! Catalog requests need `Authorization: Bearer <token>` (the token lives in
+//! `<state_dir>/server-token`, 0600) or an allowlisted Tailscale identity (see [`auth`]).
+//! `GET /v1/discovery` returns only the public identity advertised by discovery.
 pub mod auth;
 pub mod health;
 pub mod push;
@@ -19,6 +19,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use vamp_core::Library;
 use vamp_core::io::{Pool, Stalled};
 use vamp_protocol::{Metadata, MetadataPatch, PROTOCOL_VERSION};
+mod discovery;
 mod dist;
 
 mod jobs_api;
@@ -106,6 +107,7 @@ pub struct App {
     library: Mutex<Library>,
     token: String,
     name: String,
+    identity: discovery::Identity,
     helper: Option<PathBuf>,
     fetcher: ureq::Agent,
     dist: Option<PathBuf>,
@@ -148,10 +150,12 @@ impl Drop for LibraryGuard<'_> {
 impl App {
     pub fn new(library: Library, name: &str) -> Result<Self> {
         let token = token(&library.state_dir)?;
+        let identity = discovery::Identity::new(&library, name);
         Ok(Self {
             library: Mutex::new(library),
             token,
             name: name.into(),
+            identity,
             hub: push::Hub::default(),
             tailnet: None,
             helper: vamp_core::media_helper(),
@@ -193,12 +197,22 @@ impl App {
     /// Also admit allowlisted Tailscale identities (bearer tokens stay valid).
     pub fn with_tailnet(mut self, tailscale: auth::Tailscale) -> Self {
         let state_dir = self.lock().state_dir.clone();
+        self.identity.auth = "tailscale";
         self.tailnet = Some(auth::TailnetAuth {
             tailscale,
             state_dir,
         });
         self
     }
+    /// Register the running endpoint locally and, when requested, on the local network.
+    pub fn register_discovery(
+        &self,
+        addr: std::net::SocketAddr,
+        advertise: bool,
+    ) -> impl Drop + use<> {
+        discovery::Registration::start(&self.identity, addr, advertise)
+    }
+
     fn lock(&self) -> LibraryGuard<'_> {
         let guard = self.library.lock().unwrap_or_else(|e| e.into_inner());
         self.health
@@ -545,7 +559,12 @@ fn authorized(app: &App, request: &Request) -> Result<Option<auth::Peer>, String
 
 pub(crate) fn handle(app: &Arc<App>, mut request: Request) {
     let origin = extension_origin(&request);
-    let public = dist::route(app.dist.as_deref(), &request).or_else(|| open::route(&request));
+    let public = dist::route(app.dist.as_deref(), &request)
+        .or_else(|| open::route(&request))
+        .or_else(|| {
+            (*request.method() == Method::Get && request.url() == "/v1/discovery")
+                .then(|| json_reply(200, &json!(app.identity)))
+        });
     let mut reply = if let Some(reply) = public {
         reply
     } else if *request.method() == Method::Options {

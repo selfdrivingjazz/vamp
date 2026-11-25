@@ -25,6 +25,7 @@ fn dist_routes_are_public_and_confined_while_v1_requires_auth() {
     .unwrap();
     std::fs::write(home.path().join("secret"), "nope").unwrap();
     let library = Library::init(home.path(), "main", None, None).unwrap();
+    let library_id = library.context.library_id.clone();
     let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
     let base = format!("http://{}", server.server_addr());
     let app = vamp_server::App::new(library, "main")
@@ -45,4 +46,13 @@ fn dist_routes_are_public_and_confined_while_v1_requires_auth() {
     assert_eq!(get(&format!("{base}/dist/missing")).0, 404);
     assert_eq!(get(&format!("{base}/dist/%2e%2e/secret")).0, 404);
     assert_eq!(get(&format!("{base}/v1/library")).0, 401);
+    assert_eq!(get(&format!("{base}/v1/health")).0, 401);
+    let (status, body) = get(&format!("{base}/v1/discovery"));
+    assert_eq!(status, 200);
+    let identity: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(identity["version"], 1);
+    assert_eq!(identity["library_id"], library_id);
+    assert_eq!(identity["library_name"], "main");
+    assert_eq!(identity["auth"], "token");
+    assert_eq!(identity.as_object().unwrap().len(), 5);
 }
