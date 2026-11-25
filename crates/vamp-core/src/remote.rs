@@ -26,7 +26,7 @@ pub(crate) const SCHEMA: &str = "
     );";
 
 // Latest applied pages, not a second unbounded event log.
-const CHANGE_PAGES: usize = 32;
+const CHANGE_PAGES: i64 = 32;
 
 /// Blocking HTTP client for one authority's `/v1` API.
 #[derive(Clone)]
@@ -368,16 +368,15 @@ impl Client {
     pub fn hello(&self) -> Result<Value> {
         self.get_json("/hello", &[])
     }
-    /// Long-poll `GET /v1/events/stream`: returns once events after `after` exist (a page
-    /// like `GET /v1/events`, up to [`PAGE`]) or `wait` seconds pass (then the list is
-    /// empty). The answer is due after `wait` seconds, so it gets [`STREAM_GRACE`] more
-    /// instead of the agent's 120 s: a connection that died silently fails fast.
+    /// Long-poll for the first event after `after`. Treat it as a wake-up, not as
+    /// ownership of a page: another caller may already be pulling the whole backlog.
+    /// The answer is due after `wait` seconds plus [`STREAM_GRACE`].
     pub fn wait_events(&self, after: u64, wait: u64) -> Result<Vec<Event>> {
         let response = self
             .authorize(self.agent.get(format!("{}/events/stream", self.base)))
             .query("after", after.to_string())
             .query("wait", wait.to_string())
-            .query("limit", PAGE.to_string())
+            .query("limit", "1")
             .config()
             .timeout_recv_response(Some(Duration::from_secs(wait) + STREAM_GRACE))
             .build()
@@ -1079,6 +1078,8 @@ impl Changes {
 /// Pages and their change notices commit together, so another process can report exactly
 /// what it missed even if the applying caller was a write or failed on a later page.
 fn publish_page(tx: &Transaction, from: u64, to: u64, changes: &Changes) -> Result<()> {
+    let to = i64::try_from(to).context("replica cursor exceeds the catalog range")?;
+    let from = i64::try_from(from).context("replica cursor exceeds the catalog range")?;
     tx.execute(
         "INSERT INTO replica_state(key,value) VALUES('cursor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [to],
@@ -1099,16 +1100,21 @@ fn changes_since(conn: &Connection, from: u64, to: u64) -> Result<Changes> {
     if from == to {
         return Ok(changes);
     }
+    if from > to {
+        changes.reload = true;
+        changes.asset_ids = None;
+        return Ok(changes);
+    }
     let mut stmt = conn.prepare_cached(
         "SELECT cursor,from_cursor,changes FROM replica_changes WHERE cursor>?1 AND cursor<=?2 ORDER BY cursor",
     )?;
-    let mut rows = stmt.query(params![from, to])?;
+    let mut rows = stmt.query(params![from as i64, to as i64])?;
     let mut next = from;
     while let Some(row) = rows.next()? {
-        if row.get::<_, u64>(1)? != next {
+        if row.get::<_, i64>(1)? as u64 != next {
             break;
         }
-        next = row.get(0)?;
+        next = row.get::<_, i64>(0)? as u64;
         changes.merge(serde_json::from_str(row.get_ref(2)?.as_str()?)?);
     }
     if next != to {
@@ -1261,7 +1267,8 @@ fn pull(
         )
     };
     let mut events = match first {
-        Some((from, events)) if from == after => events,
+        Some((from, events)) if from == after
+            && events.last().is_some_and(|event| event.sequence == latest) => events,
         _ if latest == after => Vec::new(),
         _ => page(after)?,
     };

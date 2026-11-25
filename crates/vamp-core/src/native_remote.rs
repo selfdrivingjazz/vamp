@@ -696,7 +696,7 @@ struct SyncProgress {
     callers: usize,
     value: Value,
 }
-static SYNCS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<PathBuf, SyncProgress>>> =
+static SYNCS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<PathBuf, SyncProgress>>> =
     std::sync::LazyLock::new(Default::default);
 /// Replica state dirs with a downloader thread running in this process, with the token of
 /// that thread (so a finished thread never unregisters its successor).

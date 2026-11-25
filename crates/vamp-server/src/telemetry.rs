@@ -55,11 +55,14 @@ impl Telemetry {
 /// Only instrumentation points controlled by this program; no raw routes or query data.
 pub(crate) fn route(method: &Method, segments: &[&str]) -> Option<Feature> {
     Some(match (method, segments) {
-        (Method::Get, ["v1", "hello"]) => Feature::LibraryConnect,
+        // Every incremental pull checks /hello; /library is the attach handshake.
+        (Method::Get, ["v1", "library"]) => Feature::LibraryConnect,
         (Method::Get, ["v1", "snapshot"]) => Feature::Sync,
         (Method::Get, ["v1", "search"]) => Feature::Search,
         (Method::Get, ["v1", "assets", _, "similar"]) => Feature::Similar,
         (Method::Post, ["v1", "clip"] | ["v1", "clip", "batch"]) => Feature::Clip,
+        // Bulk view reads use POST, but aren't writes.
+        (Method::Post, ["v1", "assets", "batch"]) => return None,
         (Method::Post, ["v1", "ingest"] | ["v1", "assets", _] | ["v1", "assets", _, "accept-tags"])
         | (Method::Delete, ["v1", "assets", _]) => Feature::Save,
         _ => return None,
@@ -75,4 +78,17 @@ pub(crate) fn native(operation: &str) -> Option<Feature> {
         | "smart_folder_delete" => Feature::Save,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_pulls_do_not_count_as_attaches_or_saves() {
+        assert!(route(&Method::Get, &["v1", "hello"]).is_none());
+        assert!(route(&Method::Post, &["v1", "assets", "batch"]).is_none());
+        assert!(matches!(route(&Method::Get, &["v1", "library"]), Some(Feature::LibraryConnect)));
+        assert!(matches!(route(&Method::Post, &["v1", "assets", "asset-id"]), Some(Feature::Save)));
+    }
 }
