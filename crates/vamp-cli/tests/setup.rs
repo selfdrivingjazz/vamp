@@ -65,7 +65,6 @@ fn installed(home: &Path, script: &str, manifest: &str, model: &str, revision: &
     )
     .unwrap();
     fs::write(models.join(script), text).unwrap();
-    fs::write(models.join("vamp_usage.py"), include_str!("../../../processors/vamp_usage.py")).unwrap();
     fs::write(models.join("device"), "cpu").unwrap();
 }
 

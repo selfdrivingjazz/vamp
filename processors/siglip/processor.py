@@ -19,8 +19,6 @@ import signal
 import socket
 import sys
 
-from vamp_usage import Usage
-
 MODEL_ID = "google/siglip-base-patch16-224"
 MODEL_REVISION = "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed"
 # SigLIP text towers were trained on fixed-length padded sequences.
@@ -79,10 +77,10 @@ def loaded(manifest, device):
     device = resolve_device(device)
     processor, model = load_model(state["path"])
     model.to(device)
-    return processor, model, device, Usage(manifest, "google", MODEL_ID, device)
+    return processor, model, device
 
 
-def embed(request, processor, model, device, usage):
+def embed(request, processor, model, device):
     import numpy as np
     import torch
 
@@ -99,7 +97,7 @@ def embed(request, processor, model, device, usage):
             with Image.open(input_path) as source:
                 image = ImageOps.exif_transpose(source).convert("RGB")
             inputs = processor(images=image, return_tensors="pt").to(device)
-            encode, kind = model.get_image_features, "media-analysis"
+            features = model.get_image_features(**inputs)
         elif operation == "embed_text":
             text = request.get("text")
             if not isinstance(text, str) or not text.strip():
@@ -107,15 +105,10 @@ def embed(request, processor, model, device, usage):
             inputs = processor(text=[text.strip()], padding="max_length",
                                max_length=TEXT_LENGTH, truncation=True,
                                return_tensors="pt").to(device)
-            encode, kind = model.get_text_features, "query-embedding"
+            features = model.get_text_features(**inputs)
         else:
             raise ValueError(f"unsupported operation {operation!r}; expected process or embed_text")
-
-        def vectorize(**tensor_inputs):
-            features = encode(**tensor_inputs)
-            return torch.nn.functional.normalize(features[0].float(), dim=-1).cpu().numpy()
-
-        vector = usage.run("siglip-embedding", kind, 1, vectorize, **inputs)
+    vector = torch.nn.functional.normalize(features[0].float(), dim=-1).cpu().numpy()
     data = vector.astype("<f4").tobytes()
     assert len(data) == 4 * vector.shape[0] and np.isfinite(vector).all()
     return {"representation": None, "tiles": None, "observation": {
@@ -163,7 +156,7 @@ def serve(manifest, device, path, idle_seconds):
     # Default SIGTERM would skip `finally` and leave a stale socket behind.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
-        processor, model, device, usage = loaded(manifest, device)
+        processor, model, device = loaded(manifest, device)
         print(f"siglip: serving {MODEL_ID} on {device} at {path}", file=sys.stderr)
         server.settimeout(idle_seconds)
         while True:
@@ -174,7 +167,7 @@ def serve(manifest, device, path, idle_seconds):
             with conn:
                 conn.settimeout(30)
                 try:
-                    response = embed(json.loads(read_line(conn)), processor, model, device, usage)
+                    response = embed(json.loads(read_line(conn)), processor, model, device)
                 except Exception as error:  # one bad request must not stop the server
                     response = {"error": f"{type(error).__name__}: {error}"}
                 with contextlib.suppress(OSError):
@@ -211,8 +204,8 @@ def main():
             result = prepare(args.manifest)
         else:
             request = json.load(sys.stdin)
-            processor, model, device, usage = loaded(args.manifest, args.device)
-            result = embed(request, processor, model, device, usage)
+            processor, model, device = loaded(args.manifest, args.device)
+            result = embed(request, processor, model, device)
     print(json.dumps(result, ensure_ascii=False))
 
 

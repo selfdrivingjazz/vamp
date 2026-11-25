@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- Bundled SigLIP and Florence processors can emit opt-in, content-free usage records
-  for individual model batches, including text embeddings, through a local Unix socket.
 - The authority's background originals check emits `original_checked` only when an
   original's health changes. Each confirming check used to emit one, about 15,000 events
   an hour on a 10,000-item library, and every replica re-fetched each checked asset; a
