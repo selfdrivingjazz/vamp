@@ -348,9 +348,8 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
     }
     let client = library.remote_client()?;
     let value = match operation {
-        // Embeddings live on the authority. Offline, the local dispatcher answers with
-        // full-text browse over the mirror and "semantic":false.
-        "browse" => return Ok(semantic_browse(&library, &client, request).ok()),
+        // Embeddings live on the authority; lexical fallback is explicitly selected.
+        "browse" => return semantic_browse(&library, &client, request),
         // The authority owns embeddings, so it owns the projection; the last layout is kept
         // for offline use. Offline search answers `semantic:false` and the client falls back
         // to its lexical match.
@@ -571,42 +570,111 @@ fn mirror_items(library: &Library, ranked: &[super::remote::Ranked]) -> Result<V
     Ok(items)
 }
 
-/// Semantic browse ranked by the authority, rendered from the mirror.
+/// The authority filters and ranks the full cohort before paging. Only IDs and scores
+/// cross into `mirror_items`, so client-visible representation paths always stay local.
 fn semantic_browse(
     library: &Library,
     client: &super::remote::Client,
     request: &Request,
-) -> Result<Value> {
-    let limit = request.limit.unwrap_or(120);
-    ensure!(
-        (1..=500).contains(&limit),
-        "invalid pagination; limit must be 1–500"
-    );
+) -> Result<Option<Value>> {
     let query = request.query.as_deref().unwrap_or("").trim();
-    ensure!(!query.is_empty(), "semantic browse needs a query");
-    let added_by = request.added_by.as_deref();
-    let (semantic, mut ranked) = client.semantic_search(query, 1000, false, added_by)?;
-    ensure!(semantic, "authority has no embedder");
-    if let Some(collection) = request.collection_id.as_deref() {
-        let mut stmt = library
-            .conn
-            .prepare("SELECT asset_id FROM memberships WHERE collection_id=?1")?;
-        let members = stmt
-            .query_map([collection], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
-        ranked.retain(|(id, _)| members.contains(id));
+    if query.is_empty() {
+        return Ok(None);
     }
-    // Also against the mirror: authorities predating the filter ignore it.
-    if let Some(added_by) = added_by {
-        let matching = crate::catalog::added_by_ids(&library.conn, added_by)?;
-        ranked.retain(|(id, _)| matching.contains(id));
+    let mut body = forward_body(request)?;
+    // Older authorities reject unknown fields even when they're unused. Keep the
+    // requested filters, but don't send fields this request isn't using.
+    if let Some(object) = body.as_object_mut() {
+        object.retain(|_, v| !v.is_null() && v.as_bool() != Some(false)
+            && !v.as_array().is_some_and(Vec::is_empty));
     }
-    let mut items = mirror_items(library, &ranked)?;
-    let total = items.len();
-    let items: Vec<Value> = items.drain(..).skip(request.offset).take(limit).collect();
-    Ok(
-        json!({"has_more":request.offset + items.len() < total,"items":items,"total":total,"offset":request.offset,"semantic":true}),
-    )
+    let mut page = match client.native(&body) {
+        Ok(page) => page,
+        Err(error) if error.downcast_ref::<super::remote::RemoteStatus>().is_some_and(|status| {
+            (status.status == 404 && matches!(status.code.as_str(), "" | "not_found"))
+                || (status.status == 400 && status.message == "operation not available over HTTP: browse")
+        }) => return legacy_semantic_browse(library, client, request, query),
+        // Preserve the offline mirror path on an unreachable authority, not on HTTP,
+        // application, or response-decode failures.
+        Err(error) if error.chain().any(|cause| match cause.downcast_ref::<ureq::Error>() {
+            Some(ureq::Error::ConnectionFailed | ureq::Error::HostNotFound) => true,
+            Some(ureq::Error::Io(error)) => matches!(error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::HostUnreachable),
+            _ => false,
+        }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let semantic = page["semantic"].as_bool().context("authority omitted semantic browse mode")?;
+    ensure!(page["total"].is_u64() && page["offset"].is_u64() && page["has_more"].is_boolean(),
+        "authority returned invalid semantic browse pagination");
+    let items = page["items"].as_array().context("authority omitted semantic browse items")?;
+    if !semantic {
+        return Ok(None);
+    }
+    let ranked = items
+        .iter()
+        .map(|item| {
+            let id = item["id"].as_str().context("authority omitted semantic result ID")?;
+            let score = item["score"].as_f64().context("authority omitted semantic result score")?;
+            Ok((id.to_owned(), Some(score)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    page["items"] = json!(mirror_items(library, &ranked)?);
+    Ok(Some(page))
+}
+
+/// Before native browse was exposed, `/search` returned at most 1,000 ranks.
+/// Apply all browse filters to that cohort, but don't present a truncated rank
+/// as a complete page: eligible hits can be anywhere in the authority's order.
+fn legacy_semantic_browse(
+    library: &Library,
+    client: &super::remote::Client,
+    request: &Request,
+    query: &str,
+) -> Result<Option<Value>> {
+    #[derive(serde::Deserialize)]
+    struct LegacyPage {
+        semantic: bool,
+        results: Vec<LegacyHit>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyHit {
+        asset: LegacyAsset,
+        score: Option<f64>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyAsset {
+        id: String,
+    }
+
+    const SEARCH_LIMIT: usize = 1000;
+    let filter = super::native::BrowseFilter::from_request(request);
+    ensure!((1..=500).contains(&filter.limit), "invalid pagination; limit must be 1–500");
+    let page: LegacyPage = client.get_json("/search", &[
+        ("q", query.to_owned()), ("limit", SEARCH_LIMIT.to_string()), ("semantic", "1".into()),
+    ])?;
+    if !page.semantic {
+        return Ok(None);
+    }
+    ensure!(page.results.len() < SEARCH_LIMIT, "authority is too old to return a complete semantic browse; upgrade the server");
+    let mut ranked = page.results.into_iter().map(|hit| {
+        let score = hit.score.context("authority omitted semantic result score")?;
+        Ok((hit.asset.id, Some(score)))
+    }).collect::<Result<Vec<_>>>()?;
+    let (conditions, mut values) = super::native::filter_conditions(library, &filter)?;
+    values.push(json_text(&ranked.iter().map(|(id, _)| id).collect::<Vec<_>>())?.into());
+    let mut stmt = library.conn.prepare(&format!(
+        "SELECT a.id FROM assets a WHERE a.deleted=0{conditions} AND a.id IN (SELECT value FROM json_each(?))"
+    ))?;
+    let matches = stmt.query_map(rusqlite::params_from_iter(&values), |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    ranked.retain(|(id, _)| matches.contains(id));
+    let total = ranked.len();
+    let start = filter.offset.min(total);
+    let end = (start + filter.limit).min(total);
+    let items = mirror_items(library, &ranked[start..end])?;
+    Ok(Some(json!({"has_more":end < total,"items":items,"total":total,"offset":filter.offset,"semantic":true})))
 }
 
 /// Replica state dirs with a sync in progress in this process: `{phase, done, total}`.
@@ -896,5 +964,126 @@ fn run_downloader(library: &mut Library, registration: &Registration) -> Result<
         }
         // Only exhausted items remain: wait for their re-arm (or new priorities).
         nap(REARM.saturating_sub(rearmed.elapsed()));
+    }
+}
+
+#[cfg(test)]
+mod semantic_browse_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    fn authority(responses: Vec<(&'static str, &'static str, Value)>) -> (
+        super::super::remote::Client,
+        std::thread::JoinHandle<Vec<Value>>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = super::super::remote::Client::new(&Remote {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test".into(),
+            drive_roots: Default::default(),
+        }).unwrap();
+        let requests = std::thread::spawn(move || responses.into_iter().map(|(path, status, value)| {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with(path), "{line:?}");
+            let mut len = 0;
+            loop {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; len];
+            reader.read_exact(&mut body).unwrap();
+            let payload = value.to_string();
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).unwrap();
+            if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() }
+        }).collect());
+        (client, requests)
+    }
+
+    #[test]
+    fn modern_authority_applies_filters_and_pagination_and_replica_resolves_local_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let mut library = Library::init(&root.path().join("home"), "mirror", None, None).unwrap();
+        let path = root.path().join("image.png");
+        fs::write(&path, b"image").unwrap();
+        let asset = library.add(&path, None, Metadata::default()).unwrap();
+        let request = serde_json::from_value(json!({
+            "operation":"browse","semantic":true,"query":"forest","tags":["keep"],
+            "colors":["#101820"],"rating_min":4,"offset":1001,"limit":1,
+        })).unwrap();
+        let (client, requests) = authority(vec![("POST /v1/native ", "200 OK", json!({
+            "semantic":true,"total":1050,"offset":1001,"has_more":true,
+            "items":[{"id":asset.id,"score":0.9,"thumbnail_path":"/authority/thumbnail.jpg"}],
+        }))]);
+        let page = semantic_browse(&library, &client, &request).unwrap().unwrap();
+        let forwarded = &requests.join().unwrap()[0];
+        assert_eq!(forwarded["tags"], json!(["keep"]));
+        assert_eq!(forwarded["colors"], json!(["#101820"]));
+        assert_eq!(forwarded["rating_min"], 4);
+        assert_eq!(forwarded["offset"], 1001);
+        assert_eq!(page["total"], 1050);
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["items"][0]["id"], asset.id);
+        assert!(page["items"][0]["thumbnail_path"].is_null());
+        assert_eq!(page["items"][0]["score"], 0.9);
+    }
+
+    #[test]
+    fn unsupported_native_browse_uses_legacy_filters_but_auth_and_bad_data_stay_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let mut library = Library::init(&root.path().join("home"), "mirror", None, None).unwrap();
+        let make_asset = |lib: &mut Library, name: &str, tags| {
+            let path = root.path().join(name);
+            fs::write(&path, name).unwrap();
+            lib.add(&path, None, Metadata { tags, ..Metadata::default() }).unwrap()
+        };
+        let first = make_asset(&mut library, "first.png", vec![]);
+        let kept = make_asset(&mut library, "second.png", vec!["keep".into()]);
+        let request = serde_json::from_value(json!({
+            "operation":"browse","semantic":true,"query":"forest","tags":["keep"],"limit":1,
+        })).unwrap();
+        let (client, requests) = authority(vec![
+            ("POST /v1/native ", "404 Not Found", json!({"error":{"code":"not_found"}})),
+            ("GET /v1/search?", "200 OK", json!({"semantic":true,"results":[
+                {"asset":{"id":first.id},"score":1.0}, {"asset":{"id":kept.id},"score":0.5},
+            ]})),
+        ]);
+        let page = semantic_browse(&library, &client, &request).unwrap().unwrap();
+        requests.join().unwrap();
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["items"][0]["id"], kept.id);
+
+        for (status, body, expected) in [
+            ("401 Unauthorized", json!({"error":{"code":"unauthorized"}}), "401"),
+            ("200 OK", json!({"items":[]}), "omitted semantic browse mode"),
+        ] {
+            let (client, requests) = authority(vec![("POST /v1/native ", status, body)]);
+            let err = semantic_browse(&library, &client, &request).unwrap_err();
+            requests.join().unwrap();
+            assert!(err.to_string().contains(expected), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn unreachable_authority_allows_mirror_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let library = Library::init(root.path(), "mirror", None, None).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let client = super::super::remote::Client::new(&Remote {
+            url, token: "test".into(), drive_roots: Default::default(),
+        }).unwrap();
+        let request = serde_json::from_value(json!({
+            "operation":"browse","semantic":true,"query":"forest",
+        })).unwrap();
+        assert!(semantic_browse(&library, &client, &request).unwrap().is_none());
     }
 }
