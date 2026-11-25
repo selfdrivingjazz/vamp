@@ -435,7 +435,24 @@ impl Library {
         }
         run_tool(&spec.command, request, spec.timeout_seconds)
     }
-    /// Current-revision embeddings of live assets for `model`, ranked by cosine similarity.
+    /// Select a single live cohort. A configured model takes precedence; packs
+    /// require that model, while Galaxy can still lay out another model's images.
+    pub(crate) fn live_embedding_cohort(
+        &self,
+        preferred: Option<&str>,
+        require_preferred: bool,
+    ) -> Result<Option<(String, usize)>> {
+        let cohort = self.conn.prepare_cached(
+            "SELECT e.model,e.dim FROM embeddings e
+             JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 AND a.trashed=0
+             WHERE (?1 IS NULL OR NOT ?2 OR e.model=?1)
+             GROUP BY e.model,e.dim
+             ORDER BY e.model=?1 DESC,count(*) DESC,e.model,e.dim DESC LIMIT 1",
+        )?.query_row(params![preferred, require_preferred], |r| Ok((r.get(0)?, r.get::<_, i64>(1)?))).optional()?;
+        cohort.map(|(model, dim)| Ok((model, usize::try_from(dim)?))).transpose()
+    }
+
+    /// Current-revision embeddings in the requested trash scope, ranked by cosine similarity.
     /// `candidates` restricts ranking to those asset IDs.
     fn rank(
         &self,
@@ -443,12 +460,13 @@ impl Library {
         query: &[f32],
         exclude: Option<&str>,
         candidates: Option<&HashSet<String>>,
+        trashed: bool,
     ) -> Result<Vec<(String, f32)>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT e.asset_id,e.vector FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 WHERE e.model=?1 AND e.dim=?2",
+            "SELECT e.asset_id,e.vector FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 AND a.trashed=?3 WHERE e.model=?1 AND e.dim=?2",
         )?;
         let mut ranked = Vec::new();
-        let mut rows = stmt.query(params![model, query.len() as i64])?;
+        let mut rows = stmt.query(params![model, query.len() as i64, trashed])?;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
             if exclude == Some(id.as_str()) || candidates.is_some_and(|c| !c.contains(&id)) {
@@ -460,14 +478,15 @@ impl Library {
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok(ranked)
     }
-    /// Full semantic ranking of `candidates` (all live assets when `None`).
-    pub(crate) fn semantic_ranked(
+    /// Full semantic ranking in the requested scope.
+    fn semantic_ranked(
         &self,
         text: &str,
         candidates: Option<&HashSet<String>>,
+        trashed: bool,
     ) -> Result<Vec<(String, f32)>> {
         let (model, query) = self.embed_text(text)?;
-        self.rank(&model, &query, None, candidates)
+        self.rank(&model, &query, None, candidates, trashed)
     }
     fn scored(&self, ranked: Vec<(String, f32)>, limit: usize) -> Result<Vec<Scored>> {
         ranked
@@ -497,7 +516,7 @@ impl Library {
         let candidates = added_by
             .map(|added_by| crate::catalog::added_by_ids(&self.conn, added_by))
             .transpose()?;
-        let ranked = self.semantic_ranked(text, candidates.as_ref())?;
+        let ranked = self.semantic_ranked(text, candidates.as_ref(), false)?;
         if !hybrid {
             return self.scored(ranked, limit);
         }
@@ -538,7 +557,7 @@ impl Library {
         else {
             return Err(self.missing_embedding(&asset, None)?.into());
         };
-        let ranked = self.rank(&model, &from_blob(&blob), Some(asset_id), None)?;
+        let ranked = self.rank(&model, &from_blob(&blob), Some(asset_id), None, false)?;
         self.scored(ranked, limit)
     }
     /// Copy suggested tags into user tags. Empty `tags` accepts every current suggestion.
@@ -617,7 +636,7 @@ pub(crate) mod native {
                 .collect::<rusqlite::Result<HashSet<_>>>()?,
             )
         };
-        let ranked = library.semantic_ranked(query, candidates.as_ref())?;
+        let ranked = library.semantic_ranked(query, candidates.as_ref(), filter.trash)?;
         let items = ranked
             .iter()
             .skip(filter.offset)

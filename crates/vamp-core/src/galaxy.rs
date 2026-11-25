@@ -22,6 +22,7 @@ const A: f32 = 1.577;
 const B: f32 = 0.895;
 /// Incremental placements beyond this share of the layout trigger a full recompute.
 const REBUILD_SHARE: f64 = 0.2;
+const LAYOUT_DIM: &str = "galaxy_dim";
 
 /// Current-revision embeddings of live, untrashed assets for the preferred model.
 struct Embedded {
@@ -304,18 +305,10 @@ fn seed_of(id: &str) -> u64 {
 impl Library {
     fn galaxy_embedded(&self) -> Result<Option<Embedded>> {
         let preferred = self.embedder()?.map(|spec| spec.model);
-        let Some((model, dim)) = self
-            .conn
-            .query_row(
-                "SELECT e.model,e.dim FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 GROUP BY e.model,e.dim ORDER BY e.model=?1 DESC,count(*) DESC LIMIT 1",
-                [preferred],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .optional()?
+        let Some((model, dim)) = self.live_embedding_cohort(preferred.as_deref(), false)?
         else {
             return Ok(None);
         };
-        let dim = dim as usize;
         let mut stmt = self.conn.prepare(
             "SELECT e.asset_id,e.vector FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 AND a.trashed=0 WHERE e.model=?1 AND e.dim=?2 ORDER BY e.asset_id",
         )?;
@@ -333,7 +326,7 @@ impl Library {
         }))
     }
 
-    /// Bring the stored layout up to date: full projection when there is none, the model
+    /// Bring the stored layout up to date: full projection when there is none, the cohort
     /// changed, `rebuild` is set, or incremental placements outgrew [`REBUILD_SHARE`];
     /// otherwise place only new embeddings. Returns `{model, count, full, added, removed, ms}`.
     pub fn galaxy_refresh(&mut self, rebuild: bool) -> Result<Value> {
@@ -342,6 +335,12 @@ impl Library {
             self.conn.execute("DELETE FROM galaxy", [])?;
             return Ok(json!({"model":null,"count":0,"full":false,"added":0,"removed":0,"ms":0}));
         };
+        let dim = i64::try_from(data.dim)?;
+        let stored_dim = self.conn.query_row(
+            "SELECT CAST(document AS INTEGER) FROM settings WHERE key=?1",
+            [LAYOUT_DIM],
+            |row| row.get::<_, i64>(0),
+        ).optional()?;
         let mut stored: HashMap<String, ([f32; 3], bool)> = HashMap::new();
         {
             let mut stmt = self
@@ -377,12 +376,14 @@ impl Library {
             .collect();
         let incremental = stored.values().filter(|v| v.1).count() + missing.len();
         let full = rebuild
+            || stored_dim != Some(dim)
             || stored.len() - removed < 3
             || incremental as f64 > REBUILD_SHARE * data.ids.len() as f64;
         let tx = self.conn.transaction()?;
         if full {
             let points = project(&data);
             tx.execute("DELETE FROM galaxy", [])?;
+            catalog::set_setting(&tx, LAYOUT_DIM, &data.dim)?;
             let mut insert = tx.prepare(
                 "INSERT INTO galaxy(asset_id,model,x,y,z,incremental) VALUES(?1,?2,?3,?4,?5,0)",
             )?;
@@ -391,8 +392,8 @@ impl Library {
             }
         } else if !missing.is_empty() || removed > 0 {
             tx.execute(
-                "DELETE FROM galaxy WHERE model<>?1 OR asset_id NOT IN (SELECT e.asset_id FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 AND a.trashed=0 WHERE e.model=?1)",
-                [&data.model],
+                "DELETE FROM galaxy WHERE model<>?1 OR asset_id NOT IN (SELECT e.asset_id FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 AND a.trashed=0 WHERE e.model=?1 AND e.dim=?2)",
+                params![data.model, dim],
             )?;
             let placed: Vec<(usize, [f32; 3])> = stored
                 .iter()
@@ -486,11 +487,12 @@ impl Library {
         }))
     }
 
-    /// Top `limit` by cosine over an in-process copy of the embedding matrix, reloaded only
-    /// when the embeddings table or asset liveness changes.
+    /// Top `limit` by cosine over a cached matrix. The event cursor invalidates it on
+    /// source refreshes and equal-count membership changes, not only new vector rows.
     fn galaxy_rank(&self, model: &str, query: &[f32], limit: usize) -> Result<Vec<(String, f32)>> {
+        let _snapshot = read_snapshot(&self.conn)?;
         let stamp: (i64, i64, i64) = self.conn.query_row(
-            "SELECT (SELECT count(*) FROM embeddings),(SELECT coalesce(max(rowid),0) FROM embeddings),(SELECT coalesce(sum(deleted+trashed),0) FROM assets)",
+            "SELECT (SELECT count(*) FROM embeddings),(SELECT coalesce(max(rowid),0) FROM embeddings),(SELECT coalesce(max(sequence),0) FROM events)",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -503,7 +505,7 @@ impl Library {
             let data = self
                 .galaxy_embedded()?
                 .filter(|d| d.model == model && d.dim == query.len())
-                .context("no image embeddings for the embedder's model")?;
+                .context("no Galaxy layout for the text embedding's model and dimension")?;
             cache.insert(key.clone(), Matrix { stamp, data });
         }
         let data = &cache[&key].data;
@@ -615,5 +617,50 @@ mod tests {
             })
             .unwrap();
         assert_eq!(nearest.0 % 3, 0);
+    }
+
+    #[test]
+    fn galaxy_and_riff_choose_one_live_model_and_dimension() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut library = Library::init(&dir.path().join("home"), "main", None, None).unwrap();
+        let mut assets = Vec::new();
+        for i in 0..8u8 {
+            let path = dir.path().join(format!("{i}.png"));
+            fs::write(&path, [i]).unwrap();
+            assets.push(library.add(&path, None, Metadata::default()).unwrap());
+        }
+        assets.sort_by(|a, b| a.id.cmp(&b.id));
+        let blob = |dim| (0..dim).flat_map(|_| (1.0f32 / (dim as f32).sqrt()).to_le_bytes()).collect::<Vec<_>>();
+        for (i, asset) in assets.iter().enumerate().take(7) {
+            let (model, dim) = match i {
+                0 => ("main", 2),
+                6 => ("other", 3),
+                _ => ("main", 3),
+            };
+            library.conn.execute(
+                "INSERT INTO embeddings(asset_id,source_hash,model,dim,vector) VALUES(?1,?2,?3,?4,?5)",
+                params![asset.id, asset.original.source_key(), model, dim, blob(dim)],
+            ).unwrap();
+        }
+        let ids = |bounds: std::ops::Range<usize>| assets[bounds].iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+        let (_, pack) = library.energy_pack().unwrap().unwrap();
+        assert_eq!((pack.model.as_str(), pack.dim, pack.ids), ("main", 3, ids(1..6)));
+        assert_eq!(library.galaxy(false).unwrap()["ids"], json!(ids(1..6)));
+
+        // This member still has an embedding under the same name, but no longer in the
+        // layout's dimension. Incremental refresh must delete its projected row.
+        library.conn.execute("UPDATE embeddings SET dim=2,vector=?1 WHERE asset_id=?2",
+            params![blob(2), assets[1].id]).unwrap();
+        let layout = library.galaxy(false).unwrap();
+        assert_eq!(layout["refresh"]["full"], false);
+        assert_eq!(layout["ids"], json!(ids(2..6)));
+        assert_eq!(library.energy_pack().unwrap().unwrap().1.ids, ids(2..6));
+
+        library.trash(&ids(3..6), None).unwrap();
+        let (_, pack) = library.energy_pack().unwrap().unwrap();
+        assert_eq!((pack.dim, pack.ids), (2, ids(0..2)));
+        let layout = library.galaxy(false).unwrap();
+        assert_eq!(layout["refresh"]["full"], true);
+        assert_eq!(layout["ids"], json!(ids(0..2)));
     }
 }

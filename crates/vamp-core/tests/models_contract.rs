@@ -128,6 +128,9 @@ fn semantic_and_similar_rank_by_cosine_over_current_originals_only() {
     assert_eq!(lib.energy_pack().unwrap().unwrap().1.version, before.version);
     assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
 
+    let warm = lib.galaxy_search(&vector([1.0, 0.0, 0.0]), 10).unwrap();
+    assert_eq!(warm["ids"][0], ids[0]);
+
     // A refreshed original no longer matches its old vector, in search or similarity.
     fs::write(dir.path().join("a"), vector([0.0, 1.0, 0.0])).unwrap();
     lib.refresh(&ids[0], None).unwrap();
@@ -139,11 +142,21 @@ fn semantic_and_similar_rank_by_cosine_over_current_originals_only() {
     assert_eq!(similar.len(), 1);
     assert_eq!(similar[0].asset.id, ids[2]);
     assert!(lib.similar(&ids[0], 10).is_err());
+    let refreshed = lib.galaxy_search(&vector([1.0, 0.0, 0.0]), 10).unwrap();
+    assert_eq!(refreshed["ids"], serde_json::json!([ids[1], ids[2]]));
     // …and the pack is rebuilt without the stale vector.
     let (_, after) = lib.energy_pack().unwrap().unwrap();
     assert_ne!(after.version, before.version);
     assert_eq!(after.count, 2);
     assert!(!after.ids.contains(&ids[0]));
+
+    lib.trash(&ids[1..2], None).unwrap();
+    let ranked = lib.semantic_search(&vector([1.0, 0.0, 0.0]), 10, false, None).unwrap();
+    assert_eq!(ranked.len(), 1);
+    assert_eq!(ranked[0].asset.id, ids[2]);
+    assert!(lib.similar(&ids[2], 10).unwrap().is_empty());
+    assert_eq!(lib.galaxy_search(&vector([1.0, 0.0, 0.0]), 10).unwrap()["ids"],
+        serde_json::json!([ids[2]]));
 }
 
 #[test]
@@ -288,6 +301,7 @@ fn native_semantic_browse_ranks_only_filtered_candidates() {
         ids.push(lib.add(&path, None, metadata).unwrap().id);
     }
     lib.run_jobs(10).unwrap();
+    lib.trash(&ids[2..3], None).unwrap();
     drop(lib);
     let browse = |extra: serde_json::Value| {
         let mut request = serde_json::json!({"operation":"browse","home":home,
@@ -301,16 +315,19 @@ fn native_semantic_browse_ranks_only_filtered_candidates() {
     let all = browse(serde_json::json!({}));
     assert_eq!(
         (all["semantic"].clone(), all["total"].clone()),
-        (true.into(), 3.into())
+        (true.into(), 2.into())
     );
     assert_eq!(all["items"][0]["id"], ids[0]);
     let tagged = browse(serde_json::json!({"tags":["keep"]}));
-    assert_eq!(tagged["total"], 2);
     assert_eq!(tagged["items"][0]["id"], ids[1]);
-    assert_eq!(tagged["has_more"], true);
+    assert_eq!(tagged["total"], 1);
+    assert_eq!(tagged["has_more"], false);
     let untagged = browse(serde_json::json!({"untagged":true,"offset":1}));
     assert_eq!(untagged["total"], 1);
     assert!(untagged["items"].as_array().unwrap().is_empty());
+    let trash = browse(serde_json::json!({"trash":true,"tags":["keep"]}));
+    assert_eq!(trash["total"], 1);
+    assert_eq!(trash["items"][0]["id"], ids[2]);
 }
 
 fn unavailable(error: &anyhow::Error) -> vamp_core::EmbeddingUnavailable {

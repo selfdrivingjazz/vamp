@@ -80,34 +80,20 @@ pub fn quantize(vector: &[f32], out: &mut Vec<u8>) -> f32 {
 }
 
 impl Library {
-    /// Embedding model the pack uses: the configured embedder's, else the most common one.
-    fn pack_model(&self) -> Result<Option<String>> {
-        if let Some(spec) = self.embedder()? {
-            return Ok(Some(spec.model));
-        }
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT model FROM embeddings GROUP BY model ORDER BY count(*) DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?)
-    }
-
     fn pack_rows_sql(with_vector: bool) -> String {
         format!(
-            "SELECT a.id,a.hash,a.colors{} FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 AND a.trashed=0 WHERE e.model=?1 ORDER BY a.id",
+            "SELECT a.id,a.hash,a.colors{} FROM embeddings e JOIN assets a ON a.id=e.asset_id AND a.hash=e.source_hash AND a.deleted=0 AND a.trashed=0 WHERE e.model=?1 AND e.dim=?2 ORDER BY a.id",
             if with_vector { ",e.vector" } else { ",e.rowid" }
         )
     }
 
     /// Catalog fingerprint the pack is keyed by (cheap: no vectors read).
-    fn pack_fingerprint(&self, model: &str) -> Result<String> {
+    fn pack_fingerprint(&self, model: &str, dim: usize) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(model.as_bytes());
+        hasher.update(&(dim as u64).to_le_bytes());
         let mut stmt = self.conn.prepare(&Self::pack_rows_sql(false))?;
-        let mut rows = stmt.query([model])?;
+        let mut rows = stmt.query(params![model, i64::try_from(dim)?])?;
         while let Some(row) = rows.next()? {
             for i in 0..3 {
                 if let Some(text) = row.get_ref(i)?.as_str_or_null()? {
@@ -123,17 +109,20 @@ impl Library {
     /// Authority: the current pack (rebuilt when stale). `None` without any embeddings.
     pub fn energy_pack(&self) -> Result<Option<(PathBuf, PackHeader)>> {
         let _snapshot = read_snapshot(&self.conn)?;
-        let Some(model) = self.pack_model()? else {
+        let preferred = self.embedder()?.map(|spec| spec.model);
+        let Some((model, dim)) = self.live_embedding_cohort(preferred.as_deref(), true)?
+            .or_else(|| preferred.map(|model| (model, 0)))
+        else {
             return Ok(None);
         };
-        let version = self.pack_fingerprint(&model)?;
+        let version = self.pack_fingerprint(&model, dim)?;
         let path = pack_path(&self.state_dir);
         if let Ok(header) = read_header(&path)
             && header.version == version
         {
             return Ok(Some((path, header)));
         }
-        let bytes = self.build_pack(&model, version)?;
+        let bytes = self.build_pack(&model, dim, version)?;
         fs::create_dir_all(path.parent().context("pack directory")?)?;
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         fs::write(&tmp, &bytes)?;
@@ -141,24 +130,18 @@ impl Library {
         Ok(Some((path.clone(), read_header(&path)?)))
     }
 
-    fn build_pack(&self, model: &str, version: String) -> Result<Vec<u8>> {
+    fn build_pack(&self, model: &str, dim: usize, version: String) -> Result<Vec<u8>> {
         let mut ids = Vec::new();
         let mut scales = Vec::new();
         let mut vibe = Vec::new();
         let mut palette = Vec::new();
-        let mut dim = 0usize;
         let mut stmt = self.conn.prepare(&Self::pack_rows_sql(true))?;
-        let mut rows = stmt.query([model])?;
+        let mut rows = stmt.query(params![model, i64::try_from(dim)?])?;
         while let Some(row) = rows.next()? {
             let blob = row.get_ref(3)?.as_blob()?;
             let (chunks, _) = blob.as_chunks::<4>();
             let vector: Vec<f32> = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
-            if dim == 0 {
-                dim = vector.len();
-            }
-            if vector.len() != dim || dim == 0 {
-                continue;
-            }
+            ensure!(vector.len() == dim, "embedding has an invalid stored dimension");
             ids.push(row.get::<_, String>(0)?);
             scales.push(quantize(&vector, &mut vibe));
             let swatches: Vec<ColorSwatch> = row
