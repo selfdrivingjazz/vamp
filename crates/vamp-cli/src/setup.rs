@@ -190,13 +190,23 @@ impl Models {
         self.prepared(extra)
             && fs::read_to_string(self.script(extra))
                 .is_ok_and(|text| text == self.profile.component(extra).source)
+            && self.usage_script_current()
+    }
+    fn usage_script_current(&self) -> bool {
+        fs::read_to_string(self.root.join("vamp_usage.py"))
+            .is_ok_and(|text| text == profile::USAGE_SCRIPT)
     }
     fn write_script(&self, extra: Extra) -> Result<()> {
         self.check_manifest_identity(extra)?;
-        let script = self.script(extra);
+        if !self.usage_script_current() {
+            Self::write_model_script(&self.root.join("vamp_usage.py"), profile::USAGE_SCRIPT)?;
+        }
+        Self::write_model_script(&self.script(extra), self.profile.component(extra).source)
+    }
+    fn write_model_script(script: &Path, source: &str) -> Result<()> {
         let temporary = script.with_extension(format!("{}.tmp", std::process::id()));
-        let result = fs::write(&temporary, self.profile.component(extra).source)
-            .and_then(|()| fs::rename(&temporary, &script));
+        let result = fs::write(&temporary, source)
+            .and_then(|()| fs::rename(&temporary, script));
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
@@ -1523,6 +1533,7 @@ mod tests {
         )
         .unwrap();
         fs::write(models.script(extra), script).unwrap();
+        fs::write(models.root.join("vamp_usage.py"), profile::USAGE_SCRIPT).unwrap();
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub(super) const SIGLIP_MODEL: &str = "google/siglip-base-patch16-224";
 pub(super) const SIGLIP_REVISION: &str = "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed";
 pub(super) const SIGLIP_SCRIPT: &str = include_str!("../../../../processors/siglip/processor.py");
 pub(super) const FLORENCE_SCRIPT: &str = include_str!("../../../../processors/florence/processor.py");
+pub(super) const USAGE_SCRIPT: &str = include_str!("../../../../processors/vamp_usage.py");
 
 // Version 1 adopts the existing 0.4.2 commands and embedding keys. Unversioned names and
 // tools/models are reserved for this profile; later profiles get their own runtime directory.

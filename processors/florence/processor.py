@@ -18,6 +18,8 @@ import signal
 import socket
 import sys
 
+from vamp_usage import Usage
+
 MAX_REQUEST = 1024 * 1024
 
 MODEL_ID = "florence-community/Florence-2-base"
@@ -85,14 +87,13 @@ def prepare(manifest):
     return payload
 
 
-def generate(processor, model, image, task, device):
+def generate(processor, model, image, task, device, usage, name):
     import torch
 
     inputs = processor(text=task, images=image, return_tensors="pt").to(device)
     with torch.inference_mode():
-        generated = model.generate(
-            **inputs, max_new_tokens=512, num_beams=3, do_sample=False,
-        )
+        generated = usage.run(name, "media-analysis", 1, model.generate,
+                              **inputs, max_new_tokens=512, num_beams=3, do_sample=False)
     text = processor.batch_decode(generated, skip_special_tokens=False)[0]
     return processor.post_process_generation(text, task=task, image_size=image.size).get(task)
 
@@ -112,10 +113,10 @@ def loaded(manifest, device):
         raise RuntimeError("CUDA is not available; use --device cpu")
     processor, model = load_model(state["path"])
     model.to(device)
-    return processor, model, device
+    return processor, model, device, Usage(manifest, "florence-community", MODEL_ID, device)
 
 
-def process(request, processor, model, device, task):
+def process(request, processor, model, device, task, usage):
     if request.get("protocol_version") != "0.1":
         raise ValueError("unsupported or missing protocol_version; expected 0.1")
     input_path = request.get("input_path")
@@ -127,15 +128,15 @@ def process(request, processor, model, device, task):
         image = ImageOps.exif_transpose(source).convert("RGB")
     print(f"Florence-2 {task} locally on {device}", file=sys.stderr)
     if task == "tags":
-        detected = generate(processor, model, image, "<OD>", device) or {}
-        caption = generate(processor, model, image, "<CAPTION>", device)
+        detected = generate(processor, model, image, "<OD>", device, usage, "florence-tags") or {}
+        caption = generate(processor, model, image, "<CAPTION>", device, usage, "florence-tags")
         tags = tags_from(detected.get("labels", []), caption)
         return {"representation": None, "tiles": None, "observation": {
             "kind": "tags", "model": MODEL_ID,
             "value": {"tags": tags, "caption": caption, "revision": MODEL_REVISION,
                       "task": "<OD>+<CAPTION>", "device": device},
         }}
-    description = generate(processor, model, image, TASK, device)
+    description = generate(processor, model, image, TASK, device, usage, "florence-description")
     if not isinstance(description, str) or not description.strip():
         raise RuntimeError("Florence-2 returned no detailed caption")
     return {"representation": None, "tiles": None, "observation": {
@@ -182,7 +183,7 @@ def serve(manifest, device, task, path, idle_seconds):
     # Default SIGTERM would skip `finally` and leave a stale socket behind.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
-        processor, model, device = loaded(manifest, device)
+        processor, model, device, usage = loaded(manifest, device)
         print(f"florence: serving {MODEL_ID} {task} on {device} at {path}", file=sys.stderr)
         server.settimeout(idle_seconds)
         while True:
@@ -195,7 +196,7 @@ def serve(manifest, device, task, path, idle_seconds):
                 try:
                     request = json.loads(read_line(conn))
                     conn.settimeout(None)
-                    response = process(request, processor, model, device, task)
+                    response = process(request, processor, model, device, task, usage)
                 except Exception as error:  # one bad request must not stop the server
                     response = {"error": f"{type(error).__name__}: {error}"}
                 with contextlib.suppress(OSError):
@@ -234,8 +235,8 @@ def main():
             result = prepare(args.manifest)
         else:
             request = json.load(sys.stdin)
-            processor, model, device = loaded(args.manifest, args.device)
-            result = process(request, processor, model, device, args.task)
+            processor, model, device, usage = loaded(args.manifest, args.device)
+            result = process(request, processor, model, device, args.task, usage)
     print(json.dumps(result, ensure_ascii=False))
 
 

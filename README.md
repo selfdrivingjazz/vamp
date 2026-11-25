@@ -132,6 +132,26 @@ and embedding updates are applied atomically to the cached file. A model/dimensi
 change or missing checkpoint needs a full pack. Concurrent startup/sync requests share
 one refresh, and ordinary grid browsing never waits for its network transfer.
 
+### Local model usage hook
+
+Bundled processors can send one metadata-only JSON line per actual model invocation to a
+local Unix datagram socket. Set `VAMP_USAGE_SOCKET` to the listener's path before the
+processor starts, or listen on `vamp-usage.sock` beside its weights manifest to opt in for
+the whole model installation. An empty `VAMP_USAGE_SOCKET` disables the hook. Restart
+already-running warm model servers after changing the configuration.
+
+Records contain `at` (UTC ISO-8601), `processor`, `kind` (`media-analysis` or
+`query-embedding`), `provider`, `model`, `device`, `items`, `duration_ms` and `ok`. They
+never include paths, images, results, query text or exception messages. Jobs that stop
+before calling the model emit nothing. Each actual model batch emits once, including
+each of Florence's two distinct calls for a tags job. Concurrent one-image requests
+remain separate batches. Delivery is nonblocking and best effort: a missing or
+overloaded listener drops events rather than slowing or failing inference. Custom
+processors can emit the same records from their own inference boundary.
+
+When using a standalone script from the source checkout, add `processors` to `PYTHONPATH`;
+`vamp setup install` and `vamp worker` install the helper alongside the bundled scripts.
+
 ## Missing originals and repair
 
 `vamp doctor` prints a read-only JSON report: present/missing counts, hash-verified
