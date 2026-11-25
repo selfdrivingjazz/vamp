@@ -422,33 +422,28 @@ fn boxed(data: Vec<u8>) -> Box<dyn Read + Send> {
 }
 
 
-/// JSON reply, gzip-encoded when the client accepts it (snapshots shrink ~10x).
-fn compressed_json(request: &Request, value: &Value) -> Reply {
-    let gzip = request.headers().iter().any(|h| {
-        h.field.equiv("Accept-Encoding") && h.value.as_str().contains("gzip")
-    });
-    if !gzip {
-        return json_reply(200, value);
-    }
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    let body = serde_json::to_writer(&mut encoder, value)
-        .map_err(std::io::Error::from)
-        .and_then(|()| encoder.finish());
-    let Ok(body) = body else {
-        return json_reply(200, value);
+/// JSON reply, compressed only when the client explicitly accepts gzip.
+fn compressed_json(request: &Request, value: &impl serde::Serialize) -> Result<Reply, HttpError> {
+    let gzip = request.headers().iter().filter(|h| h.field.equiv("Accept-Encoding"))
+        .flat_map(|h| h.value.as_str().split(','))
+        .any(|entry| {
+            let mut parts = entry.split(';').map(str::trim);
+            parts.next().is_some_and(|coding| coding.eq_ignore_ascii_case("gzip"))
+                && parts.all(|parameter| parameter.split_once('=').is_some_and(|(k, v)|
+                    k.trim().eq_ignore_ascii_case("q")
+                        && v.trim().parse::<f32>().is_ok_and(|q| q > 0.0 && q <= 1.0)))
+        });
+    let mut headers = vec![header("Content-Type", "application/json"), header("Vary", "Accept-Encoding")];
+    let body = if gzip {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        serde_json::to_writer(&mut encoder, value).map_err(|e| HttpError::new(500, e.to_string()))?;
+        headers.push(header("Content-Encoding", "gzip"));
+        encoder.finish().map_err(|e| HttpError::new(500, e.to_string()))?
+    } else {
+        serde_json::to_vec(value).map_err(|e| HttpError::new(500, e.to_string()))?
     };
     let len = body.len();
-    Response::new(
-        StatusCode(200),
-        vec![
-            header("Content-Type", "application/json"),
-            header("Content-Encoding", "gzip"),
-        ],
-        boxed(body),
-        Some(len),
-        None,
-    )
+    Ok(Response::new(StatusCode(200), headers, boxed(body), Some(len), None))
 }
 fn json_reply(status: u16, value: &Value) -> Reply {
     let body = value.to_string().into_bytes();
@@ -777,7 +772,7 @@ fn route(
         }
         (Method::Get, ["v1", "snapshot"]) => {
             let snapshot = app.lock().snapshot()?;
-            Ok(compressed_json(request, &snapshot))
+            compressed_json(request, &snapshot)
         }
         (Method::Post, ["v1", "assets", "batch"]) => {
             let body: BatchBody = read_json(request)?;
@@ -792,8 +787,7 @@ fn route(
                 .filter_map(|id| library.inspect(id).ok())
                 .collect::<Vec<_>>();
             drop(library);
-            let value = serde_json::to_value(views).map_err(|e| HttpError::new(500, e.to_string()))?;
-            Ok(compressed_json(request, &value))
+            compressed_json(request, &views)
         }
         (Method::Get, ["v1", "events", "stream"]) => {
             let after = query.number("after", 0u64)?;
@@ -802,12 +796,17 @@ fn route(
             if !app.hub.wait_past(after, Duration::from_secs(wait)) {
                 return ok(Vec::<Value>::new());
             }
-            ok(app.lock().events(after, limit)?)
+            let events = app.lock().events(after, limit)?;
+            compressed_json(request, &events)
         }
-        (Method::Get, ["v1", "events"]) => ok(app.lock().events(
-            query.number("after", 0u64)?,
-            query.number("limit", 500usize)?,
-        )?),
+        (Method::Get, ["v1", "events"]) => {
+            let events = app.lock().events(
+                query.number("after", 0u64)?,
+                query.number("limit", 500usize)?,
+            )?;
+            if events.is_empty() { return ok(events); }
+            compressed_json(request, &events)
+        }
         (Method::Get, ["v1", "search"]) if flag(&query, "semantic") => {
             let library = app.lock();
             let limit = query.number("limit", 100usize)?;

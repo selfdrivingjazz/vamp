@@ -8,6 +8,8 @@
   replica that had been asleep for twenty minutes had to download the whole catalog again
   before its next edit finished.
 - A replica edit reports the catch-up sync it waits for in `sync_status`.
+- Event pages and long-poll updates use gzip when the replica accepts it; older
+  clients can still request plain JSON.
 
 ## 0.4.2 — 2026-11-04
 

@@ -73,3 +73,43 @@ fn sync_wait_wakes_on_writes_from_other_connections_and_times_out_idle() {
     let view = op(home, json!({"operation":"inspect","asset_id":asset.id})).unwrap();
     assert_eq!(view["asset"]["tags"], json!(["live"]));
 }
+
+/// Check the wire, not an HTTP client that transparently decodes gzip.
+#[test]
+fn event_pages_negotiate_gzip_without_changing_events() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let mut library = Library::init(&dir.path().join("home"), "main", None, None).unwrap();
+    library.ingest_bytes(b"example", "sample.txt", Metadata::default()).unwrap();
+    let expected = serde_json::to_value(library.events(0, 10).unwrap()).unwrap();
+    let token = vamp_server::token(&library.state_dir).unwrap();
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+    let address = server.server_addr().to_ip().unwrap();
+    let app = vamp_server::App::new(library, "main").unwrap();
+    let serving = {
+        let server = server.clone();
+        std::thread::spawn(move || vamp_server::serve(server, app, 1))
+    };
+    for route in ["events", "events/stream?wait=2"] {
+        for (encoding, compressed) in [("br, GZIP;q=0.8", true), ("gzip;q=0", false), ("identity", false)] {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(stream, "GET /v1/{route} HTTP/1.0\r\nAuthorization: Bearer {token}\r\nAccept-Encoding: {encoding}\r\n\r\n").unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            let at = response.windows(4).position(|s| s == b"\r\n\r\n").unwrap();
+            let headers = std::str::from_utf8(&response[..at]).unwrap().to_ascii_lowercase();
+            assert!(headers.contains(" 200 "));
+            assert_eq!(headers.contains("content-encoding: gzip"), compressed);
+            let body = &response[at + 4..];
+            let events: Value = if compressed {
+                serde_json::from_reader(flate2::read::GzDecoder::new(body)).unwrap()
+            } else {
+                serde_json::from_slice(body).unwrap()
+            };
+            assert_eq!(events, expected);
+        }
+    }
+    server.unblock();
+    serving.join().unwrap();
+}
