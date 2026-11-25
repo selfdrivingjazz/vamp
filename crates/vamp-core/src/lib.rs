@@ -712,7 +712,36 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
         expected_revision: Option<u64>,
     ) -> Result<Asset> {
         let tx = self.conn.transaction()?;
-        let mut asset = get_asset(&tx, id)?;
+        let asset = Self::update_asset(&tx, &self.context, id, patch, expected_revision)?;
+        tx.commit()?;
+        Ok(asset)
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn update_many(
+        &mut self,
+        ids: &[String],
+        patch: MetadataPatch,
+    ) -> Result<Vec<Asset>> {
+        let (last, rest) = ids.split_last().context("asset_ids is required")?;
+        let tx = self.conn.transaction()?;
+        let mut assets = Vec::with_capacity(ids.len());
+        for id in rest {
+            assets.push(Self::update_asset(&tx, &self.context, id, patch.clone(), None)?);
+        }
+        assets.push(Self::update_asset(&tx, &self.context, last, patch, None)?);
+        tx.commit()?;
+        Ok(assets)
+    }
+
+    fn update_asset(
+        tx: &Transaction<'_>,
+        context: &Context,
+        id: &str,
+        patch: MetadataPatch,
+        expected_revision: Option<u64>,
+    ) -> Result<Asset> {
+        let mut asset = get_asset(tx, id)?;
         check_revision(&asset, expected_revision)?;
         if let Some(name) = patch.name {
             asset.name = name;
@@ -743,15 +772,14 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
             asset.metadata.rating = rating;
         }
         bump(&mut asset);
-        save_asset(&tx, &asset)?;
+        save_asset(tx, &asset)?;
         emit(
-            &tx,
-            &self.context,
+            tx,
+            context,
             "media_updated",
             Some(&asset),
             json!({"change":"metadata"}),
         )?;
-        tx.commit()?;
         Ok(asset)
     }
     pub fn refresh(&mut self, id: &str, expected_revision: Option<u64>) -> Result<Asset> {

@@ -711,21 +711,24 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
                 let asset = library.update(asset_id()?, patch, request.expected_revision)?;
                 return Ok(serde_json::to_value(asset)?);
             }
-            let assets = request
-                .asset_ids
-                .iter()
-                .map(|id| library.update(id, patch.clone(), None))
-                .collect::<Result<Vec<_>>>()?;
+            let assets = if let [id] = request.asset_ids.as_slice() {
+                vec![library.update(id, patch, request.expected_revision)?]
+            } else {
+                ensure!(
+                    request.expected_revision.is_none(),
+                    "expected_revision requires a single asset"
+                );
+                library.update_many(&request.asset_ids, patch)?
+            };
             Ok(json!({"assets":assets}))
         }
         "remove" => {
             let ids = asset_ids()?;
-            let expected = if ids.len() == 1 {
-                request.expected_revision
-            } else {
-                None
-            };
-            Ok(json!({"trashed":library.trash(ids, expected)?}))
+            ensure!(
+                request.expected_revision.is_none() || ids.len() == 1,
+                "expected_revision requires a single asset"
+            );
+            Ok(json!({"trashed":library.trash(ids, request.expected_revision)?}))
         }
         "restore" => Ok(json!({"restored":library.restore(asset_ids()?)?})),
         "empty_trash" => {

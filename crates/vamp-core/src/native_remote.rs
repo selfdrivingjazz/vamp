@@ -56,6 +56,21 @@ fn forward_body(request: &Request) -> Result<Value> {
     Ok(body)
 }
 
+fn forward_batch(client: &super::remote::Client, request: &Request) -> Result<Value> {
+    client.native(&forward_body(request)?).map_err(|error| {
+        let unsupported = error.downcast_ref::<super::remote::RemoteStatus>().is_some_and(|status| {
+            (status.status == 404 && (status.code.is_empty() || status.message.starts_with("no route")))
+                || status.status == 405
+                || (status.status == 400 && status.message.strip_prefix("operation not available over HTTP: ") == Some(request.operation.as_str()))
+        });
+        if unsupported {
+            error.context(format!("authority does not support batch {}", request.operation))
+        } else {
+            error
+        }
+    })
+}
+
 /// Replica `energy_pack`: the mirrored pack, fetched now when none is mirrored yet;
 /// otherwise answered at once while a background check picks up a newer authority pack.
 fn energy_pack(request: &Request) -> Result<Option<Value>> {
@@ -371,7 +386,17 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
         "accept_tags" => {
             json!(client.accept_tags(asset_id()?, &request.tags, request.expected_revision)?)
         }
-        "update" if !request.asset_ids.is_empty() => client.native(&forward_body(request)?)?,
+        "update" => match request.asset_ids.as_slice() {
+            [] => json!(client.update(asset_id()?, &patch(request)?, request.expected_revision)?),
+            [id] => json!({"assets":[client.update(id, &patch(request)?, request.expected_revision)?]}),
+            _ => {
+                ensure!(
+                    request.expected_revision.is_none(),
+                    "expected_revision requires a single asset"
+                );
+                forward_batch(&client, request)?
+            }
+        },
         "collection_create" if request.parent_id.is_some() => {
             client.native(&forward_body(request)?)?
         }
@@ -389,25 +414,23 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
             client.native(&body)?
         }
         op if FORWARDED.contains(&op) => client.native(&forward_body(request)?)?,
-        "update" => {
-            json!(client.update(asset_id()?, &patch(request)?, request.expected_revision)?)
-        }
-        "remove" => {
-            let ids = if request.asset_ids.is_empty() {
-                vec![asset_id()?.to_owned()]
-            } else {
-                request.asset_ids.clone()
-            };
-            let expected = if ids.len() == 1 {
-                request.expected_revision
-            } else {
-                None
-            };
-            for id in &ids {
-                client.remove(id, expected)?;
+        "remove" => match request.asset_ids.as_slice() {
+            [] => {
+                client.remove(asset_id()?, request.expected_revision)?;
+                json!({"trashed":1})
             }
-            json!({"trashed":ids.len()})
-        }
+            [id] => {
+                client.remove(id, request.expected_revision)?;
+                json!({"trashed":1})
+            }
+            _ => {
+                ensure!(
+                    request.expected_revision.is_none(),
+                    "expected_revision requires a single asset"
+                );
+                forward_batch(&client, request)?
+            }
+        },
         "ingest" => {
             let bytes = decode_base64(
                 request

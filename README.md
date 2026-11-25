@@ -166,6 +166,11 @@ vamp join http://authority-host:7777 --token TOKEN   # attach a replica and sync
 vamp sync                                            # pull later changes (--watch keeps going)
 ```
 
+Upgrade the authority before its replicas when rolling out bulk edits. A current
+replica sends bulk trash as one request and refuses to fall back to one delete per
+asset. Bulk metadata edits are atomic only if the authority also runs the updated
+server; older servers that accept bulk edits can commit part of a failed request.
+
 The Vampire Mac app connects with **Connect to Server…** (mode *URL + token*); the iOS app
 with **Connect via Tailnet** (host, port, optional token). On a [Tailscale](https://tailscale.com) network, `vamp serve --bind
 tailnet` binds this machine's tailnet address and admits allowlisted identities without a

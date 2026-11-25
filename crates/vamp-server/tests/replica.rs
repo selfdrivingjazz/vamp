@@ -14,6 +14,7 @@ fn replica_syncs_browses_offline_fetches_lazily_and_forwards_writes() {
     let authority_home = tempfile::tempdir().unwrap();
     let originals = tempfile::tempdir().unwrap();
     let replica_home = tempfile::tempdir().unwrap();
+    let second_replica_home = tempfile::tempdir().unwrap();
     let bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
     let file = originals.path().join("bat.png");
     std::fs::write(&file, &bytes).unwrap();
@@ -72,6 +73,13 @@ fn replica_syncs_browses_offline_fetches_lazily_and_forwards_writes() {
         assert_eq!(mode & 0o077, 0, "config holding tokens must be owner-only");
     }
     assert_eq!(op(home, json!({"operation":"sync"})).unwrap()["applied"], 0);
+    let second_home = second_replica_home.path();
+    let attached = op(
+        second_home,
+        json!({"operation":"remote_attach","name":"lab","remote_url":url,"token":token}),
+    )
+    .unwrap();
+    assert_eq!(attached["sync"]["snapshot"], true);
 
     // The authority path is readable here (same machine) with the cataloged size and
     // digest, so the replica reads it directly instead of downloading a copy.
@@ -84,9 +92,29 @@ fn replica_syncs_browses_offline_fetches_lazily_and_forwards_writes() {
     assert_eq!(direct, std::path::PathBuf::from(&asset.original.path));
     assert_eq!(std::fs::read(&direct).unwrap(), bytes);
 
-    // Rename through the replica lands on the authority and back in the mirror.
-    let renamed = op(home, json!({"operation":"update","asset_id":asset.id,"name":"Vampire bat","expected_revision":1})).unwrap();
-    assert_eq!(renamed["name"], "Vampire bat");
+    // Two independent replicas editing the same revision must not both succeed.
+    let barrier = std::sync::Barrier::new(2);
+    let edit = |home: &std::path::Path| {
+        barrier.wait();
+        op(
+            home,
+            json!({"operation":"update","asset_id":asset.id,"name":"Vampire bat","expected_revision":1}),
+        )
+    };
+    let outcomes = std::thread::scope(|scope| {
+        let first = scope.spawn(|| edit(home));
+        let second = edit(second_home);
+        [first.join().unwrap(), second]
+    });
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    let conflict = outcomes.into_iter().find_map(Result::err).unwrap();
+    assert!(format!("{conflict:#}").contains("revision conflict"));
+    for replica in [home, second_home] {
+        op(replica, json!({"operation":"sync"})).unwrap();
+        let inspect = op(replica, json!({"operation":"inspect","asset_id":asset.id})).unwrap();
+        assert_eq!(inspect["asset"]["name"], "Vampire bat");
+        assert_eq!(inspect["asset"]["revision"], 2);
+    }
     let view: Value = agent
         .get(format!("{url}/v1/assets/{}", asset.id))
         .header("Authorization", format!("Bearer {token}"))
@@ -105,12 +133,34 @@ fn replica_syncs_browses_offline_fetches_lazily_and_forwards_writes() {
     .unwrap();
     assert_eq!(semantic["semantic"], false);
     assert_eq!(semantic["total"], 1);
-    // Stale revisions are refused by the authority.
+    // Both the legacy single-asset route and the native list form enforce the revision.
     let stale = op(
-        home,
-        json!({"operation":"update","asset_id":asset.id,"name":"x","expected_revision":1}),
-    );
-    assert!(format!("{:#}", stale.unwrap_err()).contains("revision conflict"));
+        second_home,
+        json!({"operation":"update","asset_ids":[asset.id],"name":"x","expected_revision":1}),
+    )
+    .unwrap_err();
+    assert!(format!("{stale:#}").contains("revision conflict"));
+    let native_conflict = agent
+        .post(format!("{url}/v1/native"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send_json(json!({"operation":"update","asset_ids":[asset.id],"name":"x","expected_revision":1}))
+        .unwrap();
+    assert_eq!(native_conflict.status().as_u16(), 409);
+    let ambiguous = op(
+        second_home,
+        json!({"operation":"update","asset_ids":[asset.id, "missing"],"name":"x","expected_revision":2}),
+    )
+    .unwrap_err();
+    assert!(format!("{ambiguous:#}").contains("expected_revision requires a single asset"));
+    let failed_batch = op(
+        second_home,
+        json!({"operation":"update","asset_ids":[asset.id, "missing"],"name":"partial"}),
+    )
+    .unwrap_err();
+    assert!(format!("{failed_batch:#}").contains("asset not found: missing"));
+    let current = op(authority_home.path(), json!({"operation":"inspect","asset_id":asset.id})).unwrap();
+    assert_eq!(current["asset"]["name"], "Vampire bat");
+    assert_eq!(current["asset"]["revision"], 2);
 
     // Eagle-parity writes are forwarded (POST /v1/native) and mirrored by sync.
     let child = op(
@@ -124,6 +174,17 @@ fn replica_syncs_browses_offline_fetches_lazily_and_forwards_writes() {
         json!({"operation":"collection_add","collection_id":child["id"],"asset_ids":[asset.id]}),
     )
     .unwrap();
+    let destination = op(
+        second_home,
+        json!({"operation":"collection_create","name":"Roost","parent_id":collection.id}),
+    )
+    .unwrap();
+    let moved = op(
+        second_home,
+        json!({"operation":"collection_move","collection_id":child["id"],"parent_id":destination["id"],"index":0}),
+    )
+    .unwrap();
+    assert_eq!(moved["parent_id"], destination["id"]);
     let smart = op(
         home,
         json!({"operation":"smart_folder_create","name":"Rated","rules":{"match":"all","rules":[{"field":"rating","op":"gte","value":4}]}}),
@@ -131,7 +192,7 @@ fn replica_syncs_browses_offline_fetches_lazily_and_forwards_writes() {
     .unwrap();
     op(
         home,
-        json!({"operation":"update","asset_ids":[asset.id],"metadata":{"rating":5,"add_tags":["night"]}}),
+        json!({"operation":"update","asset_ids":[asset.id],"metadata":{"rating":5,"add_tags":["night"]},"expected_revision":2}),
     )
     .unwrap();
     op(home, json!({"operation":"touch","asset_id":asset.id})).unwrap();
@@ -162,8 +223,20 @@ fn replica_syncs_browses_offline_fetches_lazily_and_forwards_writes() {
         ),
         (json!(1), json!(0), json!(1))
     );
-    assert_eq!(sidebar["folders"][0]["children"][0]["name"], "Bats");
+    let roost = &sidebar["folders"][0]["children"][0];
+    assert_eq!(roost["id"], destination["id"]);
+    assert_eq!(roost["children"][0]["id"], child["id"]);
+    assert_eq!(roost["children"][0]["count"], 1);
     assert_eq!(sidebar["smart_folders"][0]["count"], 1);
+    op(second_home, json!({"operation":"sync"})).unwrap();
+    let second_sidebar = op(second_home, json!({"operation":"sidebar"})).unwrap();
+    for key in ["all", "trash", "folders", "smart_folders"] {
+        assert_eq!(second_sidebar[key], sidebar[key]);
+    }
+    assert_eq!(
+        op(second_home, json!({"operation":"tags"})).unwrap()["tags"],
+        json!([{"tag":"nocturnal","count":1}])
+    );
 
     // Intake uploads files in parallel and mirrors the created assets at once (no sync round
     // trip before they show); the next sync replays their events.
@@ -192,6 +265,40 @@ fn replica_syncs_browses_offline_fetches_lazily_and_forwards_writes() {
     assert_eq!(op(home, json!({"operation":"sidebar"})).unwrap()["all"], 6);
     assert!(op(home, json!({"operation":"sync"})).unwrap()["applied"].as_u64().unwrap() >= 5);
     assert_eq!(op(home, json!({"operation":"sidebar"})).unwrap()["all"], 6);
+
+    // Failed batches must not change the authority or another replica.
+    let updated = op(
+        second_home,
+        json!({"operation":"update","asset_ids":[ids[1],ids[0]],"metadata":{"rating":4}}),
+    )
+    .unwrap();
+    assert_eq!(updated["assets"][0]["id"], ids[1]);
+    assert_eq!(updated["assets"][1]["id"], ids[0]);
+    assert_eq!(updated["assets"][0]["metadata"]["rating"], 4);
+    let failed_trash = op(
+        second_home,
+        json!({"operation":"remove","asset_ids":[ids[0], "missing"]}),
+    )
+    .unwrap_err();
+    assert!(format!("{failed_trash:#}").contains("asset not found: missing"));
+    op(second_home, json!({"operation":"sync"})).unwrap();
+    assert_eq!(op(second_home, json!({"operation":"sidebar"})).unwrap()["trash"], 0);
+    let trashed = op(
+        second_home,
+        json!({"operation":"remove","asset_ids":[ids[0],ids[1],ids[1]]}),
+    )
+    .unwrap();
+    assert_eq!(trashed["trashed"], 2);
+    op(home, json!({"operation":"sync"})).unwrap();
+    assert_eq!(op(home, json!({"operation":"sidebar"})).unwrap()["trash"], 2);
+    let restored = op(
+        second_home,
+        json!({"operation":"restore","asset_ids":[ids[0],ids[1]]}),
+    )
+    .unwrap();
+    assert_eq!(restored["restored"], 2);
+    op(home, json!({"operation":"sync"})).unwrap();
+    assert_eq!(op(home, json!({"operation":"sidebar"})).unwrap()["trash"], 0);
 
     for _ in 0..2 {
         server.unblock();
