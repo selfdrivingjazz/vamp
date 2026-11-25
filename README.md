@@ -166,6 +166,9 @@ vamp join http://authority-host:7777 --token TOKEN   # attach a replica and sync
 vamp sync                                            # pull later changes (--watch keeps going)
 ```
 
+If the bearer token changes, join the same URL under the same context name with the
+new token. This updates the credential without replacing the mirror or its caches.
+
 Upgrade the authority before its replicas when rolling out bulk edits. A current
 replica sends bulk trash as one request and refuses to fall back to one delete per
 asset. Bulk metadata edits are atomic only if the authority also runs the updated

@@ -758,13 +758,20 @@ fn attach(home: &Path, name: &str, remote: Remote) -> Result<Context> {
     let home = destination(home)?;
     let _lock = config_lock(&home)?;
     let mut config = load_config(&home)?;
-    if let Some(existing) = config.contexts.get(name) {
-        // Re-attaching the same authority resumes (an interrupted attach syncs on).
-        ensure!(
-            existing.library_id == library_id
-                && existing.remote.as_ref().is_some_and(|r| r.url == url),
-            "context already exists: {name}"
-        );
+    if let Some(existing) = config.contexts.get_mut(name) {
+        // Resume the same mirror with the credential that passed the authority check,
+        // retaining its state directory and original-path mappings.
+        let Some(previous) = existing
+            .remote
+            .as_mut()
+            .filter(|previous| existing.library_id == library_id && previous.url == url)
+        else {
+            anyhow::bail!("context already exists: {name}");
+        };
+        if previous.token != remote.token {
+            previous.token = remote.token;
+            atomic_json(&home.join("config.json"), &config)?;
+        }
         drop(_lock);
         return Ok(Library::open(&home, Some(name))?.context);
     }
