@@ -48,6 +48,8 @@ mod native_remote;
 #[cfg(feature = "remote")]
 pub mod remote;
 #[cfg(feature = "remote")]
+pub mod pairing;
+#[cfg(feature = "remote")]
 pub mod cache;
 pub mod thumbs;
 pub mod card;

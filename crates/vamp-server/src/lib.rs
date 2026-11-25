@@ -22,6 +22,7 @@ use vamp_core::io::{Pool, Stalled};
 use vamp_protocol::{Metadata, MetadataPatch, PROTOCOL_VERSION};
 use vamp_diagnostics::Feature;
 mod discovery;
+mod pairing;
 mod dist;
 
 mod jobs_api;
@@ -115,6 +116,7 @@ pub struct App {
     dist: Option<PathBuf>,
     hub: push::Hub,
     tailnet: Option<auth::TailnetAuth>,
+    pairing: Option<pairing::Pairing>,
     /// Per asset/kind turn for on-demand generation (see `representation_path`).
     generating: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     /// Original/cloud-folder filesystem calls for requests: HTTP workers never make them.
@@ -161,6 +163,7 @@ impl App {
             identity,
             hub: push::Hub::default(),
             tailnet: None,
+            pairing: None,
             helper: vamp_core::media_helper(),
             fetcher: ureq::Agent::config_builder()
                 .timeout_global(Some(Duration::from_secs(30)))
@@ -212,6 +215,12 @@ impl App {
             state_dir,
         });
         self
+    }
+    /// Enable direct Tailscale device pairing on this listener.
+    pub fn with_pairing(mut self, addr: std::net::SocketAddrV4) -> Result<Self> {
+        let state_dir = self.lock().state_dir.clone();
+        self.pairing = Some(pairing::Pairing::open(&state_dir, addr)?);
+        Ok(self)
     }
     /// Register the running endpoint locally and, when requested, on the local network.
     pub fn register_discovery(
@@ -546,8 +555,8 @@ fn authorized(app: &App, request: &Request) -> Result<Option<auth::Peer>, String
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim);
     if let Some(given) = given {
-        let (a, b) = (given.as_bytes(), app.token.as_bytes());
-        if a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0 {
+        if pairing::equals(given.as_bytes(), app.token.as_bytes())
+            || app.pairing.as_ref().is_some_and(|pairing| pairing.accepts(given, request.remote_addr().map(|a| a.ip()))) {
             return Ok(None);
         }
     }
@@ -568,7 +577,8 @@ pub(crate) fn handle(app: &Arc<App>, mut request: Request) {
         .or_else(|| {
             (*request.method() == Method::Get && request.url() == "/v1/discovery")
                 .then(|| json_reply(200, &json!(app.identity)))
-        });
+        })
+        .or_else(|| pairing::route(app, &mut request));
     let mut reply = if let Some(reply) = public {
         reply
     } else if *request.method() == Method::Options {
@@ -1835,6 +1845,7 @@ pub fn spawn_jobs(
     interval: Duration,
     health: Arc<health::Health>,
     telemetry: Option<telemetry::Telemetry>,
+    app_models: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut library = match Library::open(&home, Some(&context)) {
@@ -1842,9 +1853,10 @@ pub fn spawn_jobs(
             Err(e) => return eprintln!("vamp-server: job worker disabled: {e:#}"),
         };
         let mut last_error = String::new();
+        let exclude: &[_] = if app_models { &["siglip-embedding", "florence-description", "florence-tags"] } else { &[] };
         loop {
             health.beat("jobs");
-            match library.run_jobs(8) {
+            match library.run_jobs_filtered(8, &[], exclude) {
                 Ok(result) => {
                     last_error.clear();
                     let done = |key: &str| result.get(key).and_then(Value::as_u64).unwrap_or(0);

@@ -181,7 +181,11 @@ enum Command {
     #[cfg(feature = "remote")]
     Join {
         /// `host`, `host:port` (default port 7777) or a full `http://host:port` URL.
-        target: String,
+        #[arg(required_unless_present = "code", conflicts_with = "code")]
+        target: Option<String>,
+        /// Short-lived device code issued by the authority on Tailscale.
+        #[arg(long, conflicts_with = "token")]
+        code: Option<String>,
         /// The authority's bearer token (`vamp-server token` there). Omit on a tailnet whose
         /// server allowlists this machine (`vamp-server allow`).
         #[arg(long, env = "VAMP_REMOTE_TOKEN", hide_env_values = true)]
@@ -209,6 +213,9 @@ enum Command {
         /// Announce this library on the local network (name and ID, never credentials).
         #[arg(long)]
         advertise: bool,
+        /// Allow short-lived device invitations. Requires `--bind tailnet`.
+        #[arg(long)]
+        pairing: bool,
         /// Do not run processor jobs (captions, tags, embeddings) in the server.
         #[arg(long)]
         no_jobs: bool,
@@ -931,6 +938,9 @@ enum JobCommand {
     Run {
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Run only these processors. Repeat for more than one.
+        #[arg(long)]
+        processor: Vec<String>,
         /// Keep installed model processors (`vamp setup install`) loaded in one server per
         /// processor for this and later runs, instead of starting one per job.
         #[arg(long)]
@@ -1133,6 +1143,7 @@ fn execute(cli: Cli) -> Result<Value> {
         #[cfg(feature = "remote")]
         Command::Join {
             target,
+            code,
             token,
             name,
             drive_roots,
@@ -1145,9 +1156,14 @@ fn execute(cli: Cli) -> Result<Value> {
                         .with_context(|| format!("--drive-root needs AUTHORITY=LOCAL: {pair}"))
                 })
                 .collect::<Result<_>>()?;
-            let token = token.unwrap_or_default();
-            let (name, context) =
-                vamp_core::remote::join(&home, &target, &token, name.as_deref(), roots)?;
+            let (name, context) = if let Some(code) = code {
+                let device = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME"))
+                    .unwrap_or_else(|_| "VAMP CLI".into());
+                vamp_core::pairing::join(&home, &code, &device, name.as_deref(), roots)?
+            } else {
+                vamp_core::remote::join(&home, target.as_deref().context("target required")?,
+                    token.as_deref().unwrap_or(""), name.as_deref(), roots)?
+            };
             let mut library = Library::open(&home, Some(&name))?;
             let sync = vamp_core::remote::sync(&mut library)?;
             Ok(
@@ -1158,6 +1174,7 @@ fn execute(cli: Cli) -> Result<Value> {
             bind,
             auth,
             advertise,
+            pairing,
             no_jobs,
             dist,
         } => {
@@ -1165,6 +1182,7 @@ fn execute(cli: Cli) -> Result<Value> {
                 bind,
                 auth,
                 advertise,
+                pairing,
                 no_jobs,
                 dist,
             };
@@ -1728,13 +1746,14 @@ fn execute(cli: Cli) -> Result<Value> {
                     JobCommand::List { status, limit } => Ok(serde_json::to_value(
                         library.jobs(status.as_deref(), limit)?,
                     )?),
-                    JobCommand::Run { limit, warm, idle_seconds } => {
+                    JobCommand::Run { limit, warm, idle_seconds, processor } => {
                         ensure!(limit > 0, "job run limit must be positive");
                         if warm {
                             library.warm = warm_processors(&home)?;
                             library.warm_idle_seconds = idle_seconds.unwrap_or(vamp_core::SERVE_IDLE_SECONDS);
                         }
-                        let result = library.run_jobs(limit)?;
+                        let include: Vec<_> = processor.iter().map(String::as_str).collect();
+                        let result = library.run_jobs_filtered(limit, &include, &[])?;
                         if result.get("failed").and_then(Value::as_u64).unwrap_or(0) > 0 {
                             bail!("one or more jobs or uploads failed: {result}");
                         }

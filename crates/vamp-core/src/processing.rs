@@ -341,6 +341,12 @@ impl Library {
         bail!("warm processors require Unix sockets");
     }
     pub fn run_jobs(&mut self, limit: usize) -> Result<Value> {
+        self.run_jobs_filtered(limit, &[], &[])
+    }
+
+    /// Empty `include` selects all local processors and runs auxiliary queues; `exclude`
+    /// lets an app own selected models without racing the authority's generic drain.
+    pub fn run_jobs_filtered(&mut self, limit: usize, include: &[&str], exclude: &[&str]) -> Result<Value> {
         ensure!((1..=1000).contains(&limit), "job run limit must be 1–1000");
         let lock = OpenOptions::new()
             .create(true)
@@ -369,13 +375,15 @@ impl Library {
         let mut deferred = 0;
         let mut jobs = Vec::new();
         let mut after = 0i64;
+        let include_filter = if include.is_empty() { None } else { Some(serde_json::to_string(include)?) };
+        let exclude_filter = if exclude.is_empty() { None } else { Some(serde_json::to_string(exclude)?) };
         while jobs.len() < limit {
             // The current registration decides placement: `remote` jobs wait for /v1/jobs/claim.
             let Some((rowid, mut job)) = self
                 .conn
                 .query_row(
-                    "SELECT j.rowid,j.document FROM jobs j LEFT JOIN processors p ON p.name=j.processor WHERE j.status='pending' AND j.rowid>?1 AND coalesce(json_extract(p.document,'$.placement'),'any')!='remote' ORDER BY j.rowid LIMIT 1",
-                    [after],
+                    "SELECT j.rowid,j.document FROM jobs j LEFT JOIN processors p ON p.name=j.processor WHERE j.status='pending' AND j.rowid>?1 AND coalesce(json_extract(p.document,'$.placement'),'any')!='remote' AND (?2 IS NULL OR j.processor IN (SELECT value FROM json_each(?2))) AND (?3 IS NULL OR j.processor NOT IN (SELECT value FROM json_each(?3))) ORDER BY j.rowid LIMIT 1",
+                    params![after, include_filter, exclude_filter],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
                 )
                 .optional()?
@@ -415,9 +423,11 @@ impl Library {
             jobs.push(job);
         }
         // Cloud uploads share the worker lock so `jobs run/watch` and vamp-server drain both.
-        let storage = self.run_uploads(limit)?;
-        // Eagle thumbnails (import phase B) have their own lock: the app bridge may copy too.
-        let thumbnails = self.copy_eagle_thumbnails(limit.max(64), &mut |_| {})?;
+        let (storage, thumbnails) = if include.is_empty() {
+            (self.run_uploads(limit)?, self.copy_eagle_thumbnails(limit.max(64), &mut |_| {})?)
+        } else {
+            (Value::Null, Value::Null)
+        };
         let count = |key: &str| storage[key].as_u64().unwrap_or(0);
         let evicted = storage["evicted"].as_array().map_or(0, Vec::len) as u64;
         Ok(json!({

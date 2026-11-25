@@ -227,13 +227,15 @@ impl Client {
             "remote url must be http:// or https://"
         );
         // An empty token relies on the authority's Tailscale identity auth.
-        let agent = ureq::Agent::config_builder()
+        let mut config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_recv_response(Some(Duration::from_secs(120)))
-            .timeout_recv_body(Some(BODY_TIMEOUT))
-            .build()
-            .into();
+            .timeout_recv_body(Some(BODY_TIMEOUT));
+        if crate::pairing::is_direct_tailnet_url(&remote.url) {
+            config = config.proxy(None).max_redirects(0);
+        }
+        let agent = config.build().into();
         Ok(Self {
             agent,
             base: format!("{}/v1", remote.url.trim_end_matches('/')),

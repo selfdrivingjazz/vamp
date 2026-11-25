@@ -10,6 +10,7 @@ pub struct Options {
     pub bind: Option<String>,
     pub auth: Option<String>,
     pub advertise: bool,
+    pub pairing: bool,
     pub no_jobs: bool,
     pub dist: Option<PathBuf>,
 }
@@ -32,6 +33,9 @@ pub fn run(home: &Path, context: Option<&str>, options: Options) -> Result<()> {
     }
     if options.advertise {
         command.arg("--advertise");
+    }
+    if options.pairing {
+        command.arg("--pairing");
     }
     if options.no_jobs {
         command.arg("--no-jobs");

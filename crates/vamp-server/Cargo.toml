@@ -16,8 +16,9 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 blake3.workspace = true
+chrono.workspace = true
 vamp-protocol.workspace = true
-vamp-core = { workspace = true, features = ["native"] }
+vamp-core = { workspace = true, features = ["native", "remote"] }
 vamp-diagnostics.workspace = true
 # Small synchronous HTTP/1.1 server: no async runtime for a single-library, LAN-scale API.
 tiny_http = "0.12"
@@ -34,5 +35,4 @@ base64 = "0.22"
 anyhow.workspace = true
 tempfile = "3"
 ureq = "3"
-vamp-core = { workspace = true, features = ["native", "remote"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "webp"] }

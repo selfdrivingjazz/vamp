@@ -1187,6 +1187,11 @@ pub fn install(
     profile_version: Option<u32>,
 ) -> Result<Value> {
     let home = absolute(home)?;
+    // Search and captions share the Python environment, downloads and choices file.
+    fs::create_dir_all(&home)?;
+    let install_lock = fs::OpenOptions::new().create(true).truncate(false)
+        .read(true).write(true).open(home.join("setup-install.lock"))?;
+    install_lock.lock()?;
     if profile_version.is_some() || upgrade {
         ensure!(!names.iter().any(|name| name == "recommended"),
             "--profile and --upgrade require named components, not recommended");

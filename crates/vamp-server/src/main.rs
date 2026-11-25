@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use vamp_core::{Library, default_home, load_config};
 use vamp_diagnostics::{Event, Feature, Product, Reporter};
 use vamp_server::auth::{Allowlist, AuthMode, Tailscale};
@@ -31,12 +32,21 @@ enum Command {
         /// for another port). Use `tailnet` to accept other machines on your Tailscale network.
         #[arg(long, default_value = "127.0.0.1:7777")]
         bind: String,
+        /// Fall back to an OS-assigned port if the requested port is already in use.
+        #[arg(long)]
+        fallback_port: bool,
+        /// Stop this app-owned instance when its parent exits.
+        #[arg(long, hide = true)]
+        parent_pid: Option<u32>,
         /// Default: `tailscale` when bound to a tailnet address, else `token`.
         #[arg(long, value_enum)]
         auth: Option<AuthMode>,
         /// Announce this library on the local network (name and ID, never credentials).
         #[arg(long)]
         advertise: bool,
+        /// Allow short-lived device invitations. Requires `--bind tailnet`.
+        #[arg(long)]
+        pairing: bool,
         /// HTTP workers. Requests never touch cloud folders (originals go through a separate
         /// bounded I/O pool), so workers are cheap.
         #[arg(long, default_value_t = 16)]
@@ -44,6 +54,9 @@ enum Command {
         /// Do not run processor jobs (captions, tags, embeddings) in this process.
         #[arg(long)]
         no_jobs: bool,
+        /// Leave the bundled search and caption queues to the app.
+        #[arg(long, hide = true)]
+        app_models: bool,
         /// Seconds between job queue polls when idle.
         #[arg(long, default_value_t = 5)]
         jobs_interval: u64,
@@ -52,6 +65,8 @@ enum Command {
         #[arg(long, env = "VAMP_DIST")]
         dist: Option<PathBuf>,
     },
+    #[command(hide = true)]
+    AppAgent,
     /// Write ~/Library/LaunchAgents/com.selfdrivingjazz.vamp.server.<context>.plist (does not load it).
     InstallAgent(ServiceArgs),
     /// Write a user service (launchd on macOS, systemd on Linux) without loading it.
@@ -239,10 +254,98 @@ fn resolve_bind(bind: &str, tailscale: &Tailscale) -> Result<String> {
     Ok(format!("{}:{port}", tailscale.ipv4()?))
 }
 
+/// The bundled SMAppService launch agent is immutable. Its one selected library and bind
+/// are written by the app before registration, rather than embedding a user's paths in its plist.
+#[cfg(target_os = "macos")]
+fn app_agent() -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    #[derive(serde::Deserialize)]
+    struct Settings {
+        home: PathBuf,
+        context: String,
+        bind: String,
+    }
+    let settings = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
+        .join("Library/Application Support/VAMP/vampire-agent.json");
+    let file = std::fs::File::open(settings)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= 16 * 1024
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0,
+        "invalid app agent settings"
+    );
+    let Settings { home, context, bind } = serde_json::from_reader(file)?;
+    ensure!(home.is_absolute(), "invalid app agent home");
+    let port = bind.strip_prefix("127.0.0.1:").or_else(|| bind.strip_prefix("tailnet:"))
+        .and_then(|s| s.parse::<u16>().ok()).filter(|port| *port != 0);
+    ensure!(port.is_some(), "invalid app agent bind");
+    // Preserve the same CLI and liveness behavior (including diagnostics) as a direct serve.
+    use std::os::unix::process::CommandExt;
+    let executable = std::env::current_exe()?;
+    let log = open_agent_log(&home, &context)?;
+    let mut child = std::process::Command::new(executable);
+    child.args(["--home"]).arg(&home).args([
+        "--context", &context, "serve", "--bind", &bind, "--auth", "token", "--fallback-port", "--app-models",
+    ]);
+    if bind.starts_with("tailnet") {
+        child.args(["--advertise", "--pairing"]);
+    }
+    Err(child.stdout(log.try_clone()?).stderr(log).exec().into())
+}
+
+#[cfg(target_os = "macos")]
+fn open_agent_log(home: &Path, context: &str) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let library = Library::open(home, Some(context))?;
+    let path = library.state_dir.join("onboarding-server.log");
+    let file = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(path)?;
+    if file.metadata()?.len() > 512 * 1024 {
+        file.set_len(0)?;
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+static STOP_SERVER: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn stop_server(_: libc::c_int) {
+    STOP_SERVER.store(true, Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn supervise_shutdown(server: &Arc<tiny_http::Server>, threads: usize, parent: Option<u32>) {
+    // The signal handler only sets a flag. Stop accepting requests and let the server
+    // unwind normally so its registry entry and Bonjour announcement are removed.
+    unsafe {
+        libc::signal(libc::SIGTERM, stop_server as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, stop_server as *const () as libc::sighandler_t);
+    }
+    let server = server.clone();
+    std::thread::spawn(move || loop {
+        if STOP_SERVER.load(Ordering::Relaxed)
+            || parent.is_some_and(|pid| unsafe { libc::getppid() } as u32 != pid)
+        {
+            for _ in 0..threads.max(1) {
+                server.unblock();
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    });
+}
+
 fn main() -> Result<()> {
     vamp_core::allow_cloud_placeholder_reads();
     let cli = Cli::parse();
     let home = cli.home.clone().unwrap_or_else(default_home);
+    if matches!(cli.command, Command::AppAgent) {
+        #[cfg(target_os = "macos")]
+        return app_agent();
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!("this command is only available on macOS");
+    }
     let reporter = matches!(cli.command, Command::Serve { .. })
         .then(|| vamp_diagnostics::reporter(&home, Product::server()))
         .flatten();
@@ -266,6 +369,7 @@ fn run(cli: Cli, home: &Path, reporter: Option<&Arc<Reporter>>) -> Result<()> {
         "context {name} is a replica; serve its authority library instead"
     );
     match cli.command {
+        Command::AppAgent => unreachable!(),
         Command::Token => println!("{}", vamp_server::token(&library.state_dir)?),
         Command::Allow {
             users,
@@ -293,16 +397,43 @@ fn run(cli: Cli, home: &Path, reporter: Option<&Arc<Reporter>>) -> Result<()> {
         Command::InstallService(options) => install_service(home, &name, &options)?,
         Command::Serve {
             bind,
+            fallback_port,
+            parent_pid,
             auth,
             advertise,
+            pairing,
             threads,
             no_jobs,
+            app_models,
             jobs_interval,
             dist,
         } => {
             let tailscale = Tailscale::discover();
+            ensure!(!pairing || bind == "tailnet" || bind.starts_with("tailnet:"), "--pairing requires --bind tailnet");
             let bind = resolve_bind(&bind, &tailscale)?;
-            let server = tiny_http::Server::http(&bind).map_err(|e| anyhow!("bind {bind}: {e}"))?;
+            let state_dir = library.state_dir.clone();
+            // One authority process per library. Keep this descriptor alive for the whole serve.
+            // A crashed process releases the lock; never remove the file while another may hold it.
+            let _instance = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(state_dir.join("serve.lock"))?;
+            _instance.try_lock().context("another server is already running for this library")?;
+            let server = match tiny_http::Server::http(&bind) {
+                Ok(server) => server,
+                Err(error) if fallback_port && error.downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse) =>
+                {
+                    let mut fallback: std::net::SocketAddr = bind.parse().context("fallback requires a literal bind address")?;
+                    fallback.set_port(0);
+                    tiny_http::Server::http(fallback).map_err(|e| anyhow!("bind {fallback}: {e}"))?
+                }
+                Err(error) => return Err(anyhow!("bind {bind}: {error}")),
+            };
+            let server = Arc::new(server);
+            #[cfg(unix)]
+            supervise_shutdown(&server, threads, parent_pid);
             let addr = server.server_addr().to_ip().context("server has no IP address")?;
             ensure!(
                 !advertise || !addr.ip().is_loopback(),
@@ -314,7 +445,6 @@ fn run(cli: Cli, home: &Path, reporter: Option<&Arc<Reporter>>) -> Result<()> {
             } else {
                 AuthMode::Token
             });
-            let state_dir = library.state_dir.clone();
             // Exits (status 70) when workers stop making progress; launchd KeepAlive restarts.
             let mut app = vamp_server::App::new(library, &name)?.with_watchdog();
             if auth == AuthMode::Tailscale {
@@ -324,6 +454,10 @@ fn run(cli: Cli, home: &Path, reporter: Option<&Arc<Reporter>>) -> Result<()> {
                     allow.users, allow.tags
                 );
                 app = app.with_tailnet(tailscale);
+            }
+            if pairing {
+                let std::net::SocketAddr::V4(addr) = addr else { anyhow::bail!("pairing requires a Tailscale IPv4 listener") };
+                app = app.with_pairing(addr)?;
             }
             let dist = dist.or_else(|| Some(home.join("dist")).filter(|d| d.is_dir()));
             if let Some(dir) = dist {
@@ -368,9 +502,10 @@ fn run(cli: Cli, home: &Path, reporter: Option<&Arc<Reporter>>) -> Result<()> {
                     Duration::from_secs(jobs_interval.max(1)),
                     app.health(),
                     telemetry,
+                    app_models,
                 );
             }
-            vamp_server::serve(std::sync::Arc::new(server), app, threads);
+            vamp_server::serve(server, app, threads);
         }
     }
     Ok(())

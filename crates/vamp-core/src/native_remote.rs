@@ -185,6 +185,14 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
             json!({"name":name,"library_id":context.library_id,"state_dir":context.state_dir,"remote_url":context.remote.map(|r| r.url),"sync":sync}),
         ));
     }
+    if request.operation == "pairing_join" {
+        let code = request.pairing_code.as_deref().context("pairing code is required")?;
+        let device = request.device.as_deref().context("device name is required")?;
+        let (name, _) = crate::pairing::join(home, code, device, None, Default::default())?;
+        // Opening the new context starts ordinary replica sync. The invitation is already
+        // consumed and the device credential saved; a slow sync must not prevent opening.
+        return Ok(Some(json!({"name": name})));
+    }
     let operation = request.operation.as_str();
     if operation == "sync_status" {
         return sync_status(request).map(Some);

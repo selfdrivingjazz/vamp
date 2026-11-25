@@ -46,6 +46,8 @@ pub struct Request {
     pub filename: Option<String>,
     pub remote_url: Option<String>,
     pub token: Option<String>,
+    pub pairing_code: Option<String>,
+    pub device: Option<String>,
     #[serde(default)]
     pub semantic: bool,
     #[serde(default)]
@@ -498,6 +500,17 @@ pub fn dispatch(library: &mut Library, request: Request) -> Result<Value> {
     };
     match request.operation.as_str() {
         "doctor" => library.doctor(false, &[]),
+        "setup_progress" => {
+            let mut stmt = library.conn.prepare_cached(
+                "SELECT j.processor,j.status,count(DISTINCT j.asset_id) FROM jobs j JOIN assets a ON a.id=j.asset_id
+                 WHERE a.deleted=0 AND a.trashed=0 AND a.hash=json_extract(j.document,'$.source_hash')
+                 GROUP BY j.processor,j.status",
+            )?;
+            let jobs = stmt.query_map([], |r| {
+                Ok(json!({"processor":r.get::<_, String>(0)?, "status":r.get::<_, String>(1)?, "count":r.get::<_, i64>(2)?}))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(json!({"tiers":crate::thumbs::tier_stats(library)?, "eagle_pending":library.pending_eagle_thumbnails()?, "jobs":jobs}))
+        }
         "remember_import_root" => {
             library.remember_import_root(request.path.as_deref().context("path is required")?)?;
             Ok(json!({"recorded":true}))

@@ -187,6 +187,14 @@ vamp sync                                            # pull later changes (--wat
 If the bearer token changes, join the same URL under the same context name with the
 new token. This updates the credential without replacing the mirror or its caches.
 
+To join by code, run `vamp serve --bind tailnet --pairing` on the authority and
+generate a code in the Vampire Mac app on that same machine. On another connected
+Tailscale device, use the app or run `vamp join --code CODE`. The code expires in
+three minutes, can be used once, and carries no permanent credential. The authority
+records paired devices separately from its owner token. Codes, QR links and paired
+credentials use a direct Tailscale connection; multicast and unencrypted Wi-Fi don't
+carry them. A successful join grants normal library access, including edits.
+
 Upgrade the authority before its replicas when rolling out bulk edits. A current
 replica sends bulk trash as one request and refuses to fall back to one delete per
 asset. Bulk metadata edits are atomic only if the authority also runs the updated

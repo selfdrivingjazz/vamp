@@ -20,6 +20,9 @@
   service on Linux or macOS.
 - Running servers register per user for local discovery. `serve --advertise` also announces
   the library to nearby Vampire Macs via DNS-SD, without sharing any credentials.
+- `vamp serve --bind tailnet --pairing` enables three-minute, single-use device codes.
+  `vamp join --code CODE` joins without a server address or owner token. Successful
+  joins get their own credential; the server records when each device last connected.
 - `vamp setup install recommended` uses a bundled, versioned toolkit. Libraries keep
   their registered processors and embedding model unless explicitly upgraded.
 - `vamp diagnostics` now covers optional, anonymous usage and health reports for
