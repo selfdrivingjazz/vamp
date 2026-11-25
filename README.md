@@ -270,6 +270,17 @@ on the connection.
   `<home>/diagnostics-state.json` holds pending bucketed reports, the send budget,
   and the last delivery result. Both are mode 600 on Unix.
 
+### Private Apple crash intake
+
+`vamp-server serve --bind tailnet --apple-crash-db /private/path/reports.sqlite3`
+enables a separate Apple crash and hang receiver on the existing listener.
+The database's parent directory must already exist. Only direct Tailscale
+peers on the library allowlist can submit bounded Apple reports; a library
+bearer token alone does not work. There is no read endpoint. The database
+groups matching stacks by build, counts distinct occurrences, records no
+request IPs or headers, and expires reports after 90 days. This switch
+does not change CLI/server telemetry or enable client reporting.
+
 ## Connect an AI assistant
 
 `vamp mcp` connects an MCP client to the selected authority or replica context. It uses

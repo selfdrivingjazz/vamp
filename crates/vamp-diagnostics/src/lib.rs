@@ -2,6 +2,7 @@
 //! to the diagnostics home, endpoint, and policy. Only typed, bucketed events
 //! reach the user-chosen OTLP/HTTP endpoint.
 
+pub mod apple;
 mod event;
 pub use event::{Event, Feature, LibraryRole, Outcome, Product};
 use event::{Component, Record};
@@ -464,6 +465,22 @@ fn failure(error: &ureq::Error) -> &'static str {
     }
 }
 
+fn post(url: &str, headers: &[(String, String)], body: &[u8]) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_global(Some(SEND_TIMEOUT))
+        .max_redirects(0)
+        .proxy(None)
+        .user_agent("vamp-diagnostics")
+        .build()
+        .into();
+    let mut request = agent.post(url).header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    request.send(body)
+}
+
 impl Reporter {
     /// Record only bounded dimensions; queue a batch and try delivery if due.
     pub fn record(&self, event: Event) {
@@ -575,21 +592,7 @@ impl Reporter {
         if body.len() > MAX_BODY {
             return None;
         }
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_global(Some(SEND_TIMEOUT))
-            .max_redirects(0)
-            .proxy(None)
-            .user_agent("vamp-diagnostics")
-            .build()
-            .into();
-        let mut request = agent
-            .post(format!("{}/v1/logs", self.settings.endpoint))
-            .header("content-type", "application/json");
-        for (name, value) in &self.settings.headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
-        Some(match request.send(body) {
+        Some(match post(&format!("{}/v1/logs", self.settings.endpoint), &self.settings.headers, body) {
             Ok(response) => {
                 let status = response.status();
                 (Delivery {

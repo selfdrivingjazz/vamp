@@ -20,6 +20,7 @@ chrono.workspace = true
 vamp-protocol.workspace = true
 vamp-core = { workspace = true, features = ["native", "remote"] }
 vamp-diagnostics.workspace = true
+rusqlite.workspace = true
 # Small synchronous HTTP/1.1 server: no async runtime for a single-library, LAN-scale API.
 tiny_http = "0.12"
 # Client for /v1/clip image downloads (same client vamp-core's `remote` feature uses).
@@ -30,7 +31,6 @@ libc = "0.2"
 mdns-sd = { version = "0.22", default-features = false }
 
 [dev-dependencies]
-rusqlite.workspace = true
 base64 = "0.22"
 anyhow.workspace = true
 tempfile = "3"

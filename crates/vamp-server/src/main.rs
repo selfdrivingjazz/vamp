@@ -64,6 +64,9 @@ enum Command {
         /// Default: <VAMP_HOME>/dist when that directory exists.
         #[arg(long, env = "VAMP_DIST")]
         dist: Option<PathBuf>,
+        /// Store Apple crash reports here. Intake requires an allowlisted tailnet peer.
+        #[arg(long, env = "VAMP_APPLE_CRASH_DB")]
+        apple_crash_db: Option<PathBuf>,
     },
     #[command(hide = true)]
     AppAgent,
@@ -407,6 +410,7 @@ fn run(cli: Cli, home: &Path, reporter: Option<&Arc<Reporter>>) -> Result<()> {
             app_models,
             jobs_interval,
             dist,
+            apple_crash_db,
         } => {
             let tailscale = Tailscale::discover();
             ensure!(!pairing || bind == "tailnet" || bind.starts_with("tailnet:"), "--pairing requires --bind tailnet");
@@ -454,6 +458,11 @@ fn run(cli: Cli, home: &Path, reporter: Option<&Arc<Reporter>>) -> Result<()> {
                     allow.users, allow.tags
                 );
                 app = app.with_tailnet(tailscale);
+            }
+            if let Some(path) = apple_crash_db {
+                ensure!(on_tailnet && auth == AuthMode::Tailscale,
+                    "Apple crash intake requires a tailnet listener with Tailscale auth");
+                app = app.with_apple_crash_db(&path)?;
             }
             if pairing {
                 let std::net::SocketAddr::V4(addr) = addr else { anyhow::bail!("pairing requires a Tailscale IPv4 listener") };

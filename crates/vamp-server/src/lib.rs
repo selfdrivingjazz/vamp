@@ -27,6 +27,7 @@ mod dist;
 
 mod jobs_api;
 mod open;
+mod apple_crashes;
 
 /// Threads that run original/cloud-folder filesystem calls for requests (see `stream`).
 const IO_THREADS: usize = 8;
@@ -125,6 +126,7 @@ pub struct App {
     health: Arc<health::Health>,
     watchdog: bool,
     telemetry: Option<telemetry::Telemetry>,
+    apple_crashes: Option<apple_crashes::Collector>,
 }
 
 /// The library, with its hold time visible to `/v1/health`.
@@ -179,6 +181,7 @@ impl App {
             health: Arc::default(),
             watchdog: false,
             telemetry: None,
+            apple_crashes: None,
         })
     }
     /// How long requests wait for an original without progress (default [`ORIGINAL_DEADLINE`]).
@@ -195,6 +198,11 @@ impl App {
     pub fn with_telemetry(mut self, telemetry: telemetry::Telemetry) -> Self {
         self.telemetry = Some(telemetry);
         self
+    }
+
+    pub fn with_apple_crash_db(mut self, path: &Path) -> Result<Self> {
+        self.apple_crashes = Some(apple_crashes::Collector::open(path)?);
+        Ok(self)
     }
 
     /// Liveness shared with background loops (see [`spawn_jobs`]).
@@ -264,6 +272,14 @@ pub fn serve(server: Arc<Server>, app: App, threads: usize) {
     let app = Arc::new(app);
     push::spawn_watcher(Arc::downgrade(&app));
     spawn_original_sweep(Arc::downgrade(&app));
+    if app.apple_crashes.is_some() {
+        let app = Arc::downgrade(&app);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(3600));
+            let Some(app) = app.upgrade() else { break };
+            if let Some(collector) = &app.apple_crashes { collector.sweep(); }
+        });
+    }
     let threads = threads.max(1);
     let first = app.health.http.add_workers(threads);
     if app.watchdog {
@@ -571,6 +587,17 @@ fn authorized(app: &App, request: &Request) -> Result<Option<auth::Peer>, String
 }
 
 pub(crate) fn handle(app: &Arc<App>, mut request: Request) {
+    if request.url() == vamp_diagnostics::apple::ROUTE {
+        let reply = match (&app.apple_crashes, &app.tailnet, request.method()) {
+            (Some(collector), Some(tailnet), &Method::Post)
+                if tailnet.check(request.remote_addr().map(|addr| addr.ip())).is_ok() =>
+                    collector.receive(&mut request).unwrap_or_else(HttpError::reply),
+            (Some(_), Some(_), &Method::Post) => error_reply(401, "tailnet peer not allowed"),
+            _ => error_reply(404, "not found"),
+        };
+        let _ = request.respond(reply);
+        return;
+    }
     let origin = extension_origin(&request);
     let public = dist::route(app.dist.as_deref(), &request)
         .or_else(|| open::route(&request))
