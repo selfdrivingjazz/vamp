@@ -1420,9 +1420,17 @@ impl Library {
     /// Live asset count matching a smart folder.
     pub fn smart_folder_count(&self, folder: &SmartFolder) -> Result<i64> {
         let clause = smart_clause(&self.conn, &folder.rules)?;
+        // The facet index covers dimensions, ratings, colors, etc., but not names.
+        // For name-only rules the name index covers both the live check and predicate;
+        // using the facet index would read the JSON document of every live asset.
+        let index = if !folder.rules.rules.is_empty() && folder.rules.rules.iter().all(|r| r.field == "name") {
+            "assets_name"
+        } else {
+            "assets_facets"
+        };
         Ok(self.conn.query_row(
             &format!(
-                "SELECT count(*) FROM assets a INDEXED BY assets_facets WHERE {LIVE} AND ({})",
+                "SELECT count(*) FROM assets a INDEXED BY {index} WHERE {LIVE} AND ({})",
                 clause.sql
             ),
             rusqlite::params_from_iter(clause.args.iter()),

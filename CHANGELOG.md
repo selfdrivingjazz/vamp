@@ -10,6 +10,8 @@
 - A replica edit reports the catch-up sync it waits for in `sync_status`.
 - Event pages and long-poll updates use gzip when the replica accepts it; older
   clients can still request plain JSON.
+- Smart folders filtered only by item name now count matches from the name index,
+  without reading every live item's metadata document.
 
 ## 0.4.2 — 2026-11-04
 

@@ -11,6 +11,22 @@ fn library() -> (TempDir, Library, std::path::PathBuf) {
     (dir, lib, source)
 }
 
+#[test]
+fn name_rule_counts_follow_renames_and_exclude_unmatched_names() {
+    let (_dir, mut lib, source) = library();
+    let asset = lib.add(&source, Some("Orange Lantern"), Metadata::default()).unwrap();
+    let rules = serde_json::from_value(serde_json::json!({
+        "match":"all","rules":[
+            {"field":"name","op":"starts_with","value":"orange"},
+            {"field":"name","op":"contains","value":"ANT"}
+        ]
+    })).unwrap();
+    let folder = lib.smart_folder_create("Lamps", rules, None).unwrap();
+    assert_eq!(lib.smart_folder_count(&folder).unwrap(), 1);
+    lib.update(&asset.id, MetadataPatch { name: Some("Orange Sky".into()), ..Default::default() }, None).unwrap();
+    assert_eq!(lib.smart_folder_count(&folder).unwrap(), 0);
+}
+
 #[cfg(feature = "native")]
 #[test]
 fn readable_names_keep_display_names_and_detect_context_collisions() {
