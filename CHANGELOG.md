@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The authority's background originals check emits `original_checked` only when an
+  original's health changes. Each confirming check used to emit one, about 15,000 events
+  an hour on a 10,000-item library, and every replica re-fetched each checked asset; a
+  replica that had been asleep for twenty minutes had to download the whole catalog again
+  before its next edit finished.
+- A replica edit reports the catch-up sync it waits for in `sync_status`.
+
 ## 0.4.2 — 2026-11-04
 
 - Warm job batches accept `--idle-seconds N` (default 900); `vamp jobs stop-warm

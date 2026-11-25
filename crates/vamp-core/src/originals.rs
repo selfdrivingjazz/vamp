@@ -78,8 +78,12 @@ fn referenced(original: &Original) -> bool {
 }
 
 impl Library {
-    /// Save health through the same asset document and event stream as metadata sync.
-    /// The path guard prevents a stale in-flight stat overwriting a concurrent relink.
+    /// Save health in the asset document; publish `original_checked` only when the health
+    /// itself changed (state or check error). A check that confirms the known health only
+    /// refreshes the authority's `last_checked_at`: the sweep re-checks every original
+    /// around the clock, and an event per check made replicas replay and re-fetch the
+    /// whole catalog every pass. The path guard prevents a stale in-flight stat overwriting
+    /// a concurrent relink.
     pub fn record_original_check(&self, id: &str, path: &str, check: Check) -> Result<()> {
         ensure!(
             self.context.remote.is_none(),
@@ -104,18 +108,21 @@ impl Library {
             Check::Unreadable(error) => health.check_error = Some(error),
         }
         health.last_checked_at = Some(now());
+        let changed = before.state != health.state || before.check_error != health.check_error;
         // Health does not change content identity, revision, timestamps, or derived records.
         tx.execute(
             "UPDATE assets SET document=?2 WHERE id=?1",
             params![id, json_text(&asset)?],
         )?;
-        emit(
-            &tx,
-            &self.context,
-            "original_checked",
-            Some(&asset),
-            json!({"previous":before,"availability":asset.original.availability}),
-        )?;
+        if changed {
+            emit(
+                &tx,
+                &self.context,
+                "original_checked",
+                Some(&asset),
+                json!({"previous":before,"availability":asset.original.availability}),
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -515,6 +522,29 @@ mod tests {
         assert!(error.downcast_ref::<OriginalMissing>().is_some());
         assert_eq!(library.doctor(false, &[]).unwrap()["counts"]["missing"], 1);
         assert!(library.inspect(&asset.id).is_ok());
+    }
+    #[test]
+    fn confirming_checks_publish_no_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::write(&source, b"original").unwrap();
+        let mut lib = Library::init(&tmp.path().join("home"), "test", None, None).unwrap();
+        let asset = lib.add(&source, None, Metadata::default()).unwrap();
+        let path = asset.original.path.clone();
+        let checked = |lib: &Library| lib.inspect(&asset.id).unwrap().asset.original.availability;
+        let cursor = lib.last_event().unwrap();
+        for _ in 0..3 {
+            lib.record_original_check(&asset.id, &path, Check::Present).unwrap();
+        }
+        assert_eq!(lib.last_event().unwrap(), cursor, "an unchanged check is not a change");
+        assert!(checked(&lib).last_checked_at.is_some());
+        lib.record_original_check(&asset.id, &path, Check::Missing).unwrap();
+        lib.record_original_check(&asset.id, &path, Check::Missing).unwrap();
+        assert_eq!(lib.last_event().unwrap(), cursor + 1);
+        lib.record_original_check(&asset.id, &path, Check::Unreadable("denied".into())).unwrap();
+        lib.record_original_check(&asset.id, &path, Check::Present).unwrap();
+        assert_eq!(lib.last_event().unwrap(), cursor + 3);
+        assert_eq!(checked(&lib).state, OriginalState::Present);
     }
     #[test]
     fn explicit_relink_verifies_hash_and_stale_stat_cannot_undo_it() {

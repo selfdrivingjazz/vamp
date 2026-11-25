@@ -5,7 +5,7 @@ use super::native::{Request, decode_base64, expand};
 use super::cache::{self, CachePolicy, Previews};
 use super::remote::{
     Transfer, attach_remote, download_previews, download_thumbnails, fetch_grid,
-    representation_with, sync, sync_wait, sync_with,
+    representation_with, sync_wait, sync_with,
 };
 use super::*;
 
@@ -480,7 +480,9 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
         }
         _ => unreachable!("filtered above"),
     };
-    sync(&mut library)?;
+    // Progress visible to `sync_status`: a write waits for this catch-up, and a replica that
+    // was offline can be many pages behind.
+    sync_progress(&mut library)?;
     spawn_downloader(&library, false)?;
     Ok(Some(value))
 }
@@ -688,9 +690,8 @@ fn jittered(base: Duration) -> Duration {
     base.mul_f64(0.75 + f64::from(nanos % 1000) / 2000.0)
 }
 
-/// `sync` with progress visible to `sync_status`; afterwards thumbnails download in the
-/// background (retrying earlier failures, e.g. after being offline).
-fn tracked_sync(library: &mut Library) -> Result<Value> {
+/// `sync` whose progress `sync_status` reports while it runs.
+fn sync_progress(library: &mut Library) -> Result<Value> {
     let key = library.state_dir.clone();
     locked(&SYNCS).insert(key.clone(), json!({"phase":"starting","done":0,"total":0}));
     let result = sync_with(library, &mut |phase, done, total| {
@@ -700,7 +701,13 @@ fn tracked_sync(library: &mut Library) -> Result<Value> {
         );
     });
     locked(&SYNCS).remove(&key);
-    let mut value = result?;
+    result
+}
+
+/// [`sync_progress`]; afterwards thumbnails download in the background (retrying earlier
+/// failures, e.g. after being offline).
+fn tracked_sync(library: &mut Library) -> Result<Value> {
+    let mut value = sync_progress(library)?;
     // Micro-thumbnails arrive with the catalog (~1 KB each), so every tile has an image
     // before the first real thumbnail downloads. Best effort: older authorities lack packs.
     match crate::thumbs::sync_micros(library) {
