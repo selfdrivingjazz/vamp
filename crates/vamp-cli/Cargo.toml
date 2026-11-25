@@ -15,14 +15,14 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 vamp-core = { workspace = true, features = ["native"] }
+vamp-diagnostics.workspace = true
 vamp-protocol.workspace = true
 tiny_http = "0.12"
 base64 = "0.22"
 chrono.workspace = true
 # `vamp setup install` times its processors on a generated JPEG (already built for vamp-core).
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
-# HTTP client: opt-in diagnostics reports (`vamp diagnostics`), `vamp self-update` and the uv
-# download of `vamp setup install`.
+# HTTP client for self-update and setup downloads.
 ureq = "3"
 # `vamp self-update` and the uv download of `vamp setup install` (with `remote`): release
 # checksum, .tar.gz reader.

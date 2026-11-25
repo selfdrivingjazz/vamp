@@ -18,6 +18,7 @@ uuid.workspace = true
 blake3.workspace = true
 vamp-protocol.workspace = true
 vamp-core = { workspace = true, features = ["native"] }
+vamp-diagnostics.workspace = true
 # Small synchronous HTTP/1.1 server: no async runtime for a single-library, LAN-scale API.
 tiny_http = "0.12"
 # Client for /v1/clip image downloads (same client vamp-core's `remote` feature uses).

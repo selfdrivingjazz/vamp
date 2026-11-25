@@ -3,6 +3,7 @@ members = [
     "crates/vamp-protocol",
     "crates/vamp-core",
     "crates/vamp-cli",
+    "crates/vamp-diagnostics",
     "crates/vamp-media",
     "crates/vamp-server",
     "crates/vamp-store",
@@ -32,6 +33,7 @@ rusqlite = { version = "0.39", features = ["bundled", "functions"] }
 clap = { version = "4", features = ["derive", "env"] }
 vamp-protocol = { version = "0.4.2", path = "crates/vamp-protocol" }
 vamp-core = { version = "0.4.2", path = "crates/vamp-core" }
+vamp-diagnostics = { version = "0.4.2", path = "crates/vamp-diagnostics" }
 
 [profile.release]
 opt-level = 3

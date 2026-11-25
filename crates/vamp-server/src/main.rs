@@ -2,8 +2,11 @@ use anyhow::{Context as _, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::sync::Arc;
 use vamp_core::{Library, default_home, load_config};
+use vamp_diagnostics::{Event, Feature, Product, Reporter};
 use vamp_server::auth::{Allowlist, AuthMode, Tailscale};
+use vamp_server::telemetry::Telemetry;
 
 /// Serve one local VAMP library over HTTP for replicas, clippers and browser extensions.
 #[derive(Parser)]
@@ -119,7 +122,7 @@ fn install_agent(
         "VAMP_HOME",
         home.canonicalize()?.to_string_lossy().into_owned(),
     )];
-    for key in ["VAMP_MEDIA_HELPER", "VAMP_STORE_HELPER"] {
+    for key in ["VAMP_MEDIA_HELPER", "VAMP_STORE_HELPER", "DO_NOT_TRACK"] {
         if let Some(helper) = std::env::var_os(key) {
             env.push((key, helper.to_string_lossy().into_owned()));
         }
@@ -161,8 +164,24 @@ fn main() -> Result<()> {
     vamp_core::allow_cloud_placeholder_reads();
     let cli = Cli::parse();
     let home = cli.home.clone().unwrap_or_else(default_home);
-    let name = context_name(&cli, &home)?;
-    let library = Library::open(&home, Some(&name))?;
+    let reporter = matches!(cli.command, Command::Serve { .. })
+        .then(|| vamp_diagnostics::reporter(&home, Product::server()))
+        .flatten();
+    if let Some(reporter) = &reporter {
+        reporter.clone().install_panic_hook(Feature::Launch);
+    }
+    let result = run(cli, &home, reporter.as_ref());
+    if result.is_err()
+        && let Some(reporter) = reporter
+    {
+        reporter.record(Event::new(Feature::Launch, false));
+    }
+    result
+}
+
+fn run(cli: Cli, home: &Path, reporter: Option<&Arc<Reporter>>) -> Result<()> {
+    let name = context_name(&cli, home)?;
+    let library = Library::open(home, Some(&name))?;
     ensure!(
         library.context.remote.is_none(),
         "context {name} is a replica; serve its authority library instead"
@@ -196,7 +215,7 @@ fn main() -> Result<()> {
             no_jobs,
             dist,
             force,
-        } => install_agent(&home, &name, &bind, no_jobs, dist.as_deref(), force)?,
+        } => install_agent(home, &name, &bind, no_jobs, dist.as_deref(), force)?,
         Command::Serve {
             bind,
             auth,
@@ -259,12 +278,18 @@ fn main() -> Result<()> {
             eprintln!(
                 "vamp-server: other machines: {join} (later changes: vamp sync); Vampire app: Connect to Server… with this URL and token"
             );
+            let telemetry = reporter.map(|reporter| Telemetry::new(reporter.clone()));
+            if let Some(telemetry) = &telemetry {
+                telemetry.observe(Feature::Launch, true, None);
+                app = app.with_telemetry(telemetry.clone());
+            }
             if !no_jobs {
                 vamp_server::spawn_jobs(
-                    home.clone(),
+                    home.to_path_buf(),
                     name.clone(),
                     Duration::from_secs(jobs_interval.max(1)),
                     app.health(),
+                    telemetry,
                 );
             }
             vamp_server::serve(std::sync::Arc::new(server), app, threads);

@@ -83,6 +83,9 @@ pub(crate) fn route(
                 .lock()
                 .complete_job(id, &body.lease_id, body.response)
                 .map_err(conflict)?;
+            if let Some(telemetry) = &app.telemetry {
+                telemetry.job(&job.processor.name, &job.status);
+            }
             ok(json!({"job":job}))
         })(),
         (Method::Post, ["v1", "jobs", id, "fail"]) => (|| {
@@ -91,6 +94,9 @@ pub(crate) fn route(
                 .lock()
                 .fail_job(id, &body.lease_id, &body.error)
                 .map_err(conflict)?;
+            if let Some(telemetry) = &app.telemetry {
+                telemetry.job(&job.processor.name, &job.status);
+            }
             ok(json!({"job":job}))
         })(),
         _ => return None,

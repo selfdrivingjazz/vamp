@@ -1,6 +1,5 @@
 //! Opt-in diagnostics through the `vamp` binary: off on a fresh home, enabling needs a usable
-//! destination, a failing command reports a bounded OTLP record only while enabled, and the
-//! command's own output and exit status never change.
+//! destination, and typed OTLP telemetry never changes output or exit status.
 
 use serde_json::Value;
 use std::{
@@ -223,7 +222,7 @@ fn opted_in_failures_report_bounded_records_until_disabled() {
             .to_ascii_lowercase()
             .contains("content-type: application/json")
     );
-    assert!(request.body.len() <= 4096);
+    assert!(request.body.len() <= 16 * 1024);
     let home_text = home.path().to_str().unwrap();
     for leak in ["private-asset-7f3e", home_text, "inspect private"] {
         assert!(
@@ -241,25 +240,20 @@ fn opted_in_failures_report_bounded_records_until_disabled() {
             "service.name",
             "service.version",
             "os.type",
-            "host.arch",
             "app.diagnostics.kind",
-            "error.type",
-            "app.component",
-            "app.operation"
+            "app.feature",
+            "app.outcome",
+            "app.duration_bucket",
         ]
     );
     let get = |key: &str| attributes.iter().find(|(k, _)| k == key).unwrap().1.clone();
     assert_eq!(get("app.diagnostics.kind"), "error");
-    assert_eq!(get("app.operation"), "media inspect");
-    assert_eq!(get("service.name"), "vamp");
-    let category = get("error.type");
-    assert!(
-        category == "other"
-            || category == "json"
-            || category == "network"
-            || category.starts_with("io."),
-        "{category}"
-    );
+    assert_eq!(get("app.feature"), "browse");
+    assert_eq!(get("service.name"), "vamp-cli");
+    assert_eq!(get("app.outcome"), "failed");
+    let scope = &body["resourceLogs"][0]["scopeLogs"][0];
+    assert_eq!(scope["scope"], serde_json::json!({"name":"vamp.diagnostics","version":"2"}));
+    assert_eq!(scope["logRecords"][0].as_object().unwrap().len(), 2);
 
     // Opt out: the endpoint and credentials are forgotten and failures send nothing.
     let disabled = vamp(home.path(), &["diagnostics", "disable"]);
@@ -319,6 +313,7 @@ fn do_not_track_overrides_consent() {
     assert_eq!(status["do_not_track"], true);
     let failed = vamp_with(home.path(), &["media", "inspect", "x"], &dnt);
     assert_eq!(failed.code, 1);
+    assert_eq!(vamp_with(home.path(), &["init", "private-library"], &dnt).code, 0);
     let test = vamp_with(home.path(), &["diagnostics", "test"], &dnt);
     assert_eq!(test.code, 1);
     assert!(test.stderr.contains("DO_NOT_TRACK"), "{}", test.stderr);
@@ -332,6 +327,24 @@ fn do_not_track_overrides_consent() {
     );
     assert_eq!(failed.code, 1);
     assert!(requests.recv_timeout(Duration::from_secs(5)).is_ok());
+}
+
+#[test]
+fn old_error_only_consent_does_not_enable_usage() {
+    let home = tempfile::tempdir().unwrap();
+    let (endpoint, requests) = receiver();
+    std::fs::write(
+        home.path().join("diagnostics.json"),
+        serde_json::json!({"policy":1,"endpoint":endpoint,"consented_at_unix":1}).to_string(),
+    ).unwrap();
+    let status = json(&vamp(home.path(), &["diagnostics", "status"]).stdout);
+    assert_eq!(status["policy"], 2);
+    assert_eq!(status["enabled"], false);
+    assert!(status["note"].as_str().unwrap().contains("paused"));
+    assert_eq!(vamp(home.path(), &["init", "private-library"]).code, 0);
+    assert_eq!(vamp(home.path(), &["media", "inspect", "unknown-asset"]).code, 1);
+    assert!(requests.recv_timeout(Duration::from_millis(300)).is_err());
+    assert!(!home.path().join("diagnostics-state.json").exists());
 }
 
 /// An owner-only `--headers-file`.
@@ -349,10 +362,9 @@ fn headers_file(dir: &Path, text: &str) -> std::path::PathBuf {
     path
 }
 
-/// Parallel failing runs share the hourly budget: exactly 10 reports, and the state counts
-/// every one of them (no process overwrites another's reservation or receipt).
+/// Explicit tests bypass the batching interval; all processes still share one send budget.
 #[test]
-fn parallel_failures_share_the_hourly_budget() {
+fn concurrent_tests_share_the_hourly_budget() {
     let home = tempfile::tempdir().unwrap();
     let (endpoint, requests) = receiver();
     let enabled = vamp(
@@ -365,7 +377,7 @@ fn parallel_failures_share_the_hourly_budget() {
             Command::new(env!("CARGO_BIN_EXE_vamp"))
                 .arg("--home")
                 .arg(home.path())
-                .args(["media", "inspect", "x"])
+                .args(["diagnostics", "test"])
                 .env_remove("VAMP_HOME")
                 .env_remove("VAMP_CONTEXT")
                 .env_remove("DO_NOT_TRACK")
@@ -375,9 +387,10 @@ fn parallel_failures_share_the_hourly_budget() {
                 .unwrap()
         })
         .collect();
-    for mut child in children {
-        assert_eq!(child.wait().unwrap().code(), Some(1));
-    }
+    let successes = children.into_iter()
+        .map(|mut child| child.wait().unwrap().success())
+        .filter(|success| *success).count();
+    assert_eq!(successes, 10);
     let mut received = 0;
     while requests.recv_timeout(Duration::from_millis(500)).is_ok() {
         received += 1;

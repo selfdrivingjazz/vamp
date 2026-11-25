@@ -8,6 +8,9 @@
   replica that had been asleep for twenty minutes had to download the whole catalog again
   before its next edit finished.
 - A replica edit reports the catch-up sync it waits for in `sync_status`.
+- `vamp diagnostics` now covers optional, anonymous usage and health reports for
+  both the CLI and server. Policy 2 requires fresh consent; there is still no
+  built-in destination and `DO_NOT_TRACK` takes precedence.
 
 ## 0.4.2 — 2026-11-04
 
