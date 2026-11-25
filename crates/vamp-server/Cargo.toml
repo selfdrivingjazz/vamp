@@ -24,6 +24,8 @@ tiny_http = "0.12"
 ureq = "3"
 form_urlencoded = "1"
 flate2 = "1"
+libc = "0.2"
+mdns-sd = { version = "0.22", default-features = false }
 
 [dev-dependencies]
 rusqlite.workspace = true

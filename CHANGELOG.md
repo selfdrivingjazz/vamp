@@ -12,6 +12,13 @@
   clients can still request plain JSON.
 - Smart folders filtered only by item name now count matches from the name index,
   without reading every live item's metadata document.
+- `vamp guide` walks an agent through setting up a library for someone. `vamp init
+  --no-extras` skips inherited processors; `vamp-server install-service` writes a user
+  service on Linux or macOS.
+- Running servers register per user for local discovery. `serve --advertise` also announces
+  the library to nearby Vampire Macs via DNS-SD, without sharing any credentials.
+- `vamp setup install recommended` uses a bundled, versioned toolkit. Libraries keep
+  their registered processors and embedding model unless explicitly upgraded.
 
 ## 0.4.2 — 2026-11-04
 

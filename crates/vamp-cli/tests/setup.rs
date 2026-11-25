@@ -194,6 +194,20 @@ fn init_registers_installed_extras() {
     assert_eq!(extra(&plan, "search")["state"], "installed");
     assert_eq!(extra(&plan, "search")["seconds_measured"], true);
     assert_eq!(extra(&plan, "captions")["state"], "installed");
+    assert_eq!(plan["profile"]["version"], 1);
+    assert_eq!(extra(&plan, "search")["registration"], "registered");
+    assert_eq!(extra(&plan, "captions")["registration"], "missing");
+
+    let explicit = json(&vamp(&home, &["setup", "install", "search", "--profile", "1"]));
+    assert_eq!(explicit["profile"]["version"], 1);
+    assert_eq!(explicit["bench"], json!({}));
+    assert_eq!(explicit["backfill"], json!({}));
+    let unknown = vamp(&home, &["setup", "install", "search", "--profile", "99"]);
+    assert_ne!(unknown.code, 0);
+
+    let opted_out = json(&vamp(&home, &["init", "No model extras", "--no-extras"]));
+    assert_eq!(opted_out["extras"], json!([]));
+    assert_eq!(json(&vamp(&home, &["processors", "list"])), json!([]));
 
     // A home without setup.json registers nothing.
     let bare = dir.path().join("bare");

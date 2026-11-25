@@ -160,6 +160,42 @@ fn semantic_and_similar_rank_by_cosine_over_current_originals_only() {
 }
 
 #[test]
+fn switching_the_embedder_never_uses_an_older_models_vectors() {
+    let dir = TempDir::new().unwrap();
+    let mut lib = library(&dir);
+    let old = script(dir.path(), "old.sh", FAKE_EMBEDDER);
+    lib.processor_add(processor("embed", old)).unwrap();
+    let original = dir.path().join("asset");
+    let value = vector([1.0, 0.0, 0.0]);
+    fs::write(&original, &value).unwrap();
+    let asset = lib.add(&original, None, Metadata::default()).unwrap();
+    assert_eq!(lib.run_jobs(1).unwrap()["completed"], 1);
+    lib.require_embedding(&asset.id, Some("fake-clip")).unwrap();
+
+    let new = script(dir.path(), "new.sh", &FAKE_EMBEDDER.replace("fake-clip", "fake-clip-v2"));
+    let mut image = processor("embed-v2", new.clone());
+    image.command.extend(["--device".into(), "cpu".into()]);
+    lib.processor_add(image).unwrap();
+    lib.embedder_set(EmbedderSpec {
+        command: vec![new, "--device".into(), "auto".into()],
+        model: "fake-clip-v2".into(),
+        timeout_seconds: 10,
+        serve: false,
+    }).unwrap();
+    lib.enqueue("embed-v2", &asset.id).unwrap();
+    assert!(lib.semantic_search(&value, 10, false, None).unwrap().is_empty());
+    let unavailable = unavailable(&lib.similar(&asset.id, 10).unwrap_err());
+    assert_eq!(unavailable.state, vamp_core::EmbeddingState::Pending);
+    assert_eq!(unavailable.processor.as_deref(), Some("embed-v2"));
+    let (_, pack) = lib.energy_pack().unwrap().unwrap();
+    assert_eq!((pack.model.as_str(), pack.count), ("fake-clip-v2", 0));
+    assert_eq!(lib.run_jobs(1).unwrap()["completed"], 1);
+    assert_eq!(lib.semantic_search(&value, 10, false, None).unwrap().len(), 1);
+    lib.require_embedding(&asset.id, Some("fake-clip")).unwrap();
+    assert!(lib.similar(&asset.id, 10).unwrap().is_empty());
+}
+
+#[test]
 fn malformed_embedding_fails_job_without_storing_or_annotating() {
     let dir = TempDir::new().unwrap();
     let mut lib = library(&dir);

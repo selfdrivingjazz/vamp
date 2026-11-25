@@ -84,6 +84,9 @@ enum Command {
         original_root: Option<PathBuf>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Do not inherit this machine's installed optional processors.
+        #[arg(long)]
+        no_extras: bool,
     },
     /// Manage named catalog contexts.
     Contexts {
@@ -203,6 +206,9 @@ enum Command {
         /// Request auth [default: tailscale on a tailnet address, else token].
         #[arg(long, value_parser = ["token", "tailscale"])]
         auth: Option<String>,
+        /// Announce this library on the local network (name and ID, never credentials).
+        #[arg(long)]
+        advertise: bool,
         /// Do not run processor jobs (captions, tags, embeddings) in the server.
         #[arg(long)]
         no_jobs: bool,
@@ -262,14 +268,20 @@ enum SetupCommand {
         #[arg(long)]
         text: bool,
     },
-    /// Install extras into <home>/tools/models, register them in the active (or --context)
-    /// library and queue its existing items. `recommended` is the plan's recommendation.
+    /// Install toolkit components and register them in the selected authority library.
+    /// `recommended` applies the plan's recommendation.
     Install {
         #[arg(required = true, value_parser = ["search", "captions", "recommended"])]
         extras: Vec<String>,
         /// Model device [default: the installed one, else cuda with an NVIDIA GPU, else cpu].
         #[arg(long, value_parser = ["auto", "cpu", "cuda", "mps"])]
         device: Option<String>,
+        /// Switch the selected library to the bundled processor version and queue its backfill.
+        #[arg(long)]
+        upgrade: bool,
+        /// Use a specific bundled toolkit version.
+        #[arg(long)]
+        profile: Option<u32>,
     },
     /// Record in <home>/setup.json that these extras are not wanted; uninstalls nothing.
     Decline {
@@ -1085,11 +1097,11 @@ fn execute(cli: Cli) -> Result<Value> {
             folder,
             original_root,
             state_dir,
+            no_extras,
         } => {
             let name = display_name.or(name).context("library name is required")?;
             let root = original_root.as_deref().or(folder.as_deref());
-            // Extras this machine installed (setup.json) are registered in every new library.
-            let extras = setup::installed_extras(&home)?;
+            let extras = if no_extras { Vec::new() } else { setup::installed_extras(&home)? };
             let mut library = Library::init(&home, &name, root, state_dir.as_deref())?;
             let extras = setup::register_installed(&home, &mut library, &extras)?;
             let intake = folder.as_deref().map(|path| add_folder(&mut library, path, Metadata::default())).transpose()?;
@@ -1146,12 +1158,14 @@ fn execute(cli: Cli) -> Result<Value> {
         Command::Serve {
             bind,
             auth,
+            advertise,
             no_jobs,
             dist,
         } => {
             let options = serve::Options {
                 bind,
                 auth,
+                advertise,
                 no_jobs,
                 dist,
             };
@@ -1161,8 +1175,8 @@ fn execute(cli: Cli) -> Result<Value> {
         Command::Setup { command } => match command.unwrap_or(SetupCommand::Plan { text: false }) {
             SetupCommand::Plan { text: false } => setup::plan(&home, cli.context.as_deref()),
             SetupCommand::Plan { text: true } => unreachable!("the text plan prints in main"),
-            SetupCommand::Install { extras, device } => {
-                setup::install(&home, cli.context.as_deref(), &extras, device.as_deref())
+            SetupCommand::Install { extras, device, upgrade, profile } => {
+                setup::install(&home, cli.context.as_deref(), &extras, device.as_deref(), upgrade, profile)
             }
             SetupCommand::Decline { extras } => setup::decline(&home, &extras),
         },

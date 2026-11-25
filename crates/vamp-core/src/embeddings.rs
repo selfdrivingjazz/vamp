@@ -109,16 +109,53 @@ fn default_timeout() -> u64 {
     120
 }
 
-/// Unix socket of a library's persistent embedder: `<state_dir>/embedder.sock`, or a
-/// per-user temp path derived from it when that exceeds the platform's sun_path limit.
+/// Keep an older warm process from answering queries after an embedder switch.
 #[cfg(unix)]
-fn socket_path(state_dir: &Path) -> PathBuf {
-    let path = state_dir.join("embedder.sock");
+fn socket_path(state_dir: &Path, spec: &EmbedderSpec) -> PathBuf {
+    let mut key = blake3::Hasher::new();
+    for part in std::iter::once(spec.model.as_str()).chain(spec.command.iter().map(String::as_str)) {
+        key.update(&(part.len() as u64).to_le_bytes());
+        key.update(part.as_bytes());
+    }
+    let digest = key.finalize().to_hex();
+    let path = state_dir.join(format!("embedder-{}.sock", &digest[..16]));
     if path.as_os_str().len() < 100 {
         return path;
     }
-    let digest = blake3::hash(state_dir.as_os_str().as_encoded_bytes()).to_hex();
+    key.update(state_dir.as_os_str().as_encoded_bytes());
+    let digest = key.finalize().to_hex();
     std::env::temp_dir().join(format!("vamp-embedder-{}.sock", &digest[..16]))
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn warm_embedder_socket_is_scoped_to_the_model_and_command() {
+    let state = Path::new("/tmp/vamp-test");
+    let mut spec = EmbedderSpec {
+        command: vec!["model-tool".into(), "v1.json".into()],
+        model: "model-v1".into(),
+        timeout_seconds: 10,
+        serve: true,
+    };
+    let old = socket_path(state, &spec);
+    spec.model = "model-v2".into();
+    let new_model = socket_path(state, &spec);
+    assert_ne!(old, new_model);
+    spec.command[1] = "v2.json".into();
+    assert_ne!(new_model, socket_path(state, &spec));
+}
+
+/// Bundled image and text processors share a command, but can use different devices.
+fn same_embedder_command(image: &[String], text: &[String]) -> bool {
+    if image == text {
+        return true;
+    }
+    image.len() == text.len()
+        && text.iter().position(|arg| arg == "--device").is_some_and(|flag| {
+            flag + 1 < text.len()
+                && image.iter().zip(text).enumerate()
+                    .all(|(i, (a, b))| i == flag + 1 || a == b)
+        })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,16 +303,17 @@ impl Library {
         for name in stmt.query_map([model], |r| r.get::<_, String>(0))? {
             names.insert(name?);
         }
-        let configured_model = embedder.as_ref().is_none_or(|spec| model.is_none_or(|m| m == spec.model));
-        if configured_model {
-            // This is the registered built-in capability name, not a name substring guess.
-            // Jobs retain their processor snapshot even after the registration is removed.
+        // The unversioned name is the v1 built-in identity, not a substring match.
+        // Jobs retain this identity even if their registration has been removed.
+        if model.is_none_or(|model| model == "google/siglip-base-patch16-224") {
             names.insert("siglip-embedding".into());
-            if let Some(embedder) = embedder {
-                for processor in self.processors()? {
-                    if processor.output == "observation" && processor.command == embedder.command {
-                        names.insert(processor.name);
-                    }
+        }
+        if let Some(embedder) = embedder.filter(|spec| model.is_none_or(|m| m == spec.model)) {
+            for processor in self.processors()? {
+                if processor.output == "observation"
+                    && same_embedder_command(&processor.command, &embedder.command)
+                {
+                    names.insert(processor.name);
                 }
             }
         }
@@ -416,7 +454,7 @@ impl Library {
     fn embed_request(&self, spec: &EmbedderSpec, request: &ToolRequest) -> Result<ToolResponse> {
         #[cfg(unix)]
         if spec.serve {
-            let socket = socket_path(&self.state_dir);
+            let socket = socket_path(&self.state_dir, spec);
             match tools::query_server(&socket, request, spec.timeout_seconds) {
                 Ok(response) => return Ok(response),
                 Err(_) => {
@@ -549,13 +587,13 @@ impl Library {
         let Some((model, blob)) = self
             .conn
             .query_row(
-                "SELECT model,vector FROM embeddings WHERE asset_id=?1 AND source_hash=?2 ORDER BY model=?3 DESC,model LIMIT 1",
+                "SELECT model,vector FROM embeddings WHERE asset_id=?1 AND source_hash=?2 AND (?3 IS NULL OR model=?3) ORDER BY model LIMIT 1",
                 params![asset_id, asset.original.source_key(), preferred],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
             )
             .optional()?
         else {
-            return Err(self.missing_embedding(&asset, None)?.into());
+            return Err(self.missing_embedding(&asset, preferred.as_deref())?.into());
         };
         let ranked = self.rank(&model, &from_blob(&blob), Some(asset_id), None, false)?;
         self.scored(ranked, limit)

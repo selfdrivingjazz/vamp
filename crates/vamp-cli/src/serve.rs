@@ -9,6 +9,7 @@ use std::process::Command;
 pub struct Options {
     pub bind: Option<String>,
     pub auth: Option<String>,
+    pub advertise: bool,
     pub no_jobs: bool,
     pub dist: Option<PathBuf>,
 }
@@ -28,6 +29,9 @@ pub fn run(home: &Path, context: Option<&str>, options: Options) -> Result<()> {
     }
     if let Some(auth) = options.auth {
         command.args(["--auth", &auth]);
+    }
+    if options.advertise {
+        command.arg("--advertise");
     }
     if options.no_jobs {
         command.arg("--no-jobs");

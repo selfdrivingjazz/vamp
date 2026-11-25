@@ -320,6 +320,7 @@ fn process(shared: &Shared, claim: &Value) -> Result<bool> {
             let _ = serve;
             vamp_core::run_tool(&spec.command, &request, spec.timeout_seconds)?
         };
+        crate::setup::validate_processor_response(processor, &response)?;
         let ran = started.elapsed() - downloaded;
         ensure!(
             !heartbeat.lost.load(Ordering::Relaxed),

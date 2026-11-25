@@ -1,6 +1,6 @@
 ---
 name: vamp
-description: Search, inspect, fetch, tag, rate, organize and ingest images/media in the owner's VAMP library (reference-only media catalog shared over the tailnet) via the `vamp` CLI. Use when the user asks about their images, references, mood boards, media library, or wants media found, tagged or filed.
+description: Set up VAMP or search, inspect, fetch, tag, rate, organize and ingest media in a VAMP library. Use when a person asks to install VAMP or work with their images, references, mood boards or media library.
 ---
 
 # VAMP for agents
@@ -22,6 +22,98 @@ Never parse `--help` text when JSON exists.
 - `vamp diagnostics status` — whether optional crash/error reports are on (off by default), where they go and exactly what they hold. Enabling (`vamp diagnostics enable --endpoint URL`) or disabling is the owner's choice: never change it unless they ask.
 - `vamp setup plan` — read-only: this machine's optional extras (`search`: semantic search, Find Similar, Riff and Galaxy; `captions`: descriptions and tags), whether each is installed, its size and seconds per item, and what is recommended here (`recommended`, `offered`). `vamp setup install search|captions|recommended` downloads 1–5 GB, registers the processors in the library and queues its items; `vamp setup decline captions` records a "no". Both are the owner's choice: run them only when asked.
 - Set `VAMP_ACTOR=agent:<agent-name>` so catalog events record who made a change; what you add is recorded as added by you (`metadata.extra.added_by`), and the owner's app shows the owner's own items by default (agents' under Agents).
+
+## Set up a new library with a person
+
+Confirm placement and network before making changes. Choose optional processors
+after the binaries are installed and you have shown the plan.
+
+1. **Which computer should own the library?** Use this computer for local use. Pick an
+   always-on Linux or Mac computer for access when this one sleeps. Run the setup there,
+   as the account that owns or can read the media. Ask what to call the library.
+2. **Where do the originals live?** Use a folder this computer can read. For access across
+   machines, suggest an always-on home server or the person's own iCloud Drive or Google
+   Drive folder kept downloaded on the authority. A synced folder does not keep the VAMP
+   server online. Keep the catalog on a local disk, not inside that synced folder.
+3. **Which processors do they want?** Show `vamp setup plan --text` on the authority. Ask
+   whether to install what it recommends, pick smart search and/or captions, or skip all
+   optional models. Do not start a large download without their answer.
+4. **Should other computers or phones connect?** Keep the default loopback bind for this
+   computer only. For other devices, recommend Tailscale and ask who should have access.
+   Ask whether to advertise the library's name and ID to devices on the local network.
+
+Install only the binaries first, then create the chosen library. Use the `name` slug
+returned by `init` for `--context` (the examples use `my-refs`). If `vamp contexts list`
+already shows the library, use its context instead of initializing it again.
+
+```sh
+curl -fsSL https://vamp.sh/install | sh -s -- --extras none
+export PATH="$HOME/.local/bin:$PATH"
+vamp contexts list
+vamp init "My refs" "$HOME/Pictures/refs" --no-extras  # reference this folder, recursively
+vamp init "My refs" --no-extras                       # OR start empty
+vamp init "My refs" --original-root /path/to/media --no-extras  # OR set a folder for new clips
+vamp --context my-refs setup plan --text
+```
+
+Run only one `init` line. For a custom catalog disk, add `--home /path/to/local/vamp`
+to all `vamp` and `vamp-server` commands on the authority, or set `VAMP_HOME`. The
+originals stay in place; making previews can download online-only originals.
+
+```sh
+vamp --context my-refs setup install recommended      # install the toolkit for this machine
+vamp --context my-refs setup install search captions  # OR name only the ones they chose
+vamp --context my-refs setup decline search captions  # OR record no optional downloads
+vamp --context my-refs doctor
+vamp --context my-refs media list --limit 5
+```
+
+Choose one server command; it runs in the foreground and drains queued jobs as it runs:
+
+```sh
+vamp --context my-refs serve                             # this computer only
+vamp --context my-refs serve --bind tailnet               # allowlisted Tailscale devices
+vamp --context my-refs serve --bind tailnet --advertise   # also offer it to nearby Vampire Macs
+vamp --context my-refs serve --bind "$LAN_IP:7777" --advertise  # trusted LAN only; uses a token
+```
+
+For the last line set `LAN_IP` to the authority's LAN address. LAN HTTP does not encrypt
+bearer tokens. Prefer Tailscale; do not open the port on the public internet. Bonjour uses
+local multicast: a Tailscale device away from that LAN connects by URL, not by Bonjour.
+
+For an always-on machine or a server that should survive closing the terminal, use
+`vamp-server --context my-refs install-service` with the same `--bind` and `--advertise`
+arguments instead of starting a foreground server. Run the printed start command:
+
+```sh
+# Linux with a systemd user session
+systemctl --user daemon-reload
+systemctl --user enable --now vamp-server-my-refs.service
+# If approved, keep the Linux service running when the user logs out:
+loginctl enable-linger "$USER"
+
+# macOS (at login; the Mac must stay awake to serve other devices)
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.selfdrivingjazz.vamp.server.my-refs.plist"
+```
+
+With Tailscale, devices owned by the server's Tailscale user are allowed by default.
+To allow another login or a tagged node, run `vamp-server --context my-refs allow
+--user LOGIN` or `vamp-server --context my-refs allow --tag tag:NAME` on the authority.
+On a second computer, run `vamp join HOST:7777` using the URL or host the server prints;
+later use `vamp sync`. In Vampire for Mac, choose the found library or use **Connect to
+Server…**; on iOS use **Connect via Tailnet** and enter the host and port. For a
+token-authenticated connection, get the token locally with `vamp-server --context
+my-refs token` and send it privately to the person making the connection, never in logs
+or chat. In the terminal, pass it via `VAMP_REMOTE_TOKEN` rather than
+typing the token on the command line.
+
+```sh
+VAMP_REMOTE_TOKEN="$(cat /path/to/private-token-file)" vamp join "http://$LAN_IP:7777"
+```
+
+Finish by reporting where the server and originals live, the context name, the chosen
+processors, the server address (not its token), and how to start or stop it.
+If they also want an agent connected, use the read-only MCP setup below.
 
 ## MCP clients
 
