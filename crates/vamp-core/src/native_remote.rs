@@ -291,8 +291,8 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
     }
     if operation == "sync_wait" {
         flush_touches_in_background(&library);
-        let value = sync_wait(&mut library, request.wait.unwrap_or(25))?;
-        spawn_downloader(&library, false)?;
+        let value = sync_wait(&mut library, request.wait.unwrap_or(25), request.sync_since)?;
+        download_after_sync(&library, false);
         return Ok(Some(value));
     }
     if operation == "stream" {
@@ -412,6 +412,9 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
             }
             client.native(&body)?
         }
+        "doctor" | "explore_show" | "explore_list" | "explore_link" => {
+            return client.native(&forward_body(request)?).map(Some);
+        }
         op if FORWARDED.contains(&op) => client.native(&forward_body(request)?)?,
         "remove" => match request.asset_ids.as_slice() {
             [] => {
@@ -442,8 +445,8 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
                 .as_deref()
                 .context("filename is required")?;
             let asset = client.ingest(&bytes, filename, &patch(request)?)?;
-            super::remote::record_created(&mut library, std::slice::from_ref(&asset))?;
-            return Ok(Some(json!(asset)));
+            let mirrored = super::remote::record_created(&mut library, std::slice::from_ref(&asset));
+            return Ok(Some(write_receipt(json!(asset), mirrored)));
         }
         "add" => {
             ensure!(!request.paths.is_empty(), "paths is required");
@@ -464,8 +467,8 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
                     Err(e) => errors.push(json!({"path":path,"message":format!("{e:#}")})),
                 }
             }
-            super::remote::record_created(&mut library, &assets)?;
-            return Ok(Some(json!({"assets":assets,"errors":errors})));
+            let mirrored = super::remote::record_created(&mut library, &assets);
+            return Ok(Some(write_receipt(json!({"assets":assets,"errors":errors}), mirrored)));
         }
         "collection_create" => {
             json!(client.collection_create(request.name.as_deref().context("name is required")?)?)
@@ -504,9 +507,20 @@ pub(crate) fn request(request: &Request) -> Result<Option<Value>> {
     };
     // Progress visible to `sync_status`: a write waits for this catch-up, and a replica that
     // was offline can be many pages behind.
-    sync_progress(&mut library)?;
-    spawn_downloader(&library, false)?;
-    Ok(Some(value))
+    let synced = sync_progress(&mut library).map(|_| ());
+    if synced.is_ok() {
+        download_after_sync(&library, false);
+    }
+    Ok(Some(write_receipt(value, synced)))
+}
+
+/// A successful authority response is final. Local catch-up may need to be retried,
+/// but callers must not roll back the edit or send it to the authority again.
+fn write_receipt(mut value: Value, synced: Result<()>) -> Value {
+    if let Err(error) = synced {
+        value["sync_pending"] = json!(format!("{error:#}"));
+    }
+    value
 }
 
 /// Files a replica `add` uploads at once: several in flight keep a slow, high-latency link
@@ -678,7 +692,11 @@ fn legacy_semantic_browse(
 }
 
 /// Replica state dirs with a sync in progress in this process: `{phase, done, total}`.
-static SYNCS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<PathBuf, Value>>> =
+struct SyncProgress {
+    callers: usize,
+    value: Value,
+}
+static SYNCS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<PathBuf, SyncProgress>>> =
     std::sync::LazyLock::new(Default::default);
 /// Replica state dirs with a downloader thread running in this process, with the token of
 /// that thread (so a finished thread never unregisters its successor).
@@ -784,14 +802,22 @@ fn jittered(base: Duration) -> Duration {
 /// `sync` whose progress `sync_status` reports while it runs.
 fn sync_progress(library: &mut Library) -> Result<Value> {
     let key = library.state_dir.clone();
-    locked(&SYNCS).insert(key.clone(), json!({"phase":"starting","done":0,"total":0}));
+    locked(&SYNCS).entry(key.clone()).or_insert_with(|| SyncProgress {
+        callers: 0,
+        value: json!({"phase":"starting","done":0,"total":0}),
+    }).callers += 1;
     let result = sync_with(library, &mut |phase, done, total| {
-        locked(&SYNCS).insert(
-            key.clone(),
-            json!({"phase":phase,"done":done,"total":total}),
-        );
+        if let Some(progress) = locked(&SYNCS).get_mut(&key) {
+            progress.value = json!({"phase":phase,"done":done,"total":total});
+        }
     });
-    locked(&SYNCS).remove(&key);
+    let mut syncs = locked(&SYNCS);
+    if let Some(progress) = syncs.get_mut(&key) {
+        progress.callers -= 1;
+        if progress.callers == 0 {
+            syncs.remove(&key);
+        }
+    }
     result
 }
 
@@ -805,8 +831,14 @@ fn tracked_sync(library: &mut Library) -> Result<Value> {
         Ok(micro) => value["micro"] = micro,
         Err(e) => eprintln!("micro thumbnails: {e:#}"),
     }
-    spawn_downloader(library, true)?;
+    download_after_sync(library, true);
     Ok(value)
+}
+
+fn download_after_sync(library: &Library, retry: bool) {
+    if let Err(error) = spawn_downloader(library, retry) {
+        eprintln!("replica thumbnails: {error:#}");
+    }
 }
 
 /// `sync_status`: `{syncing, phase?, done?, total?, downloading, pending_thumbnails}`.
@@ -814,7 +846,7 @@ fn sync_status(request: &Request) -> Result<Value> {
     let library = Library::open(&request.home, request.context.as_deref())?;
     let mut value = locked(&SYNCS)
         .get(&library.state_dir)
-        .cloned()
+        .map(|progress| progress.value.clone())
         .map_or_else(|| json!({"syncing":false}), |mut v| {
             v["syncing"] = json!(true);
             v

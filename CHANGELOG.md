@@ -7,7 +7,10 @@
   an hour on a 10,000-item library, and every replica re-fetched each checked asset; a
   replica that had been asleep for twenty minutes had to download the whole catalog again
   before its next edit finished.
-- A replica edit reports the catch-up sync it waits for in `sync_status`.
+- The app bridge and CLI share one ordered pull per mirror. Readers get the changes
+  even if another process applied them. Pulls recheck the authority ID and protocol version.
+- A replica edit reports the catch-up sync it waits for in `sync_status`. If the
+  authority saves the edit but catch-up fails, the edit succeeds with `sync_pending`.
 - Event pages and long-poll updates use gzip when the replica accepts it; older
   clients can still request plain JSON.
 - Smart folders filtered only by item name now count matches from the name index,

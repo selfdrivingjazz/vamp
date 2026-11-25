@@ -92,6 +92,9 @@ pub struct Request {
     pub hash: Option<String>,
     /// sync_wait: seconds to long-poll the authority for changes (default 25, max 60).
     pub wait: Option<u64>,
+    /// sync_wait: last mirror cursor seen by this reader (omit to start now).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_since: Option<u64>,
     /// thumbnail_updates: event cursor from the previous answer (omit to start now).
     /// With `wait` (seconds, max 60), blocks until a thumbnail lands, the queue drains, or
     /// the wait ends, instead of answering immediately.

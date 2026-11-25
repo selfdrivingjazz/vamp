@@ -192,6 +192,10 @@ replica sends bulk trash as one request and refuses to fall back to one delete p
 asset. Bulk metadata edits are atomic only if the authority also runs the updated
 server; older servers that accept bulk edits can commit part of a failed request.
 
+The CLI and the app can sync the same local mirror. Only one pulls at a time; waiting
+readers still see the applied changes. If a remote edit succeeds but the mirror cannot
+catch up, the native result includes `sync_pending`. Sync again rather than repeating the edit.
+
 The Vampire Mac app offers running local servers and nearby DNS-SD servers in its welcome
 and **Connect to Server…** sheet. It checks the server's ID before offering it and doesn't
 connect without a choice. The iOS app uses **Connect via Tailnet** (host, port, optional token).

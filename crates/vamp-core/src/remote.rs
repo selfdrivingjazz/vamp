@@ -19,6 +19,15 @@ const PACK_CHUNK: usize = 32;
 use crate::eagle::THUMB_ATTEMPTS;
 use serde::Deserialize;
 
+pub(crate) const SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS replica_state(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS replica_changes(
+        cursor INTEGER PRIMARY KEY, from_cursor INTEGER NOT NULL, changes TEXT NOT NULL
+    );";
+
+// Latest applied pages, not a second unbounded event log.
+const CHANGE_PAGES: usize = 32;
+
 /// Blocking HTTP client for one authority's `/v1` API.
 #[derive(Clone)]
 pub struct Client {
@@ -747,14 +756,7 @@ fn attach(home: &Path, name: &str, remote: Remote) -> Result<Context> {
     validate_name(name)?;
     let url = remote.url.clone();
     let info = Client::new(&remote)?.library()?;
-    ensure!(
-        info["protocol_version"] == PROTOCOL_VERSION,
-        "unsupported remote protocol version"
-    );
-    let library_id = info["library_id"]
-        .as_str()
-        .context("remote library has no identity")?
-        .to_owned();
+    let library_id = authority_id(&info)?.to_owned();
     let home = destination(home)?;
     let _lock = config_lock(&home)?;
     let mut config = load_config(&home)?;
@@ -797,6 +799,14 @@ fn attach(home: &Path, name: &str, remote: Remote) -> Result<Context> {
     }
     atomic_json(&home.join("config.json"), &config)?;
     Ok(context)
+}
+
+fn authority_id(info: &Value) -> Result<&str> {
+    ensure!(
+        info["protocol_version"] == PROTOCOL_VERSION,
+        "unsupported remote protocol version"
+    );
+    info["library_id"].as_str().context("remote library has no identity")
 }
 
 /// Removes a replica context and its mirror (catalog and caches: nothing that is not on
@@ -856,9 +866,6 @@ fn cache_path(kind: &str, asset_id: &str, source_hash: &str, mime: &str) -> Stri
 }
 
 fn cursor(conn: &Connection) -> Result<u64> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS replica_state(key TEXT PRIMARY KEY, value INTEGER NOT NULL)",
-    )?;
     let value: Option<i64> = conn
         .query_row(
             "SELECT value FROM replica_state WHERE key='cursor'",
@@ -1031,17 +1038,107 @@ struct Snapshot {
 /// or `events` (incremental replay); `done`/`total` count assets or events.
 pub type Progress<'a> = &'a mut dyn FnMut(&str, u64, u64);
 
-fn set_cursor(tx: &Transaction, cursor: u64) -> Result<()> {
+#[derive(Default, Deserialize, Serialize)]
+struct Changes {
+    applied: u64,
+    snapshot: bool,
+    reload: bool,
+    kinds: BTreeMap<String, u64>,
+    // Fall back to a reload if the set was too large to retain.
+    asset_ids: Option<BTreeSet<String>>,
+}
+
+impl Changes {
+    fn empty() -> Self {
+        Self { asset_ids: Some(BTreeSet::new()), ..Self::default() }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.applied += other.applied;
+        self.snapshot |= other.snapshot;
+        self.reload |= other.reload;
+        for (kind, count) in other.kinds {
+            *self.kinds.entry(kind).or_default() += count;
+        }
+        self.asset_ids = self.asset_ids.take().zip(other.asset_ids)
+            .and_then(|(mut ids, more)| {
+                ids.extend(more);
+                (ids.len() <= CHANGED_IDS).then_some(ids)
+            });
+    }
+
+    fn result(self, library: &Library, cursor: u64, added_by: u64) -> Result<Value> {
+        let mut value = serde_json::to_value(self)?;
+        value["cursor"] = json!(cursor);
+        value["pending_thumbnails"] = json!(library.pending_eagle_thumbnails()?);
+        value["added_by_mirrored"] = json!(added_by);
+        Ok(value)
+    }
+}
+
+/// Pages and their change notices commit together, so another process can report exactly
+/// what it missed even if the applying caller was a write or failed on a later page.
+fn publish_page(tx: &Transaction, from: u64, to: u64, changes: &Changes) -> Result<()> {
     tx.execute(
         "INSERT INTO replica_state(key,value) VALUES('cursor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [cursor as i64],
+        [to],
     )?;
+    tx.execute(
+        "INSERT INTO replica_changes(cursor,from_cursor,changes) VALUES(?1,?2,?3)",
+        params![to, from, json_text(changes)?],
+    )?;
+    tx.execute(
+        "DELETE FROM replica_changes WHERE cursor < (SELECT cursor FROM replica_changes ORDER BY cursor DESC LIMIT 1 OFFSET ?1)",
+        [CHANGE_PAGES - 1],
+    )?;
+    Ok(())
+}
+
+fn changes_since(conn: &Connection, from: u64, to: u64) -> Result<Changes> {
+    let mut changes = Changes::empty();
+    if from == to {
+        return Ok(changes);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT cursor,from_cursor,changes FROM replica_changes WHERE cursor>?1 AND cursor<=?2 ORDER BY cursor",
+    )?;
+    let mut rows = stmt.query(params![from, to])?;
+    let mut next = from;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, u64>(1)? != next {
+            break;
+        }
+        next = row.get(0)?;
+        changes.merge(serde_json::from_str(row.get_ref(2)?.as_str()?)?);
+    }
+    if next != to {
+        // Older clients don't write notices, and slow readers can outlive the journal.
+        changes.reload = true;
+        changes.asset_ids = None;
+    }
+    Ok(changes)
+}
+
+fn sync_lock(library: &Library) -> Result<File> {
+    let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(library.state_dir.join("sync.lock"))?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
+fn require_cursor(tx: &Transaction, expected: u64) -> Result<()> {
+    ensure!(cursor(tx)? == expected, "replica cursor moved while fetching changes");
     Ok(())
 }
 
 /// Replaces the mirror with an authority snapshot in one transaction (FTS rebuilt once).
 /// Assets absent from the snapshot are tombstoned. `None` for authorities without the route.
-fn bootstrap(library: &mut Library, client: &Client, progress: Progress) -> Result<Option<u64>> {
+fn bootstrap(
+    library: &mut Library,
+    client: &Client,
+    after: u64,
+    progress: Progress,
+) -> Result<Option<(u64, Changes)>> {
     progress("snapshot", 0, 0);
     let Some(snapshot) = client.get_optional_bulk::<Snapshot>("/snapshot")? else {
         return Ok(None);
@@ -1050,9 +1147,11 @@ fn bootstrap(library: &mut Library, client: &Client, progress: Progress) -> Resu
         snapshot.library_id == library.context.library_id,
         "remote library identity differs from replica"
     );
+    ensure!(snapshot.cursor > after, "remote snapshot did not advance the replica cursor");
     let total = snapshot.assets.len() as u64;
     let state = library.state_dir.clone();
     let tx = library.conn.transaction()?;
+    require_cursor(&tx, after)?;
     tx.execute_batch(
         "DELETE FROM search; DELETE FROM asset_tags; DELETE FROM memberships; UPDATE assets SET deleted=1;",
     )?;
@@ -1070,10 +1169,11 @@ fn bootstrap(library: &mut Library, client: &Client, progress: Progress) -> Resu
     )?;
     apply_collections(&tx, &snapshot.collections)?;
     apply_organization(&tx, Some(&snapshot.smart_folders), Some(&snapshot.tags))?;
-    set_cursor(&tx, snapshot.cursor)?;
+    let changes = Changes { applied: total, snapshot: true, ..Changes::empty() };
+    publish_page(&tx, after, snapshot.cursor, &changes)?;
     tx.commit()?;
     progress("applying", total, total);
-    Ok(Some(snapshot.cursor))
+    Ok(Some((snapshot.cursor, changes)))
 }
 
 /// Current views for `ids`, one `POST /assets/batch` per chunk; absent ids were deleted.
@@ -1113,7 +1213,7 @@ pub fn sync(library: &mut Library) -> Result<Value> {
 
 /// Schedules a best-effort embeddings refresh only when a pack is already mirrored.
 pub fn sync_with(library: &mut Library, progress: Progress) -> Result<Value> {
-    let value = pull(library, progress, true, None)?;
+    let value = pull(library, progress, true, None, None)?;
     crate::energy::replica::refresh_after_sync(library, value["applied"].as_u64().unwrap_or(0));
     Ok(value)
 }
@@ -1121,21 +1221,39 @@ pub fn sync_with(library: &mut Library, progress: Progress) -> Result<Value> {
 /// `sync` that only replays events, never bootstrapping from a snapshot (the reference
 /// a snapshot-bootstrapped mirror must match).
 pub fn replay(library: &mut Library) -> Result<Value> {
-    pull(library, &mut |_, _, _| {}, false, None)
+    pull(library, &mut |_, _, _| {}, false, None, None)
 }
 
-/// `first`: events after cursor `.0` the caller already holds (a long-poll's answer),
-/// replayed instead of asking `GET /events` for them again; ignored once the cursor moved.
+/// A reader reports changes since its observed cursor, but fetches only after the cursor
+/// read under the file lock. Long-poll answers can be used without re-fetching their page.
 fn pull(
     library: &mut Library,
     progress: Progress,
     bootstrap_allowed: bool,
+    observed: Option<u64>,
     first: Option<(u64, Vec<Event>)>,
 ) -> Result<Value> {
+    library.remote().context("context is not a remote replica")?;
+    let observed = match observed {
+        Some(cursor) => cursor,
+        None => cursor(&library.conn)?,
+    };
+    let _lock = sync_lock(library)?;
     let client = library.remote_client()?;
     let mut after = cursor(&library.conn)?;
-    let mut applied = 0u64;
-    let mut snapshot = false;
+    let mut changes = changes_since(&library.conn, observed, after)?;
+    if let Some((_, events)) = &first
+        && events.last().is_some_and(|event| event.sequence <= after)
+    {
+        return changes.result(library, after, 0);
+    }
+    let hello = client.hello()?;
+    ensure!(
+        authority_id(&hello)? == library.context.library_id,
+        "remote library identity differs from replica"
+    );
+    let latest = hello["cursor"].as_u64().context("remote library did not report an event cursor")?;
+    ensure!(latest >= after, "remote event cursor is behind the replica");
     let page = |after: u64| -> Result<Vec<Event>> {
         client.get_json(
             "/events",
@@ -1144,32 +1262,23 @@ fn pull(
     };
     let mut events = match first {
         Some((from, events)) if from == after => events,
+        _ if latest == after => Vec::new(),
         _ => page(after)?,
     };
-    let mut total = events.len() as u64;
-    if bootstrap_allowed && (events.len() == PAGE || (after == 0 && !events.is_empty())) {
-        let latest = client.hello()?["cursor"].as_u64();
-        if let Some(latest) = latest {
-            total = latest.saturating_sub(after);
-        }
-        if (after == 0 || total > SNAPSHOT_LAG)
-            && let Some(cursor) = bootstrap(library, &client, &mut *progress)?
-        {
-            snapshot = true;
-            applied = library.conn.query_row(
-                "SELECT count(*) FROM assets WHERE deleted=0",
-                [],
-                |r| r.get::<_, i64>(0),
-            )? as u64;
-            after = cursor;
-            events = page(after)?;
-            total = events.len() as u64;
-        }
+    let total = latest.saturating_sub(after).max(events.len() as u64);
+    if bootstrap_allowed && !events.is_empty() && (after == 0 || total > SNAPSHOT_LAG)
+        && let Some((snapshot_cursor, snapshot)) = bootstrap(library, &client, after, progress)?
+    {
+        changes.merge(snapshot);
+        after = snapshot_cursor;
+        events = page(after)?;
     }
     let mut replayed = 0u64;
-    let mut kinds: BTreeMap<String, u64> = BTreeMap::new();
-    let mut changed: BTreeSet<String> = BTreeSet::new();
     while let Some(last) = events.last().map(|e| e.sequence) {
+        ensure!(
+            events[0].sequence > after && events.windows(2).all(|pair| pair[0].sequence < pair[1].sequence),
+            "remote event page is out of order"
+        );
         ensure!(
             events
                 .iter()
@@ -1181,13 +1290,19 @@ fn pull(
         // so assets that were only viewed need no view fetch.
         let mut viewed: BTreeMap<&str, &str> = BTreeMap::new();
         let mut fetch: BTreeSet<&str> = BTreeSet::new();
+        let mut kinds = BTreeMap::new();
+        let mut changed = BTreeSet::new();
         for event in &events {
-            *kinds.entry(event.kind.clone()).or_default() += 1;
+            if let Some(count) = kinds.get_mut(&event.kind) {
+                *count += 1;
+            } else {
+                kinds.insert(event.kind.clone(), 1u64);
+            }
             let Some(id) = event.asset_id.as_deref() else {
                 continue;
             };
             if changed.len() <= CHANGED_IDS {
-                changed.insert(id.to_owned());
+                changed.insert(id);
             }
             match event.payload["last_viewed_at"].as_str() {
                 Some(at) if event.kind == "media_viewed" => {
@@ -1217,6 +1332,7 @@ fn pull(
             .transpose()?;
         let state = library.state_dir.clone();
         let tx = library.conn.transaction()?;
+        require_cursor(&tx, after)?;
         for id in &ids {
             apply_view(&tx, &state, id, views.get(*id))?;
         }
@@ -1227,8 +1343,16 @@ fn pull(
             apply_collections(&tx, collections)?;
         }
         apply_organization(&tx, smart.as_ref(), tags.as_ref())?;
-        set_cursor(&tx, last)?;
+        let batch = Changes {
+            applied: events.len() as u64,
+            kinds,
+            asset_ids: (changed.len() <= CHANGED_IDS)
+                .then(|| changed.into_iter().map(str::to_owned).collect()),
+            ..Changes::default()
+        };
+        publish_page(&tx, after, last, &batch)?;
         tx.commit()?;
+        changes.merge(batch);
         replayed += events.len() as u64;
         after = last;
         if events.len() < PAGE {
@@ -1236,20 +1360,9 @@ fn pull(
         }
         events = page(after)?;
     }
-    if !snapshot {
-        applied = replayed;
-    }
     let added_by_mirrored = mirror_added_by(library, &client);
     progress("events", replayed, total.max(replayed));
-    Ok(json!({
-        "applied": applied,
-        "cursor": after,
-        "snapshot": snapshot,
-        "pending_thumbnails": library.pending_eagle_thumbnails()?,
-        "kinds": kinds,
-        "asset_ids": (changed.len() <= CHANGED_IDS).then_some(changed),
-        "added_by_mirrored": added_by_mirrored,
-    }))
+    changes.result(library, after, added_by_mirrored)
 }
 
 /// Replica state dirs that asked their authority for `added_by` in this process.
@@ -1952,22 +2065,36 @@ fn dataless(_: &fs::Metadata) -> bool {
 }
 
 /// Block until the authority has events past this replica's cursor (or `wait` seconds
-/// pass), then sync, replaying the events the long-poll returned (no second `GET /events`
-/// round trip) and refreshing the embeddings pack in the background, so a push costs one
-/// asset fetch on top of the long-poll. Returns the `sync` result plus `changed`.
-pub fn sync_wait(library: &mut Library, wait: u64) -> Result<Value> {
+/// pass), then sync. The mirror isn't locked while waiting on the authority.
+pub fn sync_wait(library: &mut Library, wait: u64, since: Option<u64>) -> Result<Value> {
+    library.remote().context("context is not a remote replica")?;
     let after = cursor(&library.conn)?;
-    let events = library.remote_client()?.wait_events(after, wait.min(60))?;
-    let changed = !events.is_empty();
-    let mut value = if changed {
-        let value = pull(library, &mut |_, _, _| {}, true, Some((after, events)))?;
-        crate::energy::replica::refresh_after_sync(library, value["applied"].as_u64().unwrap_or(0));
-        value
-    } else {
-        json!({"applied":0,"cursor":after})
+    let since = since.unwrap_or(after);
+    let local_changes = |library: &Library| -> Result<Option<Value>> {
+        let tx = Transaction::new_unchecked(&library.conn, TransactionBehavior::Deferred)?;
+        let current = cursor(&tx)?;
+        if current == since { return Ok(None); }
+        let mut value = changes_since(&tx, since, current)?.result(library, current, 0)?;
+        value["changed"] = json!(true);
+        Ok(Some(value))
     };
-    value["changed"] = json!(changed);
-    Ok(value)
+    if let Some(value) = local_changes(library)? {
+        return Ok(value);
+    }
+    let events = library.remote_client()?.wait_events(after, wait.min(60));
+    if events.as_ref().is_ok_and(|events| !events.is_empty()) {
+        let mut value = pull(library, &mut |_, _, _| {}, true, Some(since), Some((after, events?)))?;
+        crate::energy::replica::refresh_after_sync(library, value["applied"].as_u64().unwrap_or(0));
+        value["changed"] = json!(value["cursor"] != since);
+        return Ok(value);
+    }
+    // An inline write or a CLI pull may have committed while this answer was in flight,
+    // even if the stream timed out or failed.
+    if let Some(value) = local_changes(library)? {
+        return Ok(value);
+    }
+    events?;
+    Ok(json!({"applied":0,"cursor":after,"changed":false}))
 }
 
 /// Semantic search for a replica: ranked by the authority, asset documents from the mirror

@@ -450,6 +450,10 @@ CREATE INDEX IF NOT EXISTS observations_asset ON observations(asset_id);")?;
         conn.execute_batch(storage::SCHEMA)?;
         conn.execute_batch(eagle::SCHEMA)?;
         conn.execute_batch(thumbs::SCHEMA)?;
+        #[cfg(feature = "remote")]
+        if context.remote.is_some() {
+            conn.execute_batch(remote::SCHEMA)?;
+        }
         thumbs::migrate(&conn)?;
         catalog::migrate(&conn)?;
         Ok(Self {

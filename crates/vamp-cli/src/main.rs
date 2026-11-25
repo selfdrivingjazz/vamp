@@ -1810,6 +1810,7 @@ fn execute(cli: Cli) -> Result<Value> {
                             .map_or(0, |d| d.as_millis() as u64)
                     };
                     let mut value = vamp_core::remote::sync(&mut library)?;
+                    let mut since = value["cursor"].as_u64();
                     value["at_ms"] = json!(now_ms());
                     line(&value)?;
                     // Thumbnails never hold up the live event stream.
@@ -1825,8 +1826,9 @@ fn execute(cli: Cli) -> Result<Value> {
                         std::thread::sleep(std::time::Duration::from_secs(5));
                     });
                     loop {
-                        match vamp_core::remote::sync_wait(&mut library, 25) {
+                        match vamp_core::remote::sync_wait(&mut library, 25, since) {
                             Ok(mut value) => {
+                                since = value["cursor"].as_u64();
                                 if value["changed"] == true {
                                     value["at_ms"] = json!(now_ms());
                                     line(&value)?;
