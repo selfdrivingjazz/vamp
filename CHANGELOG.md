@@ -22,6 +22,9 @@
   the library to nearby Vampire Macs via DNS-SD, without sharing any credentials.
 - `vamp setup install recommended` uses a bundled, versioned toolkit. Libraries keep
   their registered processors and embedding model unless explicitly upgraded.
+- `vamp diagnostics` now covers optional, anonymous usage and health reports for
+  both the CLI and server. Policy 2 requires fresh consent; there is still no
+  built-in destination and `DO_NOT_TRACK` takes precedence.
 
 ## 0.4.2 — 2026-11-04
 

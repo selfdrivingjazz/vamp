@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod health;
 pub mod push;
+pub mod telemetry;
 
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::Deserialize;
@@ -14,11 +15,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use vamp_core::Library;
 use vamp_core::io::{Pool, Stalled};
 use vamp_protocol::{Metadata, MetadataPatch, PROTOCOL_VERSION};
+use vamp_diagnostics::Feature;
 mod discovery;
 mod dist;
 
@@ -120,6 +122,7 @@ pub struct App {
     io_deadline: Duration,
     health: Arc<health::Health>,
     watchdog: bool,
+    telemetry: Option<telemetry::Telemetry>,
 }
 
 /// The library, with its hold time visible to `/v1/health`.
@@ -172,6 +175,7 @@ impl App {
             io_deadline: ORIGINAL_DEADLINE,
             health: Arc::default(),
             watchdog: false,
+            telemetry: None,
         })
     }
     /// How long requests wait for an original without progress (default [`ORIGINAL_DEADLINE`]).
@@ -185,6 +189,11 @@ impl App {
         self.watchdog = true;
         self
     }
+    pub fn with_telemetry(mut self, telemetry: telemetry::Telemetry) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
     /// Liveness shared with background loops (see [`spawn_jobs`]).
     pub fn health(&self) -> Arc<health::Health> {
         self.health.clone()
@@ -764,7 +773,10 @@ fn route(
     );
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     let method = request.method().clone();
-    match (&method, segments.as_slice()) {
+    let tracking = app.telemetry.as_ref().and_then(|telemetry| {
+        telemetry::route(&method, &segments).map(|feature| (telemetry, feature, Instant::now()))
+    });
+    let response = (|| match (&method, segments.as_slice()) {
         (Method::Get, ["v1", "library"]) => {
             let library = app.lock();
             ok(
@@ -1075,7 +1087,14 @@ fn route(
                 let mut library = app.lock().reopen()?;
                 return ok(vamp_core::native::dispatch(&mut library, native)?);
             }
-            ok(vamp_core::native::dispatch(&mut app.lock(), native)?)
+            let tracking = app.telemetry.as_ref().and_then(|telemetry| {
+                telemetry::native(&operation).map(|feature| (telemetry, feature, Instant::now()))
+            });
+            let result = vamp_core::native::dispatch(&mut app.lock(), native);
+            if let Some((telemetry, feature, started)) = tracking {
+                telemetry.observe(feature, result.is_ok(), Some(started));
+            }
+            ok(result?)
         }
         (Method::Post, ["v1", "collections", id]) => {
             let body: NameBody = read_json(request)?;
@@ -1105,7 +1124,12 @@ fn route(
         (_, ["v1", "jobs", ..]) => jobs_api::route(app, &method, &segments, request)
             .unwrap_or_else(|| Err(HttpError::new(404, format!("no route for {method} {path}")))),
         _ => Err(HttpError::new(404, format!("no route for {method} {path}"))),
+    })();
+    if let Some((telemetry, feature, started)) = tracking {
+        let ok = response.as_ref().is_ok_and(|reply| reply.status_code().0 < 400);
+        telemetry.observe(feature, ok, Some(started));
     }
+    response
 }
 
 /// Stores uploaded bytes, filed into `collection_id` when given, and answers as soon as the
@@ -1810,6 +1834,7 @@ pub fn spawn_jobs(
     context: String,
     interval: Duration,
     health: Arc<health::Health>,
+    telemetry: Option<telemetry::Telemetry>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut library = match Library::open(&home, Some(&context)) {
@@ -1823,6 +1848,17 @@ pub fn spawn_jobs(
                 Ok(result) => {
                     last_error.clear();
                     let done = |key: &str| result.get(key).and_then(Value::as_u64).unwrap_or(0);
+                    if let Some(telemetry) = &telemetry
+                        && let Some(jobs) = result["jobs"].as_array()
+                    {
+                        for job in jobs {
+                            if let (Some(name), Some(status)) =
+                                (job["processor"]["name"].as_str(), job["status"].as_str())
+                            {
+                                telemetry.job(name, status);
+                            }
+                        }
+                    }
                     if done("deferred") > 0 {
                         eprintln!(
                             "vamp-server: jobs deferred={} (original storage not responding)",
@@ -1850,8 +1886,13 @@ pub fn spawn_jobs(
             // jobs keep their turn).
             match vamp_core::thumbs::pending(&library, 128) {
                 Ok(batch) if !batch.is_empty() => {
+                    let started = telemetry.as_ref().map(|_| Instant::now());
                     let rendered = vamp_core::thumbs::render_all(&batch);
-                    if let Err(e) = vamp_core::thumbs::store(&mut library, &rendered) {
+                    let result = vamp_core::thumbs::store(&mut library, &rendered);
+                    if let Some(telemetry) = &telemetry {
+                        telemetry.observe(Feature::Previews, result.is_ok(), started);
+                    }
+                    if let Err(e) = result {
                         eprintln!("vamp-server: grid thumbnails: {e:#}");
                     } else {
                         continue;

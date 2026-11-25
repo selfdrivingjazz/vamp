@@ -2,8 +2,11 @@ use anyhow::{Context as _, Result, anyhow, ensure};
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::sync::Arc;
 use vamp_core::{Library, default_home, load_config};
+use vamp_diagnostics::{Event, Feature, Product, Reporter};
 use vamp_server::auth::{Allowlist, AuthMode, Tailscale};
+use vamp_server::telemetry::Telemetry;
 
 /// Serve one local VAMP library over HTTP for replicas, clippers and browser extensions.
 #[derive(Parser)]
@@ -131,9 +134,10 @@ fn install_agent(home: &Path, name: &str, options: &ServiceArgs) -> Result<()> {
         "VAMP_HOME",
         home.canonicalize()?.to_string_lossy().into_owned(),
     )];
-    for key in ["VAMP_MEDIA_HELPER", "VAMP_STORE_HELPER", "VAMP_FFMPEG", "XDG_STATE_HOME"] {
-        if let Some(helper) = std::env::var_os(key) {
-            env.push((key, helper.to_string_lossy().into_owned()));
+    for key in ["VAMP_MEDIA_HELPER", "VAMP_STORE_HELPER", "VAMP_FFMPEG", "XDG_STATE_HOME", "DO_NOT_TRACK"] {
+        // A launched service does not inherit these settings from the installer.
+        if let Some(value) = std::env::var_os(key) {
+            env.push((key, value.to_string_lossy().into_owned()));
         }
     }
     // launchd starts with a minimal PATH; keep the caller's so processors resolve.
@@ -192,7 +196,7 @@ fn install_systemd(home: &Path, name: &str, options: &ServiceArgs) -> Result<()>
         .map(|value| value.to_str().map(quoted).context("service arguments must be UTF-8"))
         .collect::<Result<Vec<_>>>()?.join(" ");
     let mut env = String::new();
-    for key in ["PATH", "VAMP_MEDIA_HELPER", "VAMP_STORE_HELPER", "VAMP_FFMPEG", "XDG_STATE_HOME"] {
+    for key in ["PATH", "VAMP_MEDIA_HELPER", "VAMP_STORE_HELPER", "VAMP_FFMPEG", "XDG_STATE_HOME", "DO_NOT_TRACK"] {
         if let Ok(value) = std::env::var(key) {
             // Environment= does not expand variables, unlike ExecStart.
             let assignment = format!("{key}={value}");
@@ -239,8 +243,24 @@ fn main() -> Result<()> {
     vamp_core::allow_cloud_placeholder_reads();
     let cli = Cli::parse();
     let home = cli.home.clone().unwrap_or_else(default_home);
-    let name = context_name(&cli, &home)?;
-    let library = Library::open(&home, Some(&name))?;
+    let reporter = matches!(cli.command, Command::Serve { .. })
+        .then(|| vamp_diagnostics::reporter(&home, Product::server()))
+        .flatten();
+    if let Some(reporter) = &reporter {
+        reporter.clone().install_panic_hook(Feature::Launch);
+    }
+    let result = run(cli, &home, reporter.as_ref());
+    if result.is_err()
+        && let Some(reporter) = reporter
+    {
+        reporter.record(Event::new(Feature::Launch, false));
+    }
+    result
+}
+
+fn run(cli: Cli, home: &Path, reporter: Option<&Arc<Reporter>>) -> Result<()> {
+    let name = context_name(&cli, home)?;
+    let library = Library::open(home, Some(&name))?;
     ensure!(
         library.context.remote.is_none(),
         "context {name} is a replica; serve its authority library instead"
@@ -269,8 +289,8 @@ fn main() -> Result<()> {
             }
             println!("{}", serde_json::to_string(&allow)?);
         }
-        Command::InstallAgent(options) => install_agent(&home, &name, &options)?,
-        Command::InstallService(options) => install_service(&home, &name, &options)?,
+        Command::InstallAgent(options) => install_agent(home, &name, &options)?,
+        Command::InstallService(options) => install_service(home, &name, &options)?,
         Command::Serve {
             bind,
             auth,
@@ -336,12 +356,18 @@ fn main() -> Result<()> {
             eprintln!(
                 "vamp-server: other machines: {join} (later changes: vamp sync); Vampire: Connect to Server…"
             );
+            let telemetry = reporter.map(|reporter| Telemetry::new(reporter.clone()));
+            if let Some(telemetry) = &telemetry {
+                telemetry.observe(Feature::Launch, true, None);
+                app = app.with_telemetry(telemetry.clone());
+            }
             if !no_jobs {
                 vamp_server::spawn_jobs(
-                    home.clone(),
+                    home.to_path_buf(),
                     name.clone(),
                     Duration::from_secs(jobs_interval.max(1)),
                     app.health(),
+                    telemetry,
                 );
             }
             vamp_server::serve(std::sync::Arc::new(server), app, threads);

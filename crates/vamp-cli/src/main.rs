@@ -1,4 +1,3 @@
-mod diagnostics;
 mod mcp;
 mod mcp_tools;
 #[cfg(feature = "remote")]
@@ -25,6 +24,7 @@ use vamp_core::{
     Backend, EmbedderSpec, Library, StorageConfig, attach_context, default_home, load_config,
     select_context,
 };
+use vamp_diagnostics::{self as diagnostics, Event as DiagnosticEvent, Feature, LibraryRole, Product};
 use vamp_protocol::{Metadata, MetadataPatch, ProcessorSpec, SheetItem, ToolRequest};
 
 #[derive(Parser)]
@@ -32,7 +32,7 @@ use vamp_protocol::{Metadata, MetadataPatch, ProcessorSpec, SheetItem, ToolReque
     name = "vamp",
     version,
     about = "Reference-only media catalog for agents",
-    long_about = "Reference-only media catalog for agents. JSON output is the default. Originals are referenced in place and never modified or deleted (ingested bytes such as clips and exploration findings are copied into the library inbox). Search covers metadata and observations; --semantic ranks by embeddings. Set VAMP_ACTOR to identify event authors. Optional extras (smart search, captions) are installed only by an explicit `vamp setup install`. Crash and error reports are off unless enabled with `vamp diagnostics enable`. `vamp guide` prints the agent manual."
+    long_about = "Reference-only media catalog for agents. JSON output is the default. Originals are referenced in place and never modified or deleted (ingested bytes such as clips and exploration findings are copied into the library inbox). Search covers metadata and observations; --semantic ranks by embeddings. Set VAMP_ACTOR to identify event authors. Optional extras (smart search, captions) are installed only by an explicit `vamp setup install`. Usage and health reports are off unless enabled with `vamp diagnostics enable`. `vamp guide` prints the agent manual."
 )]
 struct Cli {
     #[arg(
@@ -160,8 +160,8 @@ enum Command {
         #[command(subcommand)]
         command: Option<SetupCommand>,
     },
-    /// Optional crash and error reports to an OpenTelemetry endpoint you choose (off by
-    /// default; `status` lists exactly what a report holds).
+    /// Optional usage and health reports to an OpenTelemetry endpoint you choose (off
+    /// by default; `status` lists exactly what a report holds).
     Diagnostics {
         #[command(subcommand)]
         command: DiagnosticsCommand,
@@ -293,8 +293,7 @@ enum SetupCommand {
 enum DiagnosticsCommand {
     /// Whether reports are on, where they go (credentials redacted) and what they hold.
     Status,
-    /// Opt in: send bounded crash/error reports (no messages, arguments, paths or library
-    /// content) to this OTLP/HTTP endpoint.
+    /// Opt in: send usage and health reports to this OTLP/HTTP endpoint.
     Enable {
         /// OTLP/HTTP base URL; reports are POSTed to <endpoint>/v1/logs (e.g.
         /// http://localhost:4318 or https://otlp-gateway-<region>.grafana.net/otlp).
@@ -306,7 +305,7 @@ enum DiagnosticsCommand {
         #[arg(long, value_name = "PATH")]
         headers_file: Option<PathBuf>,
     },
-    /// Opt out: stop reporting and forget the endpoint and its credentials.
+    /// Opt out: discard pending reports and forget the endpoint and its credentials.
     Disable,
     /// Send one test report now and print whether the endpoint accepted it.
     Test,
@@ -1974,6 +1973,34 @@ fn add_folder(library: &mut Library, path: &Path, metadata: Metadata) -> Result<
     Ok(summary)
 }
 
+fn diagnostic_feature(command: &Command) -> Option<(Feature, Option<LibraryRole>)> {
+    let feature = match command {
+        Command::Diagnostics { .. } | Command::Guide | Command::Schema | Command::Commands => {
+            return None;
+        }
+        Command::Init { .. } => return Some((Feature::LibraryCreate, Some(LibraryRole::Authority))),
+        #[cfg(feature = "remote")]
+        Command::Join { .. } => return Some((Feature::LibraryConnect, Some(LibraryRole::Replica))),
+        #[cfg(feature = "remote")]
+        Command::Sync { command: None, .. } => return Some((Feature::Sync, Some(LibraryRole::Replica))),
+        Command::Setup { .. } => Feature::Setup,
+        Command::Import { .. } => Feature::LibraryImport,
+        Command::Galaxy { .. } => Feature::Galaxy,
+        Command::Media { command } => match command {
+            MediaCommand::List { query: Some(_), .. } | MediaCommand::Search { .. } => Feature::Search,
+            MediaCommand::List { .. } | MediaCommand::Inspect { .. } => Feature::Browse,
+            MediaCommand::Similar { .. } => Feature::Similar,
+            MediaCommand::Fetch { .. } => Feature::Viewer,
+            MediaCommand::Thumbnail { .. } | MediaCommand::Preview { .. } => Feature::Previews,
+            MediaCommand::LoopPreview { .. } => Feature::Video,
+            _ => Feature::Save,
+        },
+        Command::Serve { .. } | Command::Mcp(_) => Feature::Launch,
+        _ => Feature::Other,
+    };
+    Some((feature, None))
+}
+
 fn main() -> ExitCode {
     vamp_core::allow_cloud_placeholder_reads();
     let mut command = Cli::command();
@@ -1986,12 +2013,9 @@ fn main() -> ExitCode {
     }
     let parsed = command
         .try_get_matches_from_mut(std::env::args_os())
-        .and_then(|mut matches| {
-            let operation = diagnostics::operation(&matches);
-            Cli::from_arg_matches_mut(&mut matches).map(|cli| (cli, operation))
-        })
+        .and_then(|mut matches| Cli::from_arg_matches_mut(&mut matches))
         .map_err(|error| error.format(&mut command));
-    let (cli, operation) = match parsed {
+    let mut cli = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
             if matches!(
@@ -2011,6 +2035,19 @@ fn main() -> ExitCode {
         print!("{}", guide());
         return ExitCode::SUCCESS;
     }
+    let home = cli.home.get_or_insert_with(default_home);
+    let telemetry = diagnostic_feature(&cli.command).and_then(|(feature, role)| {
+        let reporter = diagnostics::reporter(home, Product::cli())?;
+        reporter.clone().install_panic_hook(feature);
+        Some((reporter, feature, role, std::time::Instant::now()))
+    });
+    let report = |ok| {
+        if let Some((reporter, feature, role, started)) = &telemetry {
+            let mut event = DiagnosticEvent::new(*feature, ok).timed(started.elapsed());
+            event.library_role = *role;
+            reporter.record(event);
+        }
+    };
     if matches!(
         cli.command,
         Command::Setup {
@@ -2020,32 +2057,28 @@ fn main() -> ExitCode {
         return match setup::plan_text(&cli.home.unwrap_or_else(default_home), cli.context.as_deref()) {
             Ok(text) => {
                 print!("{text}");
+                report(true);
                 ExitCode::SUCCESS
             }
             Err(error) => {
                 print_error("operation_failed", format!("{error:#}"));
+                report(false);
                 ExitCode::FAILURE
             }
         };
     }
     if let Command::Mcp(options) = cli.command {
         return match mcp::run(options, &cli.home.unwrap_or_else(default_home), cli.context.as_deref()) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(()) => {
+                report(true);
+                ExitCode::SUCCESS
+            }
             Err(error) => {
                 print_error("mcp_failed", format!("{error:#}"));
+                report(false);
                 ExitCode::FAILURE
             }
         };
-    }
-    // Only with the user's opt-in (`vamp diagnostics enable`); the diagnostics commands
-    // themselves never report.
-    let reporter = if matches!(cli.command, Command::Diagnostics { .. }) {
-        None
-    } else {
-        diagnostics::reporter(&cli.home.clone().unwrap_or_else(default_home))
-    };
-    if let Some(reporter) = &reporter {
-        reporter.clone().install_panic_hook(operation.clone());
     }
     match execute(cli) {
         Ok(value) => {
@@ -2059,6 +2092,8 @@ fn main() -> ExitCode {
                 print_error("output_failed", error.to_string());
                 return ExitCode::FAILURE;
             }
+            drop(out);
+            report(true);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -2069,9 +2104,7 @@ fn main() -> ExitCode {
             } else {
                 print_error("operation_failed", format!("{error:#}"));
             }
-            if let Some(reporter) = &reporter {
-                reporter.error(&operation, &error);
-            }
+            report(false);
             ExitCode::FAILURE
         }
     }

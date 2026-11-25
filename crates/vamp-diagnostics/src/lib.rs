@@ -1,70 +1,53 @@
-//! Optional crash and error reports, off unless the user enables them with
-//! `vamp diagnostics enable --endpoint URL`. Reports go to that user-chosen OpenTelemetry
-//! (OTLP/HTTP JSON) logs endpoint and nowhere else; no endpoint is compiled in.
-//!
-//! The choice is CLI-local (`<home>/diagnostics.json`, mode 600; separate from the catalog
-//! config) and is consent to [`POLICY`]: a later release that changes what a report holds
-//! stops reporting until the user enables it again. `DO_NOT_TRACK=1` in the environment
-//! overrides that consent for the run. Without consent, or under `DO_NOT_TRACK`, nothing here
-//! touches the network. A report holds only the fields of [`SENDS`]: bounded categories and names
-//! defined by this program, never messages, arguments, paths, library content or identifiers.
-//! Sending never changes a command's output or exit status.
+//! Shared, opt-in diagnostics for VAMP and the Vampire apps. Consent is scoped
+//! to the diagnostics home, endpoint, and policy. Only typed, bucketed events
+//! reach the user-chosen OTLP/HTTP endpoint.
+
+mod event;
+pub use event::{Event, Feature, LibraryRole, Outcome, Product};
+use event::{Component, Record};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::VecDeque,
     fs,
     io::Write as _,
-    panic::{Location, PanicHookInfo},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// What a report contains, versioned; consent recorded for another version is not used.
-const POLICY: u32 = 1;
+const POLICY: u32 = 2;
 const CONFIG_FILE: &str = "diagnostics.json";
 const STATE_FILE: &str = "diagnostics-state.json";
 /// Serializes the send budget and receipts across processes (`File::lock`: released when the
 /// holder exits, so a crash leaves no stale lock). Never deleted, since it may be held.
 const LOCK_FILE: &str = "diagnostics.lock";
 const LOCK_WAIT: Duration = Duration::from_secs(1);
-/// Reports one process sends at most (a failing command plus panics on other threads).
-const MAX_PER_PROCESS: u32 = 3;
-/// Reports one home sends per hour at most, across processes (agents run vamp in loops).
 const MAX_PER_HOUR: u32 = 10;
-const MAX_BODY: usize = 4096;
+const MAX_BODY: usize = 16 * 1024;
+const MAX_BATCH: usize = 16;
+const MAX_PENDING: usize = 32;
+const MAX_AGE: u64 = 24 * 3600;
+const MIN_INTERVAL: u64 = 15;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SEND_TIMEOUT: Duration = Duration::from_secs(3);
-/// The crates whose source paths are public and safe to name in a panic report.
-const CRATES: [&str; 4] = ["vamp-cli", "vamp-core", "vamp-protocol", "vamp-media"];
 
-const SENDS: [&str; 7] = [
-    "kind: error (a command failed), panic (vamp crashed) or test",
-    "error category from a fixed list (io.not_found, io.permission_denied, json, network, panic, other, ...)",
-    "the command path without its arguments (e.g. \"media inspect\")",
-    "component (vamp-cli, vamp-core, ...) and, for a panic in VAMP's own source, its source file and line",
-    "vamp version",
-    "operating system and CPU architecture",
-    "the time of the report",
+const SENDS: &[&str] = &[
+    "Product, release version, platform and telemetry policy version",
+    "Event kind (use, failure, Rust panic or test), feature and outcome (ok or failed)",
+    "When measured: library role (authority or replica), item-count range and time range",
 ];
-const NEVER_SENDS: [&str; 5] = [
-    "error or panic messages, stack traces",
-    "command arguments, file paths or names, asset ids, tags, search text, URLs, environment",
-    "library contents, metadata or media",
-    "host, user, machine, install or session identifiers",
-    "anything about commands that succeed (no usage analytics)",
+const NEVER_SENDS: &[&str] = &[
+    "Files, filenames, paths, URLs, hosts, tags, captions, searches, library or item IDs, or library contents",
+    "Email, tokens, machine or install IDs, hardware details, exact times, error messages or stack traces",
 ];
-const COVERS: &str = "Commands that fail with operation_failed, and Rust panics on any vamp thread (reported after the panic message is printed; exit status and unwinding are unchanged: 101 when the panic ends the process, and a panic a job runner catches stays caught). Not covered: invalid arguments, output errors, crashes that kill the process without a panic (signals such as SIGKILL or SIGSEGV, aborts, out-of-memory, stack overflow), and failures inside helper processes (vamp-media, model processors).";
-
-static SENT: AtomicU32 = AtomicU32::new(0);
+const COVERS: &str = "Instrumented feature use and handled failures, and Rust panics in vamp and vamp-server. Does not send Apple crash reports, stack traces, or unexpected process exits (such as signals or out-of-memory).";
 
 /// `<home>/diagnostics.json`: present only while reporting is enabled.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct Settings {
     policy: u32,
     /// OTLP base URL (like `OTEL_EXPORTER_OTLP_ENDPOINT`); logs go to `<endpoint>/v1/logs`.
@@ -73,14 +56,46 @@ struct Settings {
     #[serde(default)]
     headers: Vec<(String, String)>,
     consented_at_unix: u64,
+    /// Local only: invalidate reporters buffered under a previous opt-in, even to the same URL.
+    #[serde(default)]
+    generation: String,
 }
 
-/// `<home>/diagnostics-state.json`: the hourly send budget and the last delivery attempt.
+/// Local send state. Queues never share records across products or release versions.
 #[derive(Serialize, Deserialize, Default)]
 struct State {
     window_start_unix: u64,
     sent: u32,
     last_delivery: Option<Delivery>,
+    #[serde(default)]
+    queues: [Queue; 3],
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Queue {
+    version: String,
+    last_attempt_unix: Option<u64>,
+    pending: VecDeque<Pending>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Pending {
+    at_unix: u64,
+    record: Record,
+}
+
+impl State {
+    fn reserve(&mut self, now: u64) -> bool {
+        if now < self.window_start_unix || now - self.window_start_unix >= 3600 {
+            self.window_start_unix = now;
+            self.sent = 0;
+        }
+        if self.sent >= MAX_PER_HOUR {
+            return false;
+        }
+        self.sent += 1;
+        true
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -93,19 +108,11 @@ struct Delivery {
     error: Option<String>,
 }
 
-/// A report: only static names, categories and versions.
-struct Report<'a> {
-    kind: &'static str,
-    category: &'a str,
-    operation: &'a str,
-    component: &'static str,
-    site: Option<(String, u32)>,
-}
-
 /// Reporting enabled with current consent; the only way anything is sent.
 pub struct Reporter {
     home: PathBuf,
     settings: Settings,
+    product: Product,
 }
 
 fn now() -> Duration {
@@ -131,14 +138,23 @@ fn settings(home: &Path) -> Result<Option<Settings>> {
     }
 }
 
-/// An exclusive lock on `<home>/diagnostics.lock`, held until the file is dropped; `None` if
-/// it cannot be taken within [`LOCK_WAIT`].
-fn lock(home: &Path) -> Option<fs::File> {
+fn lock_file(home: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let file = options.open(home.join(LOCK_FILE)).ok()?;
+    options.open(home.join(LOCK_FILE))
+}
+
+fn config_lock(home: &Path) -> Result<fs::File> {
+    let file = lock_file(home).context("opening the diagnostics lock")?;
+    file.lock().context("locking diagnostics settings")?;
+    Ok(file)
+}
+
+/// Senders give up under contention; an explicit consent change waits.
+fn lock(home: &Path) -> Option<fs::File> {
+    let file = lock_file(home).ok()?;
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
         match file.try_lock() {
@@ -156,6 +172,10 @@ fn state(home: &Path) -> State {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
+}
+
+fn save_state(path: &Path, state: &State) -> Result<()> {
+    write_private(path, &serde_json::to_vec(state)?)
 }
 
 /// Write `bytes` to `path` through a sibling file created with mode 600 (unix), then rename.
@@ -211,6 +231,14 @@ fn endpoint(text: &str) -> Result<String> {
         uri.query().is_none(),
         "--endpoint must not have a query string"
     );
+    if uri.scheme_str() == Some("http") {
+        let host = uri.host().unwrap_or_default().trim_start_matches('[').trim_end_matches(']');
+        ensure!(
+            host.eq_ignore_ascii_case("localhost")
+                || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()),
+            "collectors require HTTPS outside loopback"
+        );
+    }
     Ok(text.to_owned())
 }
 
@@ -267,13 +295,19 @@ fn argv(home: &Path, command: &[&str]) -> Vec<Value> {
         .collect()
 }
 
+fn current(settings: &Settings) -> bool {
+    settings.policy == POLICY
+        && !settings.generation.is_empty()
+        && endpoint(&settings.endpoint).is_ok_and(|url| url == settings.endpoint)
+}
+
 /// The choice as `vamp diagnostics status` shows it; credentials redacted.
 pub fn status(home: &Path) -> Result<Value> {
     let (settings, error) = match settings(home) {
         Ok(settings) => (settings, None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
-    let consented = settings.as_ref().is_some_and(|s| s.policy == POLICY);
+    let consented = settings.as_ref().is_some_and(current);
     let do_not_track = do_not_track();
     let mut out = json!({
         "capability": "diagnostics",
@@ -288,12 +322,25 @@ pub fn status(home: &Path) -> Result<Value> {
             .map(|(name, _)| (name.clone(), json!("<redacted>"))).collect()),
         "consented_at_unix": settings.as_ref().map(|s| s.consented_at_unix),
         "policy": POLICY,
-        "last_delivery": state(home).last_delivery,
+        "last_delivery": consented.then(|| state(home).last_delivery).flatten(),
         "sends": SENDS,
         "never_sends": NEVER_SENDS,
         "covers": COVERS,
-        "limits": {"per_process": MAX_PER_PROCESS, "per_hour": MAX_PER_HOUR, "max_bytes": MAX_BODY,
-            "timeout_seconds": SEND_TIMEOUT.as_secs(), "queue": "none (sent synchronously, never retried)"},
+        "fields": {
+            "service.name": Component::VALUES,
+            "service.version": "Major.minor.patch only",
+            "os.type": event::PLATFORMS,
+            "app.diagnostics.kind": event::Kind::VALUES,
+            "app.feature": Feature::VALUES,
+            "app.outcome": Outcome::VALUES,
+            "app.duration_bucket": event::DURATIONS,
+            "app.size_bucket": event::SIZES,
+            "app.library_role": LibraryRole::VALUES
+        },
+        "limits": {"requests_per_hour": MAX_PER_HOUR, "max_batch": MAX_BATCH,
+            "max_bytes": MAX_BODY, "timeout_seconds": SEND_TIMEOUT.as_secs(),
+            "max_pending_per_product": MAX_PENDING, "queue_expiry_hours": MAX_AGE / 3600,
+            "min_seconds_between_automatic_requests_per_product": MIN_INTERVAL},
         "enable_argv": argv(home, &["diagnostics", "enable", "--endpoint", "OTLP_HTTP_URL", "--headers-file", "HEADERS_FILE"]),
         "disable_argv": argv(home, &["diagnostics", "disable"]),
         "test_argv": argv(home, &["diagnostics", "test"]),
@@ -322,41 +369,29 @@ pub fn status(home: &Path) -> Result<Value> {
 pub fn enable(home: &Path, endpoint_text: &str, headers_file: Option<&Path>) -> Result<Value> {
     let endpoint = endpoint(endpoint_text)?;
     let headers = headers_file.map(headers).transpose()?.unwrap_or_default();
-    if !headers.is_empty() && endpoint.starts_with("http://") {
-        let uri: ureq::http::Uri = endpoint.parse()?;
-        let host = uri
-            .host()
-            .unwrap_or("")
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let loopback = host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        ensure!(
-            loopback,
-            "collector credentials require HTTPS unless the collector is loopback"
-        );
-    }
     fs::create_dir_all(home).with_context(|| format!("creating {}", home.display()))?;
+    let guard = config_lock(home)?;
+    // Never deliver events collected under the previous choice to a new destination.
+    remove(&home.join(STATE_FILE))?;
     let settings = Settings {
         policy: POLICY,
         endpoint,
         headers,
         consented_at_unix: now().as_secs(),
+        generation: uuid::Uuid::new_v4().simple().to_string(),
     };
     write_private(
         &home.join(CONFIG_FILE),
         &serde_json::to_vec_pretty(&settings)?,
     )?;
+    drop(guard);
     status(home)
 }
 
-/// Opt-out: forget the destination, its credentials and the send history. Taken under the
-/// send lock, so no running vamp is between its consent check and its state write; reporters
-/// in running processes re-check consent before every send and stop. The lock file stays.
+/// Opt out, dropping the destination, credentials and pending events. A send
+/// that already holds the lock can finish before this returns, never after it.
 pub fn disable(home: &Path) -> Result<Value> {
-    let guard = if home.is_dir() { lock(home) } else { None };
+    let guard = if home.is_dir() { Some(config_lock(home)?) } else { None };
     remove(&home.join(CONFIG_FILE))?;
     remove(&home.join(STATE_FILE))?;
     drop(guard);
@@ -369,21 +404,14 @@ pub fn test(home: &Path) -> Result<Value> {
         !do_not_track(),
         "DO_NOT_TRACK is set, which turns diagnostics off for this run; unset it to send a test report"
     );
-    let Some(reporter) = reporter(home) else {
+    let Some(reporter) = reporter(home, Product::cli()) else {
         bail!(
             "diagnostics are off; enable them first: vamp diagnostics enable --endpoint OTLP_HTTP_URL"
         );
     };
-    let report = Report {
-        kind: "test",
-        category: "test",
-        operation: "diagnostics test",
-        component: "vamp-cli",
-        site: None,
-    };
     let delivery = reporter
-        .send(&report)
-        .context("not sent: the per-process or hourly limit was reached, the send state was busy or unwritable, or reporting was turned off meanwhile; try again later")?;
+        .urgent(Record::test())
+        .context("not sent: the hourly limit was reached, send state was busy or unwritable, or reporting was turned off")?;
     ensure!(
         delivery.delivered,
         "the endpoint did not accept the test report ({}{})",
@@ -410,129 +438,18 @@ fn do_not_track() -> bool {
 
 /// The reporter if the user enabled reporting under the current policy and `DO_NOT_TRACK`
 /// is not set; else `None`, and nothing is sent.
-pub fn reporter(home: &Path) -> Option<Arc<Reporter>> {
+pub fn reporter(home: &Path, product: Product) -> Option<Arc<Reporter>> {
     if do_not_track() {
         return None;
     }
     let settings = settings(home).ok().flatten()?;
-    (settings.policy == POLICY).then(|| {
+    current(&settings).then(|| {
         Arc::new(Reporter {
             home: home.to_path_buf(),
             settings,
+            product,
         })
     })
-}
-
-/// The invoked command path from parsed arguments: subcommand names only, never values.
-pub fn operation(matches: &clap::ArgMatches) -> String {
-    let mut names = Vec::new();
-    let mut matches = matches;
-    while let Some((name, sub)) = matches.subcommand() {
-        names.push(name);
-        matches = sub;
-    }
-    names.join(" ")
-}
-
-/// Bounded category of a failed command, from the error types in its chain.
-fn category(error: &anyhow::Error) -> String {
-    for cause in error.chain() {
-        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
-            let kind = format!("{:?}", error.kind());
-            let mut snake = String::from("io.");
-            for (i, c) in kind.chars().take(40).enumerate() {
-                if c.is_ascii_uppercase() && i > 0 {
-                    snake.push('_');
-                }
-                snake.push(c.to_ascii_lowercase());
-            }
-            return snake;
-        }
-        if cause.is::<serde_json::Error>() {
-            return "json".into();
-        }
-        if cause.is::<ureq::Error>() {
-            return "network".into();
-        }
-    }
-    "other".into()
-}
-
-/// Component and, inside VAMP's own crates, the crate-relative source file and line (never
-/// the directories above it, which hold the builder's home or checkout).
-fn site(file: &str, line: u32) -> (&'static str, Option<(String, u32)>) {
-    let file = file.replace('\\', "/");
-    for krate in CRATES {
-        let crate_dir = format!("/{krate}/src/");
-        let found = file
-            .rfind(&crate_dir)
-            .map(|at| at + 1)
-            .or_else(|| file.starts_with(&crate_dir[1..]).then_some(0));
-        if let Some(at) = found {
-            let relative = &file[at + krate.len() + 1..];
-            let safe = relative.len() <= 120
-                && relative
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'));
-            return (krate, safe.then(|| (relative.to_owned(), line)));
-        }
-    }
-    ("dependency", None)
-}
-
-fn attribute(key: &str, value: &str) -> Value {
-    json!({"key": key, "value": {"stringValue": value}})
-}
-
-/// The OTLP/HTTP JSON logs request for one report.
-fn body(report: &Report<'_>, time: Duration) -> Vec<u8> {
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        os => os,
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        arch => arch,
-    };
-    let operation: String = report.operation.chars().take(64).collect();
-    let mut attributes = vec![
-        attribute("app.diagnostics.kind", report.kind),
-        attribute("error.type", report.category),
-        attribute("app.component", report.component),
-        attribute("app.operation", &operation),
-    ];
-    if let Some((file, line)) = &report.site {
-        attributes.push(attribute("code.file.path", file));
-        attributes
-            .push(json!({"key": "code.line.number", "value": {"intValue": line.to_string()}}));
-    }
-    let (severity, text) = if report.kind == "panic" {
-        (21, "FATAL")
-    } else {
-        (17, "ERROR")
-    };
-    let nanos = time.as_nanos().to_string();
-    serde_json::to_vec(&json!({"resourceLogs": [{
-        "resource": {"attributes": [
-            attribute("service.name", "vamp"),
-            attribute("service.version", env!("CARGO_PKG_VERSION")),
-            attribute("os.type", os),
-            attribute("host.arch", arch),
-        ]},
-        "scopeLogs": [{
-            "scope": {"name": "vamp.diagnostics", "version": POLICY.to_string()},
-            "logRecords": [{
-                "timeUnixNano": nanos,
-                "observedTimeUnixNano": nanos,
-                "severityNumber": severity,
-                "severityText": text,
-                "body": {"stringValue": format!("vamp {}: {}", report.kind, report.category)},
-                "attributes": attributes,
-            }],
-        }],
-    }]}))
-    .expect("report serializes")
 }
 
 fn failure(error: &ureq::Error) -> &'static str {
@@ -548,74 +465,113 @@ fn failure(error: &ureq::Error) -> &'static str {
 }
 
 impl Reporter {
-    /// Report a command that failed with `error`; never fails.
-    pub fn error(&self, operation: &str, error: &anyhow::Error) {
-        let category = category(error);
-        let _ = self.send(&Report {
-            kind: "error",
-            category: &category,
-            operation,
-            component: "vamp-cli",
-            site: None,
-        });
+    /// Record only bounded dimensions; queue a batch and try delivery if due.
+    pub fn record(&self, event: Event) {
+        self.record_batch([event]);
     }
 
-    /// Report panics on every thread after the existing hook prints them; unwinding and the
-    /// exit status are unchanged.
-    pub fn install_panic_hook(self: Arc<Self>, operation: String) {
+    /// Like `record`, for a bounded group drained off a request or UI thread.
+    pub fn record_batch(&self, events: impl IntoIterator<Item = Event>) {
+        let _ = self.update(events, None);
+    }
+
+    /// Try pending work without adding an observation.
+    pub fn flush(&self) {
+        self.record_batch([]);
+    }
+
+    /// Preserve panic output and unwinding without sending a message or location.
+    pub fn install_panic_hook(self: Arc<Self>, feature: Feature) {
         let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
+        std::panic::set_hook(Box::new(move |info| {
             previous(info);
-            let (component, source) = info
-                .location()
-                .map_or(("unknown", None), |l: &Location<'_>| {
-                    site(l.file(), l.line())
-                });
-            let _ = self.send(&Report {
-                kind: "panic",
-                category: "panic",
-                operation: &operation,
-                component,
-                site: source,
-            });
+            let _ = self.urgent(Record::panic(feature));
         }));
     }
 
-    /// The consent this reporter was created under still holds: same policy, destination and
-    /// headers. Read again before every send, so `disable` or a changed destination stops
-    /// long-running processes (`jobs watch`, `sync --watch`, `worker`).
-    fn consented(&self) -> bool {
-        settings(&self.home).ok().flatten().is_some_and(|s| {
-            s.policy == POLICY
-                && s.endpoint == self.settings.endpoint
-                && s.headers == self.settings.headers
-        })
+    fn urgent(&self, record: Record) -> Option<Delivery> {
+        self.update([], Some(record))
     }
 
-    /// One bounded, synchronous POST if consent still holds and the per-process and hourly
-    /// budgets allow it; `None` otherwise. The budget is reserved and the receipt recorded under
-    /// the home's lock, each from a fresh read, so concurrent processes never lose updates.
-    fn send(&self, report: &Report<'_>) -> Option<Delivery> {
-        let now = now();
+    fn update(&self, events: impl IntoIterator<Item = Event>, urgent: Option<Record>) -> Option<Delivery> {
+        if do_not_track() {
+            return None;
+        }
+        // Recheck consent under the same lock that enable/disable take, and keep
+        // the lock through the bounded HTTP attempt and its local receipt.
+        let _guard = lock(&self.home)?;
+        if settings(&self.home).ok().flatten().as_ref() != Some(&self.settings) {
+            return None;
+        }
+        let now = now().as_secs();
         let state_path = self.home.join(STATE_FILE);
-        {
-            let _lock = lock(&self.home)?;
-            if !self.consented() || SENT.fetch_add(1, Ordering::Relaxed) >= MAX_PER_PROCESS {
-                return None;
+        let mut state = state(&self.home);
+        let index = match self.product.component {
+            Component::Cli => 0,
+            Component::Server => 1,
+            Component::Apple => 2,
+        };
+        let queue = &mut state.queues[index];
+        let pending_before = queue.pending.len();
+        if queue.version != self.product.version {
+            queue.pending.clear();
+            queue.last_attempt_unix = None;
+            queue.version.clear();
+            queue.version.push_str(&self.product.version);
+        }
+        queue.pending.retain(|event| now.saturating_sub(event.at_unix) < MAX_AGE);
+        let mut changed = queue.pending.len() != pending_before;
+        for event in events.into_iter().take(MAX_PENDING) {
+            if event.feature == Feature::Diagnostics {
+                continue;
             }
-            let mut state = state(&self.home);
-            if now.as_secs().saturating_sub(state.window_start_unix) >= 3600 {
-                state.window_start_unix = now.as_secs();
-                state.sent = 0;
+            if queue.pending.len() >= MAX_PENDING {
+                queue.pending.pop_front();
             }
-            if state.sent >= MAX_PER_HOUR {
-                return None;
+            queue.pending.push_back(Pending { at_unix: now, record: event.bucket() });
+            changed = true;
+        }
+        let due = !queue.pending.is_empty()
+            && queue.last_attempt_unix.is_none_or(|last| now < last || now - last >= MIN_INTERVAL);
+        if (urgent.is_none() && !due) || !state.reserve(now) {
+            if changed {
+                let _ = save_state(&state_path, &state);
             }
-            state.sent += 1;
-            write_private(&state_path, &serde_json::to_vec(&state).ok()?).ok()?;
+            return None;
         }
 
-        let body = body(report, now);
+        let mut batch = [Record::test(); MAX_BATCH];
+        let mut reserved = [0; MAX_BATCH];
+        let len = if let Some(record) = urgent {
+            batch[0] = record;
+            1
+        } else {
+            let queue = &mut state.queues[index];
+            queue.last_attempt_unix = Some(now);
+            let len = queue.pending.len().min(MAX_BATCH);
+            for (i, event) in queue.pending.drain(..len).enumerate() {
+                batch[i] = event.record;
+                reserved[i] = event.at_unix;
+            }
+            len
+        };
+        // Remove the batch before POSTing. A process killed during delivery
+        // must not replay an already accepted batch on its next launch.
+        save_state(&state_path, &state).ok()?;
+        let bytes = event::body(&self.product, POLICY, &batch[..len]);
+        let (delivery, offline) = self.post(now, &bytes)?;
+        if offline && urgent.is_none() {
+            let queue = &mut state.queues[index];
+            for i in (0..len).rev() {
+                queue.pending.push_front(Pending { at_unix: reserved[i], record: batch[i] });
+            }
+        }
+        state.last_delivery = Some(delivery);
+        let _ = save_state(&state_path, &state);
+        state.last_delivery
+    }
+
+    fn post(&self, now: u64, body: &[u8]) -> Option<(Delivery, bool)> {
         if body.len() > MAX_BODY {
             return None;
         }
@@ -623,7 +579,8 @@ impl Reporter {
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(SEND_TIMEOUT))
             .max_redirects(0)
-            .user_agent(concat!("vamp/", env!("CARGO_PKG_VERSION")))
+            .proxy(None)
+            .user_agent("vamp-diagnostics")
             .build()
             .into();
         let mut request = agent
@@ -632,36 +589,30 @@ impl Reporter {
         for (name, value) in &self.settings.headers {
             request = request.header(name.as_str(), value.as_str());
         }
-        let delivery = match request.send(&body[..]) {
+        Some(match request.send(body) {
             Ok(response) => {
-                let status = response.status().as_u16();
-                Delivery {
-                    at_unix: now.as_secs(),
-                    delivered: response.status().is_success(),
-                    status: Some(status),
-                    error: (!response.status().is_success()).then(|| "http_status".into()),
-                }
+                let status = response.status();
+                (Delivery {
+                    at_unix: now,
+                    delivered: status.is_success(),
+                    status: Some(status.as_u16()),
+                    error: (!status.is_success()).then(|| "http_status".into()),
+                }, false)
             }
-            Err(error) => Delivery {
-                at_unix: now.as_secs(),
-                delivered: false,
-                status: match error {
-                    ureq::Error::StatusCode(status) => Some(status),
-                    _ => None,
-                },
-                error: Some(failure(&error).into()),
-            },
-        };
-        // Only the receipt changes; the budget comes from a fresh read. A home disabled
-        // meanwhile stays clean.
-        if let Some(_lock) = lock(&self.home)
-            && self.consented()
-        {
-            let mut state = state(&self.home);
-            state.last_delivery = Some(delivery.clone());
-            let _ = serde_json::to_vec(&state).map(|bytes| write_private(&state_path, &bytes));
-        }
-        Some(delivery)
+            Err(error) => {
+                let offline = matches!(error, ureq::Error::HostNotFound | ureq::Error::ConnectionFailed)
+                    || matches!(&error, ureq::Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused);
+                (Delivery {
+                    at_unix: now,
+                    delivered: false,
+                    status: match error {
+                        ureq::Error::StatusCode(status) => Some(status),
+                        _ => None,
+                    },
+                    error: Some(failure(&error).into()),
+                }, offline)
+            }
+        })
     }
 }
 
@@ -672,84 +623,6 @@ mod tests {
         io::{BufRead as _, BufReader, Read as _},
         net::TcpListener,
     };
-
-    fn keys(body: &Value) -> Vec<String> {
-        let record = &body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
-        let resource = &body["resourceLogs"][0]["resource"]["attributes"];
-        resource
-            .as_array()
-            .unwrap()
-            .iter()
-            .chain(record["attributes"].as_array().unwrap())
-            .map(|a| a["key"].as_str().unwrap().to_owned())
-            .collect()
-    }
-
-    #[test]
-    fn error_reports_hold_only_allowlisted_fields() {
-        let secret = "/home/someone/Pictures/private-shoot/IMG_0001.heic";
-        let error = anyhow::Error::from(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("open {secret}"),
-        ))
-        .context(format!("adding {secret} with tag nda-client"));
-        let category = category(&error);
-        assert_eq!(category, "io.not_found");
-        let report = Report {
-            kind: "error",
-            category: &category,
-            operation: "media add",
-            component: "vamp-cli",
-            site: None,
-        };
-        let bytes = body(&report, Duration::from_secs(1));
-        assert!(bytes.len() <= MAX_BODY);
-        let text = String::from_utf8(bytes).unwrap();
-        for leak in ["someone", "Pictures", "IMG_0001", "nda-client", "open "] {
-            assert!(!text.contains(leak), "report leaks {leak:?}: {text}");
-        }
-        let value: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(
-            keys(&value),
-            [
-                "service.name",
-                "service.version",
-                "os.type",
-                "host.arch",
-                "app.diagnostics.kind",
-                "error.type",
-                "app.component",
-                "app.operation"
-            ]
-        );
-        assert_eq!(
-            value["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["severityNumber"],
-            17
-        );
-    }
-
-    #[test]
-    fn panic_sites_name_only_vamp_source() {
-        assert_eq!(
-            site("/home/someone/src/vamp/crates/vamp-core/src/library.rs", 7),
-            ("vamp-core", Some(("src/library.rs".into(), 7)))
-        );
-        assert_eq!(
-            site("crates/vamp-cli/src/main.rs", 3),
-            ("vamp-cli", Some(("src/main.rs".into(), 3)))
-        );
-        assert_eq!(
-            site("/home/someone/.cargo/registry/src/x/serde-1.0/src/de.rs", 1),
-            ("dependency", None)
-        );
-        assert_eq!(site("/x/not-vamp-core/src/lib.rs", 1), ("dependency", None));
-        assert_eq!(site("/x/vamp-core/src/a b.rs", 1), ("vamp-core", None));
-        let here = Location::caller();
-        assert_eq!(
-            site(here.file(), here.line()),
-            ("vamp-cli", Some(("src/diagnostics.rs".into(), here.line())))
-        );
-    }
 
     #[test]
     fn enabling_needs_a_usable_destination() {
@@ -804,7 +677,7 @@ mod tests {
             .is_err()
         );
         assert!(!home.path().join(CONFIG_FILE).exists());
-        assert!(reporter(home.path()).is_none());
+        assert!(reporter(home.path(), Product::cli()).is_none());
         assert_eq!(status(home.path()).unwrap()["enabled"], false);
     }
 
@@ -845,9 +718,9 @@ mod tests {
         enable(home.path(), "http://127.0.0.1:9", None).unwrap();
         let path = home.path().join(CONFIG_FILE);
         let mut settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        settings["policy"] = json!(POLICY + 1);
+        settings["policy"] = json!(POLICY - 1);
         fs::write(&path, settings.to_string()).unwrap();
-        assert!(reporter(home.path()).is_none());
+        assert!(reporter(home.path(), Product::cli()).is_none());
         let status = status(home.path()).unwrap();
         assert_eq!(status["enabled"], false);
         assert!(status["note"].as_str().unwrap().contains("paused"));
@@ -861,7 +734,7 @@ mod tests {
             r#"{"policy":1,"endpoint":"http://127.0.0.1:9","headers":["Authorization: Basic c2VjcmV0"],"consented_at_unix":1}"#,
         )
         .unwrap();
-        assert!(reporter(home.path()).is_none());
+        assert!(reporter(home.path(), Product::cli()).is_none());
         let status = status(home.path()).unwrap();
         assert_eq!(status["enabled"], false);
         assert!(status["error"].as_str().unwrap().contains("not valid"));
@@ -883,6 +756,10 @@ mod tests {
     /// A local OTLP/HTTP receiver; each request is queued before its 200 response is written.
     fn receiver() -> (String, std::sync::mpsc::Receiver<Request>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        serve_receiver(listener)
+    }
+
+    fn serve_receiver(listener: TcpListener) -> (String, std::sync::mpsc::Receiver<Request>) {
         let url = format!(
             "http://127.0.0.1:{}/otlp",
             listener.local_addr().unwrap().port()
@@ -922,24 +799,37 @@ mod tests {
         (url, receiver)
     }
 
-    /// Built directly so a DO_NOT_TRACK in the test environment does not skip it.
-    fn running_reporter(home: &Path) -> Arc<Reporter> {
-        Arc::new(Reporter {
-            home: home.to_path_buf(),
-            settings: settings(home).unwrap().unwrap(),
-        })
+    #[test]
+    fn offline_observations_batch_after_reconnect() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+        enable(home.path(), &format!("http://{address}/otlp"), None).unwrap();
+        let reporter = running_reporter(home.path());
+        reporter.record(Event::new(Feature::Search, true));
+        reporter.record(Event::new(Feature::GridLoad, true));
+        let mut local = state(home.path());
+        assert_eq!(local.queues[0].pending.len(), 2);
+        assert_eq!(local.sent, 1);
+        let (_, requests) = serve_receiver(TcpListener::bind(address).unwrap());
+        local.queues[0].last_attempt_unix = Some(now().as_secs() - MIN_INTERVAL);
+        save_state(&home.path().join(STATE_FILE), &local).unwrap();
+        reporter.flush();
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let payload: Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array().unwrap().len(), 2);
+        let local = state(home.path());
+        assert!(local.queues[0].pending.is_empty());
+        assert!(local.last_delivery.unwrap().delivered);
     }
 
-    const TEST_REPORT: Report<'static> = Report {
-        kind: "test",
-        category: "test",
-        operation: "jobs watch",
-        component: "vamp-cli",
-        site: None,
-    };
+    fn running_reporter(home: &Path) -> Arc<Reporter> {
+        reporter(home, Product::cli()).unwrap()
+    }
 
-    /// A reporter in a long-running process stops as soon as the user disables reporting or
-    /// changes its policy, destination or credentials, and resumes only under the same consent.
+    /// An old handle cannot send after revocation, even after a fresh opt-in
+    /// to the original destination with the original credentials.
     #[test]
     fn revoked_consent_stops_a_running_reporter() {
         let quiet = Duration::from_millis(300);
@@ -950,30 +840,31 @@ mod tests {
         let (url, requests) = receiver();
         enable(home.path(), &url, Some(old.as_path())).unwrap();
         let reporter = running_reporter(home.path());
-        assert!(reporter.send(&TEST_REPORT).unwrap().delivered);
+        assert!(reporter.urgent(Record::test()).unwrap().delivered);
         requests.recv_timeout(Duration::from_secs(5)).unwrap();
 
         disable(home.path()).unwrap();
-        assert!(reporter.send(&TEST_REPORT).is_none());
+        assert!(reporter.urgent(Record::test()).is_none());
         assert!(requests.recv_timeout(quiet).is_err());
         assert!(!home.path().join(STATE_FILE).exists());
 
         let (other, other_requests) = receiver();
         enable(home.path(), &other, Some(old.as_path())).unwrap();
-        assert!(reporter.send(&TEST_REPORT).is_none());
+        assert!(reporter.urgent(Record::test()).is_none());
         enable(home.path(), &url, Some(new.as_path())).unwrap();
-        assert!(reporter.send(&TEST_REPORT).is_none());
+        assert!(reporter.urgent(Record::test()).is_none());
         enable(home.path(), &url, Some(old.as_path())).unwrap();
         let path = home.path().join(CONFIG_FILE);
         let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        saved["policy"] = json!(POLICY + 1);
+        saved["policy"] = json!(POLICY - 1);
         fs::write(&path, saved.to_string()).unwrap();
-        assert!(reporter.send(&TEST_REPORT).is_none());
+        assert!(reporter.urgent(Record::test()).is_none());
         assert!(requests.recv_timeout(quiet).is_err());
         assert!(other_requests.recv_timeout(quiet).is_err());
 
         enable(home.path(), &url, Some(old.as_path())).unwrap();
-        assert!(reporter.send(&TEST_REPORT).unwrap().delivered);
+        assert!(reporter.urgent(Record::test()).is_none());
+        assert!(running_reporter(home.path()).urgent(Record::test()).unwrap().delivered);
         assert!(
             requests
                 .recv_timeout(Duration::from_secs(5))
@@ -992,7 +883,7 @@ mod tests {
         let Some(home) = std::env::var_os(PANIC_CHILD_HOME) else {
             return;
         };
-        running_reporter(Path::new(&home)).install_panic_hook("media inspect".into());
+        running_reporter(Path::new(&home)).install_panic_hook(Feature::Browse);
         let unwound = std::panic::catch_unwind(|| panic!("secret asset 0f3a in /home/someone"));
         assert!(unwound.is_err(), "the panic must still unwind");
     }
@@ -1008,7 +899,7 @@ mod tests {
         enable(home.path(), &url, Some(headers.as_path())).unwrap();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "diagnostics::tests::panic_hook_child",
+                "tests::panic_hook_child",
                 "--exact",
                 "--nocapture",
                 "--test-threads=1",
@@ -1033,8 +924,8 @@ mod tests {
         let value: Value = serde_json::from_str(&body).unwrap();
         let record = &value["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
         assert_eq!(record["severityNumber"], 21);
-        assert!(body.contains("\"app.operation\"") && body.contains("media inspect"));
-        assert!(body.contains("src/diagnostics.rs"));
+        assert!(body.contains("\"app.feature\"") && body.contains("\"browse\""));
+        assert!(!body.contains(".rs"));
         let status = status(home.path()).unwrap();
         assert_eq!(status["last_delivery"]["delivered"], true);
         assert!(!status.to_string().contains("dGVzdA=="));

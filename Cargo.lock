@@ -2083,6 +2083,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "vamp-core",
+ "vamp-diagnostics",
  "vamp-protocol",
 ]
 
@@ -2108,6 +2109,18 @@ dependencies = [
  "vamp-protocol",
  "webp",
  "zip",
+]
+
+[[package]]
+name = "vamp-diagnostics"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
+ "uuid",
 ]
 
 [[package]]
@@ -2153,6 +2166,7 @@ dependencies = [
  "ureq",
  "uuid",
  "vamp-core",
+ "vamp-diagnostics",
  "vamp-protocol",
 ]
 
